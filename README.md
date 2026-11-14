@@ -2,6 +2,8 @@
 
 A from-scratch Rust rebuild of Dogecoin Arcade, wire-compatible with the existing arcades. Pepecoin testnet first; other chains are add-ons. See [docs/PLAN.md](docs/PLAN.md).
 
+> **v0.1.67 is the last release published on GitHub.** From here on, Arcade V1 carries and updates itself: every arcade keeps the arcade's own code (the whole repository with its history, every dependency so it rebuilds offline, and the prebuilt programs) and hands new releases to the arcades it is linked to. Releases are signed with Strawberry's release key, and an arcade with automatic updates on (Options tab) installs them from the network, with no website involved. The install command below still works: it installs v0.1.67, which then updates itself from the network. See [docs/ARCADECHAIN.md §14.25](docs/ARCADECHAIN.md).
+
 ![Dogecoin image inscriptions in the Explorer](docs/img/screens/inscriptions-dogecoin.png)
 
 | | |
