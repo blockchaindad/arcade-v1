@@ -864,8 +864,8 @@ history, the vendored dependencies so it rebuilds with no internet, and the preb
   files by SHA-256 and size): `arcade-v1.bundle` (a git bundle of the history up to the commit: `git clone` reads it),
   `vendor.tar.zst` (`cargo vendor --versioned-dirs` into `cargo-deps/`, not `vendor/`, which the repo uses for a patched crate of its own; tarred with a fixed order, times and owners), `program-<platform>`
   (release archives), `BUILD.txt` (how to rebuild offline). Its id is the SHA-256 of the record; the signature
-  (ed25519) is over `"ARCADE code release\0" ‖ id` by a trusted release key (`RELEASE_KEYS`: @strawberry's release key
-  `e638005c…bd67`, Martin 2026-11-14; `--code-key` adds one on closed test networks). Vendored crates check against the checksums in `Cargo.lock`, which is
+  (ed25519) is over `"ARCADE code release\0" ‖ id` by a trusted release key (`RELEASE_KEYS`: Strawberry's release signing key
+  `9c955cd5…008a`, the original arcade's (Martin 2026-11-14); `--code-key` adds one on closed test networks). Vendored crates check against the checksums in `Cargo.lock`, which is
   in the commit; programs rest on the signature (builds aren't reproducible yet).
 - **Kept by every arcade** in `<home>/code/files/<sha256>`: every release's bundle and dependencies, and the programs of
   the newest 5 releases of each name. Each file is hashed before it is kept.
