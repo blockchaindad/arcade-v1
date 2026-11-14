@@ -896,3 +896,81 @@ nothing for writing loses nothing by holding a block back or building in secret;
 costs it. The draw is by storage weight, so the share falls to writers in the same proportions as storage pay; splitting
 into many keys gains nothing. Tested on a local chain switching at block 5: 49 blocks, every coinbase from block 5 pays its
 writer exactly 1 ARCADE, none before, nothing refused.
+
+## 15. The whole build, to mainnet (Martin 2026-11-14: "Build the whole entire thing don't skip anything. Make sure this time everything is working.")
+
+Every step is done only when its **pass test** passes: unit tests, then a closed local network (`unshare -Urn`, several
+arcades), then the live testnet where it applies. A step's status is kept here: **todo**, **built** (code in, tests not all
+passed), **done** (every pass test passed, released).
+
+### 15.1 Defaults taken for questions not yet answered
+
+Taken from the recommendations made to Martin on 2026-11-14; each can be changed by a rules-version upgrade before
+mainnet. Marked *(default)* where Martin has not said yes.
+
+| Question | Taken |
+|---|---|
+| Blob bytes' fee | 10× the transaction floor: 0.01 ARCADE/kB *(default)* |
+| Blob budget per block | 4 MB, beside the 1 MB of transactions and 4 MB of storage items *(default)* |
+| Pruning | every full node keeps a blob 30 days, then may drop it once 5 audited replicas hold it *(default)* |
+| Storage classes | Permanent (never pruned by rule), Release (newest 5 per release line, reference-counted chunks), Temporary (90 days) *(default)* |
+| Viewer cache | on by default, size in the Options tab (**Martin: yes**) |
+| Segment confirmation | block and coins segments: 10% of the draw weight and a 100-block challenge window; index segments: more than half *(default)* |
+| @tag expiry | activity keeps a tag; a check-in costs 0.1 ARCADE into the pot; 12 months then 30 days' grace; claims committed ahead *(default)* |
+| Repo names | under the owner's @tag, `@tag/name` (**Martin: yes**) |
+| Home chain | ARCADE at mainnet, the Pepecoin ledger migrated by snapshot; on the testnet the ledger also runs on ARCADE beside Pepecoin testnet, so nothing that runs today breaks *(default)* |
+| Writer's share | 1 ARCADE of each block's 50 (**Martin: yes**, built, §14.26) |
+| Pay delay (§13 q1) | as built: pay is released by passed audits *(default)* |
+| Blocks only at launch (§13 q2) | blocks, the coins family and index journals at launch *(default)* |
+| Time keepers' pay (§13 q3) | none, as in Chia *(default)* |
+| Mainnet address prefix (§13 q4) | `A…` (p2pkh 0x17, already set) *(default)* |
+| ARCADE's BIP44 coin type (§13 q6) | the home chain's: 1 on test chains, 3 on mainnet, so an @name's address on ARCADE is its claim's key hash (relied on since v0.1.71) *(default)* |
+| Fees under dust (§13 q7) | moot since §14.18: every fee joins the pot |
+| Genesis assembler | the GX10 *(default)* |
+
+### 15.2 The steps
+
+**A. Storage and code on chain**
+
+1. **Blobs** (rules version 3): a transaction carries a blob record (an output `OP_RETURN "ablb"` with the blob's root over 127-byte leaves, its length, type, encoding and class); the bytes ride in the block's blob section, committed in the header; a block whose blobs aren't all there is refused; fees per blob byte at the blob rate. Pass: unit tests; a local net where one arcade publishes blobs, all keep them, a block missing one is refused, and the fee rule holds.
+2. **Blobs as storage**: a blob segment family, sealed, audited and paid like blocks; reveal demands answered from it. Pass: a local net seals blob segments, audits pass, pay accrues.
+3. **Pruning and storage classes**: Permanent / Release (newest 5) / Temporary (90 days); a full node may drop a blob after 30 days once 5 audited replicas hold it; an archive mode keeps all. Pass: a local net where an old Release blob and an expired Temporary blob are dropped and a Permanent one is kept.
+4. **The viewer cache and a paid boost**: blobs fetched to view are kept (size in Options, on by default) and served; a boost is a Temporary class with a copy count. Pass: a blob viewed on three arcades is served by all three; the cache drops what isn't viewed.
+5. **`/content/` from blobs, and ASHVALE on the ARCADE testnet**: arcades serve a blob by its id as `/content/` does inscriptions; ASHVALE's modules published as blobs and its launcher loads from them. Pass: ASHVALE boots on the testnet from blobs only.
+6. **Git objects as blobs and a git server**: every git object a blob (stored once across repos); an arcade answers `git clone` / `git fetch` (smart HTTP) for repos it keeps; Arcade V1's own repo published so. Pass: `git clone` from an arcade gives the same commit ids as GitHub.
+
+**B. The ledger on ARCADE**
+
+7. **Ledger records on ARCADE**: `arcd` records of up to 1 kB in an OP_RETURN; the ledger indexer runs on the ARCADE chain (tags, profiles, follows, tokens, orders, messages). Pass: a tag claimed and a profile published on the ARCADE testnet are read back by every arcade.
+8. **@tag expiry**: as 15.1. Pass: on a local chain with short periods, an idle tag expires, a checked-in one stays, a claim after release follows the commit rule, and sends warn of the owner change.
+9. **@tag repos**: `@tag/name` records, signed ref updates (pushes) by owners and maintainers, forks. Pass: two arcades push, fork and clone a repo.
+10. **Pull requests, issues, comments, reviews**, and an importer of a GitHub repo's history. Pass: a pull request opened, reviewed and merged on a local net; arcade-v1's GitHub history imported.
+
+**C. Consensus rules**
+
+11. **Segment confirmation** as 15.1. Pass: a chain kept by 10% of the weight lists its block segments; a wrong root is taken out by a fraud proof inside the window.
+12. **A fraud proof for the coins family**. Pass: a wrong coins record is proved wrong on a local net.
+13. **Index journals**: a design for proving a wrong one, built for the ord journal at least. Pass: a wrong ord journal record is proved wrong.
+14. **§13's questions**, as 15.1, written into the rules.
+
+**D. Mainnet**
+
+15. **Bitcoin headers** kept by every arcade (for beacons and Bitcoin segments). Pass: every arcade follows Bitcoin's headers.
+16. **The genesis list's 12-31 correction step** (a receipted commit left out is put back). Pass: a rehearsal where the assembler leaves a commit out and the correction restores it.
+17. **The mainnet settings**: the timetable, the assembler, block 0 naming the first code release. Pass: a dry run of the whole timetable shortened to hours.
+18. **Release checkpoints** for new or long-offline arcades. Pass: an arcade started fresh takes the checkpointed branch.
+19. **Migration**: the Pepecoin ledger snapshot at an announced height carried into ARCADE's genesis; apps stay where inscribed. Pass: a snapshot of the testnet ledger migrated into a local ARCADE chain; every tag and balance matches.
+20. **Testnet rehearsal** (mid-December), 21. **the genesis window** (Dec 21–31), 22. **mainnet launch** (2027-01-01).
+
+**E. Housekeeping**
+
+23. The ThinkPad and arcade_v1 on the current release (Martin). 24. Automatic updates on for Ashburn. 25. The GX10 → @arcade_v1 send and the faucet's owed ARCADE gifts, once the coins mature.
+
+### 15.3 Status
+
+| Step | Status |
+|---|---|
+| 1–22 | todo |
+| 23 | Martin |
+| 24 | todo |
+| 25 | running (waits for block 1,165) |
