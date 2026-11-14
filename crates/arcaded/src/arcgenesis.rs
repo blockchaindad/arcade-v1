@@ -51,7 +51,7 @@ pub struct Settings {
     pub beacon_chain: String,
     pub beacon_depth: u32,
     pub fixed_beacons: Option<(Hash, Hash)>,
-    /// Block 0's time and first difficulty, and the rest of the chain settings (`"block_0"`): with them the final step
+    /// Block 0's time and first difficulty, its `clock` ("vdf"), and the rest of the chain settings (`"block_0"`): with them the final step
     /// also writes `block0.json`, chain settings to start the network from (`--arc-local`, or built into a release).
     pub block_0: Option<Value>,
 }
@@ -458,6 +458,8 @@ struct Mine {
 }
 
 static MINE: Mutex<Option<Mine>> = Mutex::new(None);
+/// Why this arcade isn't taking part as it should, for arc.genesis (empty when all is well).
+static NOTE: Mutex<String> = Mutex::new(String::new());
 
 fn take_part(node: &Arc<Node>) {
     let s = SET.get().expect("set");
@@ -487,7 +489,11 @@ fn take_part(node: &Arc<Node>) {
             // The commit once sealing has caught up (nothing sealing now), or in the last tenth of the window regardless.
             let late = arcade_app::now() + (s.closes - s.opens) / 10 >= s.closes;
             if !mine.committed && !replicas.is_empty() && (crate::arcseal::sealing().is_none() || late) {
-                let Some(payout) = payout(node, &net) else { return };
+                let Some(payout) = payout(node, &net) else {
+                    *NOTE.lock().unwrap() = "no wallet here: make one (or restore it) so this arcade has an address to be paid at".into();
+                    return;
+                };
+                NOTE.lock().unwrap().clear();
                 let mut c = RegCommit { owner: me, payout, replicas: replicas.iter().map(|r| (r.segment, r.replica_root)).take(block::MAX_BATCH).collect(), anchor: 0, nonce: 0, sig: [0; 64] };
                 c.finish(&net, &genesis::list_anchor(&net), registry::STAMP_BITS, &node.identity);
                 eprintln!("arc genesis: committing {} replicas", c.replicas.len());
@@ -554,9 +560,13 @@ fn take_part(node: &Arc<Node>) {
                             "final_list": hex::encode(list.hash(&net)), "beacon_1": hex::encode(b1), "beacon_2": hex::encode(b2)});
                         chain["segment_bytes"] = json!(s.segment_bytes);
                         chain["list"] = json!({"entries": fj["entries"], "owners": fj["owners"]});
+                        // In block_0 "time" is block 0's moment; in chain settings it names the clock ("clock" here).
                         if let Some(o) = chain.as_object_mut() {
-                            o.remove("time");
                             o.remove("difficulty");
+                            match o.remove("clock") {
+                                Some(c) => o.insert("time".into(), c),
+                                None => o.remove("time"),
+                            };
                         }
                         let _ = std::fs::write(dir.join("block0.json"), chain.to_string());
                     }
@@ -692,6 +702,7 @@ pub fn status(node: &Node) -> Result<Value, String> {
         "closed": {"entries": closed.entries.len(), "commits": closed.commits.len(), "hash_here": hex::encode(closed.hash(&s.net)), "hash_assembler": assembler_closed},
         "beacons": [b1.map(hex::encode), b2.map(hex::encode)],
         "my_commit_receipted": mine_receipted > 0,
+        "note": NOTE.lock().unwrap().clone(),
         "final": fin.map(|(l, st)| json!({"hash": hex::encode(l.hash(&s.net)), "owners": l.owners.len(), "entries": l.entries.len(), "struck": st.len()})),
     }))
 }

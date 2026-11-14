@@ -702,8 +702,9 @@ fn run_writer_on(node: Arc<Node>, svc: Arc<Svc>, wrote: &mut VecDeque<Hash256>, 
                             for tid in running.lock().unwrap().iter() {
                                 crate::rulecheck::lowest_priority_of(*tid);
                             }
-                            // Tests only: an arcade too slow to make its own proof in time leans on the keepers.
-                            if std::env::var("ARCADE_ARC_TEST_NO_OWN_PROOF").is_ok() {
+                            // Tests only: an arcade too slow to make its own proof in time leans on the keepers for
+                            // its likely draws (the rest still run at the lowest priority, so the chain can't stall).
+                            if *likely && std::env::var("ARCADE_ARC_TEST_NO_OWN_PROOF").is_ok() {
                                 continue;
                             }
                             let (job, challenge, steps, running, likely) = (proving.clone(), t.challenge, t.steps, running.clone(), *likely);
