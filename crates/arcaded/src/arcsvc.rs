@@ -141,6 +141,38 @@ pub struct Settings {
     /// The rules versions and their first heights ([[1, 0], [2, 30]]); the network's when not given. A local test
     /// chain sets its own, so a test sees a rules switch in minutes.
     pub rules: Option<&'static [(u32, u64)]>,
+    /// The final genesis list block 0 starts from (§10, §14.24: `"list"`, as the bulletin's final.json writes it);
+    /// its hash must be `genesis.final_list`.
+    pub list: Option<arcade_arc::genesis::FinalList>,
+}
+
+/// A final genesis list as final.json writes it (crate::arcgenesis): entries as item bytes, owners with replicas.
+fn parse_list(v: &Value) -> Result<arcade_arc::genesis::FinalList, String> {
+    use arcade_arc::block::Item;
+    let h32 = |x: &Value| -> Option<[u8; 32]> { x.as_str().and_then(|s| hex::decode(s).ok()).and_then(|b| b.try_into().ok()) };
+    let bad = || "settings: list doesn't read".to_string();
+    let mut list = arcade_arc::genesis::FinalList::default();
+    for e in v["entries"].as_array().ok_or_else(bad)? {
+        let b = e["item"].as_str().and_then(|s| hex::decode(s).ok()).ok_or_else(bad)?;
+        match Item::decode(&mut arcade_chain::Reader::new(&b)) {
+            Ok(Item::CatalogEntry(c)) => list.entries.push(c),
+            _ => return Err(bad()),
+        }
+    }
+    for o in v["owners"].as_array().ok_or_else(bad)? {
+        let payout: [u8; 21] = o["payout"].as_str().and_then(|s| hex::decode(s).ok()).and_then(|b| b.try_into().ok()).ok_or_else(bad)?;
+        let replicas = o["replicas"].as_array().ok_or_else(bad)?.iter().map(|r| Some((h32(&r[0])?, h32(&r[1])?))).collect::<Option<Vec<_>>>().ok_or_else(bad)?;
+        list.owners.push(arcade_arc::genesis::ListedOwner { owner: h32(&o["owner"]).ok_or_else(bad)?, payout, replicas });
+    }
+    Ok(list)
+}
+
+/// Block 0's registry: the genesis holders, and the final genesis list when the settings name one.
+pub(crate) fn registry_of(net: &Net, s: &Settings) -> Result<Registry, String> {
+    match &s.list {
+        Some(list) => Registry::from_list(net, &s.holders, list, s.segment_bytes).map_err(|e| format!("settings: the genesis list: {e}")),
+        None => Registry::new(net, &s.holders, s.segment_bytes).ok_or_else(|| "settings: the holders list doesn't hold (a key twice, nothing held, or an address of another network)".into()),
+    }
 }
 
 impl Settings {
@@ -163,7 +195,7 @@ impl Settings {
             difficulty: v["genesis"]["difficulty"].as_str().and_then(|d| d.parse().ok()).filter(|d| *d >= 1).ok_or("settings: genesis.difficulty must be a number in quotes")?,
         };
         let mut holders = Vec::new();
-        for h in v["holders"].as_array().ok_or("settings: holders missing")? {
+        for h in v["holders"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
             let key = h["key"].as_str().and_then(|k| hex::decode(k).ok()).and_then(|b| b.try_into().ok()).ok_or("settings: a holder's key must be an arcade id")?;
             let bytes = h["bytes"].as_u64().ok_or("settings: a holder's bytes missing")?;
             let (version, hash) = h["pay"].as_str().and_then(arcade_ledger::address::decode_base58check).ok_or("settings: a holder's pay address doesn't read")?;
@@ -209,7 +241,20 @@ impl Settings {
                 Some(&*Box::leak(list.into_boxed_slice()))
             }
         };
-        Ok(Settings { genesis, holders, steps_per_second, segment_bytes, block_seconds, clock, audit_period, rules })
+        let list = match &v["list"] {
+            Value::Null => None,
+            l => {
+                let list = parse_list(l)?;
+                if list.hash(net) != genesis.final_list {
+                    return Err("settings: genesis.final_list isn't the hash of the list".into());
+                }
+                Some(list)
+            }
+        };
+        if holders.is_empty() && list.is_none() {
+            return Err("settings: no holders and no genesis list: nobody could write block 1".into());
+        }
+        Ok(Settings { genesis, holders, steps_per_second, segment_bytes, block_seconds, clock, audit_period, rules, list })
     }
 }
 
@@ -682,6 +727,12 @@ fn run_writer_on(node: Arc<Node>, svc: Arc<Svc>, wrote: &mut VecDeque<Hash256>, 
                     }
                 }
             };
+            // Tests only: a writer that announces its draw and then never writes (gone, or holding back), so the next
+            // candidate's proof comes in more than one run.
+            if std::env::var("ARCADE_ARC_TEST_WITHHOLD").is_ok() {
+                ticket = None;
+                continue;
+            }
             written = Some(write_block(&st.chain, &st.pool, &secret, t, pot, seed.clone(), arcade_app::now()));
             ticket = None;
             remember(wrote, tip);
@@ -724,7 +775,7 @@ pub fn define(node: &Arc<Node>, settings: &std::path::Path) -> Result<(), String
 pub fn define_text(node: &Arc<Node>, text: &str) -> Result<(), String> {
     let s = Settings::parse(&params::TESTNET, text)?;
     let net = Net { block_seconds: s.block_seconds, audit_period: s.audit_period, rules: s.rules.unwrap_or(params::TESTNET.rules), ..params::TESTNET };
-    Registry::new(&net, &s.holders, s.segment_bytes).ok_or("settings: the holders list doesn't hold (a key twice, nothing held, or an address of another network)")?;
+    registry_of(&net, &s)?;
     let genesis = s.genesis.id(&net);
     let def = Def { net, params: store::chain_params(&net, &genesis), genesis, settings: s };
     let def = DEF.get_or_init(|| def);
@@ -790,7 +841,7 @@ pub fn remove(node: &Arc<Node>) -> Result<(), String> {
 /// Bring the chain up from the store's copy and start its writer. The caller holds `CHANGING`.
 fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
     let (net, s, genesis, p) = (def.net, &def.settings, def.genesis, def.params);
-    let mut holders = Registry::new(&net, &s.holders, s.segment_bytes).ok_or("settings: the holders list doesn't hold")?;
+    let mut holders = registry_of(&net, s)?;
     holders.set_sources(Arc::new(NodeSources(node.clone())));
     let mut chain = Chain::new(net, &s.genesis, s.clock, holders, &[]);
 
@@ -1824,7 +1875,8 @@ pub fn earn(node: &Node, req: &Value) -> Result<Value, String> {
             if node.mode_of(key).as_deref() != Some("full") {
                 return Err(format!("Earn ARCADE needs {} kept in full (its whole database is sealed)", p.name));
             }
-            if svc().is_none() {
+            // Before a network's block 0 (a genesis list kept here) the switch only marks the coin for sealing.
+            if svc().is_none() && !crate::arcgenesis::active() {
                 install(&node.self_arc())?;
             }
         }

@@ -580,6 +580,7 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             Ok(serde_json::json!({"blocks": hashes.len(), "via": how, "outcome": format!("{outcome:?}"), "seconds": t.elapsed().as_secs_f64()}))
         }
         "arc.keeper" => crate::arckeep::api(node, req),
+        "arc.genesis" => crate::arcgenesis::status(node),
         "arc.open" => crate::arcsvc::open(node, req),
         "arc.sealing" => crate::arcsvc::sealing(node, req),
         "arc.earn" => crate::arcsvc::earn(node, req),

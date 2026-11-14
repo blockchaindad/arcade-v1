@@ -136,12 +136,16 @@ fn hex32(v: &Value) -> Option<[u8; 32]> {
     v.as_str().and_then(|s| hex::decode(s).ok()).and_then(|b| b.try_into().ok())
 }
 
+/// A block id as `Hash256::to_hex` writes it (reversed, as Bitcoin shows hashes).
+fn block_id(v: &Value) -> Option<Hash256> {
+    v.as_str().and_then(|s| Hash256::from_hex(s).ok())
+}
+
 /// A `cand` frame: checked against the chain (the draw, the weight, a score that could win), kept, passed on.
 pub fn on_cand(f: &Frame) {
     let Some(svc) = arcsvc::svc() else { return };
-    let (Some(prev), Some(writer), Some(weight)) = (hex32(&f.head["prev"]), hex32(&f.head["writer"]), f.head["w"].as_u64()) else { return };
+    let (Some(tip), Some(writer), Some(weight)) = (block_id(&f.head["prev"]), hex32(&f.head["writer"]), f.head["w"].as_u64()) else { return };
     let Some(vrf) = f.head["vrf"].as_str().and_then(|s| hex::decode(s).ok()).and_then(|b| <VrfProof>::try_from(b).ok()) else { return };
-    let tip = Hash256(prev);
     let key = [&b"cand"[..], &writer, &vrf[..]].concat();
     {
         let st = ST.lock().unwrap();
@@ -174,13 +178,12 @@ pub fn on_cand(f: &Frame) {
 /// A `tp` frame: a proof for a candidate's count on the tip, checked, kept, passed on.
 pub fn on_tp(f: &Frame) {
     let Some(svc) = arcsvc::svc() else { return };
-    let (Some(prev), Some(steps), Some(ol)) = (hex32(&f.head["prev"]), f.head["steps"].as_u64(), f.head["ol"].as_u64()) else { return };
+    let (Some(tip), Some(steps), Some(ol)) = (block_id(&f.head["prev"]), f.head["steps"].as_u64(), f.head["ol"].as_u64()) else { return };
     let ol = ol as usize;
     if ol > f.blob.len() || f.blob.len() > arcade_arc::block::MAX_TIME_BYTES * 2 {
         return;
     }
-    let tip = Hash256(prev);
-    let key = [&b"tp"[..], &prev, &steps.to_le_bytes()].concat();
+    let key = [&b"tp"[..], &tip.0, &steps.to_le_bytes()].concat();
     {
         // Only for a count some candidate needs, once: a proof costs its maker real time, its check costs ours.
         let st = ST.lock().unwrap();

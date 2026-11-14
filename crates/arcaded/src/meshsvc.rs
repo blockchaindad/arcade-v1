@@ -537,6 +537,7 @@ fn serve_loop(
         crate::coreboot::tick(node, link)?;
         crate::vxshare::tick(node, link)?;
         crate::arcsvc::tick(node, link)?;
+        crate::arcgenesis::tick(&link.peer_id.clone(), link)?;
         crate::shares::tick(link)?;
         crate::mempoolshare::tick(node, peer, link)?;
         crate::crvia::tick(peer, link)?;
@@ -627,6 +628,8 @@ fn serve_loop(
             "cb" => crate::coreboot::on_frame(node, link, &f)?,
             "vx" => crate::vxshare::on_frame(node, link, &f)?,
             "ac" => crate::arcsvc::on_frame(node, link, &f)?,
+            // The genesis bulletin (crate::arcgenesis), before an ARCADE network has a block 0.
+            "gb" => crate::arcgenesis::on_frame(node, &f),
             #[cfg(feature = "oldimport")]
             "lx" => crate::lxfetch::on_frame(node, link, &f)?,
             #[cfg(feature = "oldimport")]

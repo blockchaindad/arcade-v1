@@ -795,3 +795,61 @@ keep 1,152.
 6. **Registration commits most-work-first** when more wait than a block's places (§4; small).
 7. **Testnet restart** with all of the above but item 4 and 5, then the GX10 and the JB20B updated, the genesis list
    (§10) for mainnet, and release checkpoints.
+
+
+### 14.23 Time keepers as built (2026-11-14, rules version 2)
+
+One calculation per height serves every candidate (§6.2). Chia's library proves only one run at a time, but it can start
+a run from any form, and the squaring is the same however it is cut. So a **time keeper** runs from the challenge to the
+lowest candidate's count, hands that candidate its proof, runs on from that output to the next candidate's count, and so
+on. The k-th candidate's proof is the first k runs (`time::join`).
+
+- **In a block:** the runs ride in the proof's bytes, with no change to the header. `output` is the last run's output;
+  `proof` is each earlier run (8 bytes of steps, its output, its proof: 208 bytes) in order, then the last run's proof.
+  The last run's steps are what is left of the block's count. A plain single run is the case of no earlier runs.
+- **Rules version 2** (`params::pot_runs`): a block's proof may come in up to `MAX_POT_RUNS` = 8 runs (`MAX_TIME_BYTES`
+  is 2,048). Version 1 takes single runs only. Testnet: version 2 from block 2,200; mainnet: from block 0. The draw
+  seed's proof stays a single run (one calculator per epoch).
+- **Over the mesh** (`arckeep.rs`, "ac" frames, each passed on once per link): `cand {prev, w, writer, vrf}`, a writer's
+  draw for the block after `prev`; `tp {prev, steps, ol} + output ‖ proof`, a proof for one candidate's count. A keeper
+  takes a `cand` only on its own tip, with a draw that checks (`Chain::candidate`: the VRF on the draw input, no more
+  weight than the writer has) and a score that could win; it takes a `tp` only for a count some candidate needs, checked
+  in full before it is passed on.
+- **Writers:** a draw that could be the height's best (score below 3× the best expected from the whole weight, about 19
+  heights in 20) is announced and the writer also runs its own proof; it writes with whichever is ready first. A draw
+  that can't win is not announced and its own proof runs at the lowest CPU priority, so the chain moves even if every
+  likely writer is away. Nothing depends on a keeper.
+- **Keepers are opt-in** (`arc.keeper {on: true}`; a core while on). `arc.status` → `keeper`; `arc.block` → `pot_runs`.
+- **Tested:** real-VDF unit test (cut runs = single run, tampering refused); a local three-arcade net where two arcades
+  make no proofs of their own and write only with the keeper's (`ARCADE_ARC_TEST_NO_OWN_PROOF`, tests only). Two bugs it
+  found: the "could win" threshold was 2^32 too strict (score units are 2^96), and block ids in frames were decoded
+  without `Hash256::from_hex`'s byte order. Local test settings may set `"rules"`.
+- **Still open (§13 question 3):** keepers aren't paid.
+
+### 14.24 The genesis list as built (2026-11-14)
+
+The list of §10 runs the chain's own checks with the seeds of the list in place of blocks (`genesis.rs`):
+
+| Where the chain uses | the list uses |
+|---|---|
+| a commit's anchor block | `list_anchor(net)` (anchor 0) |
+| the challenge block (proof leaves), the picking block (audit leaves) | `proof_seed = H(closed hash ‖ beacon 1)` |
+| the block after an audit commit (openings) | `open_seed = H(closed hash ‖ beacon 2)` |
+
+- `registry::check_reg_proof` and `registry::check_opening` are shared by the chain and the list.
+- `finalize` keeps each owner's batch with the most stamp work, strikes (with a reason) a batch whose proof fails or
+  whose segments aren't on the list, and each replica whose audit commit or opening fails. A range claimed by two
+  different entries stands for neither, nor anything after it in its chain, until a fraud proof takes the wrong one out;
+  each chain's entries must run from height 0. Entries left with no replica go, and so does what comes after them.
+- `FinalList::hash` is what block 0 carries; `Registry::from_list` starts block 0 with the list's catalog
+  (`Catalog::list_at_genesis`, confirmed at height 0) and replicas registered, counting for the draw from block 1.
+- **The bulletin** (`arcgenesis.rs`, `--arc-genesis <settings>`): records (items, the assembler's receipts, its signed
+  closed hash) kept in `<home>/arc/genesis-<net>/board.bin` and passed on once over every link ("gb" frames). The
+  assembler receipts an item only in its window; every arcade builds the lists from receipted items only. An arcade with
+  Earn ARCADE on for a kept listed chain seals it, posts its entries and one commit, answers beacon 1 (proof and an audit
+  commit per replica) and beacon 2 (openings) by itself, and writes `final.json` once the last window closes.
+  `arc.genesis` shows where it stands. Before block 0, `arc.earn` only marks the coin (it doesn't install a chain).
+- **Beacons:** the first block of `beacon_chain` (Bitcoin on mainnet) with a header time at or after the beacon's moment,
+  `beacon_depth` deep; closed test networks give fixed ones.
+- **Not built yet:** block 0 from `final.json` (settings that name a final list instead of genesis holders), the
+  assembler's 12-31 correction step, and a ready-made mainnet settings file.

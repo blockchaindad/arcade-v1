@@ -21,6 +21,7 @@ mod arcborrow;
 mod arcseal;
 mod arcserve;
 mod arcseg;
+mod arcgenesis;
 mod arckeep;
 mod arcsvc;
 mod borrow;
@@ -353,6 +354,13 @@ fn main() {
         }
     } else if let Err(e) = arcsvc::define_text(&node, arcsvc::TESTNET_SETTINGS) {
         eprintln!("arcaded: the built-in ARCADE testnet: {e}");
+    }
+    // A genesis list to keep and take part in (§10), before that network's block 0.
+    if let Some(settings) = opt("--arc-genesis") {
+        if let Err(e) = arcgenesis::start(&node, std::path::Path::new(&settings)) {
+            eprintln!("arcaded: --arc-genesis: {e}");
+            std::process::exit(1);
+        }
     }
     chains::start_saved(&node);
     borrow::start(node.clone());
