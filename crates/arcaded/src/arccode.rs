@@ -27,9 +27,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Keys whose releases every arcade takes (hex ed25519). Empty until the release key is chosen (Martin's call); closed
-/// test networks name one with `--code-key`.
-pub const RELEASE_KEYS: &[&str] = &[];
+/// Keys whose releases every arcade takes (hex ed25519). Martin 2026-11-14: "strawberry should hold the release key":
+/// @strawberry's release key (kept beside its publish key, apart from it: it signs code releases and nothing else).
+/// Closed test networks add one with `--code-key`.
+pub const RELEASE_KEYS: &[&str] = &["e638005c7603c41e7fe7ad871affe601c85e88aff6b9ce7a2fb146334ae2bd67"];
 /// Releases whose programs are kept (the bundles and dependencies of every release are).
 pub const KEEP_PROGRAMS: usize = 5;
 /// Bytes of a file per answer (a mesh frame is 64 KiB at most, head and blob).
