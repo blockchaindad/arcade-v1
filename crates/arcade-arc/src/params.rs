@@ -177,8 +177,9 @@ pub const TESTNET: Net = Net {
     // The main network's, and the other test chains: small, so cheap to try things on.
     listed: &["arctest", "pep", "peptest", "doge", "dgb", "dgbtest", "flop", "wjk", "kot", "ltc", "ltctest", "btc"],
     block_seconds: BLOCK_SECONDS,
-    // Version 2 (time keepers) from block 2,200 (2026-11-14: about two days ahead, so every arcade can update).
-    rules: &[(1, 0), (2, 2_200)],
+    // Version 2 (time keepers, the writer's share) from block 1,065 (Martin 2026-11-14: "we need this stuff now",
+    // "1065"; was 2,200).
+    rules: &[(1, 0), (2, 1_065)],
     audit_period: AUDIT_PERIOD_BLOCKS,
 };
 
