@@ -635,7 +635,7 @@ pub fn register(node: &Node, net: &Net, p: &ChainParams, reg: &Registry, tip: u6
 }
 
 /// This arcade's address on the chain (its wallet's first key), as a payout.
-fn payout_of(node: &Node, net: &Net, p: &ChainParams) -> Option<block::Payout> {
+pub(crate) fn payout_of(node: &Node, net: &Net, p: &ChainParams) -> Option<block::Payout> {
     let (k, _) = node.app.tag_key(p, 0).ok()?;
     let pk = hex::decode(&k.pubkey).ok()?;
     let mut out = [0u8; 21];

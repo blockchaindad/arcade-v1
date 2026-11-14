@@ -32,7 +32,7 @@ fn note(h: u64, replica: &Hash, what: String) {
 }
 
 /// Every audit leaf of a sealed copy with the picking block's seed: one read through it.
-fn audit_leaves(net: &Net, r: &crate::arcseal::Replica, seed: &Hash) -> Result<Vec<Hash>, String> {
+pub(crate) fn audit_leaves(net: &Net, r: &crate::arcseal::Replica, seed: &Hash) -> Result<Vec<Hash>, String> {
     let f = std::fs::File::open(r.dir.join("sealed.bin")).map_err(|e| e.to_string())?;
     let mut out = Vec::with_capacity(r.leaves as usize);
     let mut buf = vec![0u8; SEALED_LEAF * 8192];

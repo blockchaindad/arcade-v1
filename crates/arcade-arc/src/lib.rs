@@ -6,6 +6,7 @@ pub mod catalog;
 pub mod chain;
 pub mod coins;
 pub mod draw;
+pub mod genesis;
 pub mod light;
 pub mod log;
 pub mod merkle;

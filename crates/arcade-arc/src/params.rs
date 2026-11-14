@@ -110,8 +110,35 @@ pub struct Net {
     pub audit_period: u64,
 }
 
-/// The newest rules version this arcade knows.
-pub const RULES_KNOWN: u32 = 1;
+/// The newest rules version this arcade knows. Version 2 (time keepers, §6.2): a block's proof of time may come in
+/// up to [`MAX_POT_RUNS`] runs one after another.
+pub const RULES_KNOWN: u32 = 2;
+
+/// The most runs a block's proof of time may come in from rules version 2 (a time keeper serving the 8 lowest
+/// candidates of a height; the 8th candidate's proof is 8 runs).
+pub const MAX_POT_RUNS: usize = 8;
+
+/// The block writer's own share of each block's 50 from rules version 2 (Martin 2026-11-14: 1 to the writer, 49 to the
+/// storage pot, fees still into the pot): a withheld or lost block costs its writer something.
+pub const WRITER_REWARD: u64 = COIN;
+
+/// What the writer of the block at `height` is paid in its own coinbase.
+pub fn writer_reward(net: &Net, height: u64) -> u64 {
+    if net.rules_at(height) >= 2 {
+        WRITER_REWARD
+    } else {
+        0
+    }
+}
+
+/// The most runs a block at `height` may carry in its proof of time.
+pub fn pot_runs(net: &Net, height: u64) -> usize {
+    if net.rules_at(height) >= 2 {
+        MAX_POT_RUNS
+    } else {
+        1
+    }
+}
 
 /// The ARCADE mesh protocol this arcade speaks, and the oldest it takes ARCADE frames from (§14.21).
 pub const PROTOCOL: u32 = 1;
@@ -135,7 +162,7 @@ pub const MAINNET: Net = Net {
     genesis_time: Some(1_798_761_600),
     listed: &["arc", "pep", "peptest", "doge", "dgb", "flop", "wjk", "kot", "ltc", "btc"],
     block_seconds: BLOCK_SECONDS,
-    rules: &[(1, 0)],
+    rules: &[(2, 0)],
     audit_period: AUDIT_PERIOD_BLOCKS,
 };
 
@@ -150,7 +177,8 @@ pub const TESTNET: Net = Net {
     // The main network's, and the other test chains: small, so cheap to try things on.
     listed: &["arctest", "pep", "peptest", "doge", "dgb", "dgbtest", "flop", "wjk", "kot", "ltc", "ltctest", "btc"],
     block_seconds: BLOCK_SECONDS,
-    rules: &[(1, 0)],
+    // Version 2 (time keepers) from block 2,200 (2026-11-14: about two days ahead, so every arcade can update).
+    rules: &[(1, 0), (2, 2_200)],
     audit_period: AUDIT_PERIOD_BLOCKS,
 };
 

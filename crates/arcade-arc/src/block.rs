@@ -39,7 +39,8 @@ pub const TX_FORMAT: Format = Format { auxpow: false, ..Format::AUXPOW };
 /// The header layout's version; a header also says its rules version in the same field (params::Net::rules_at).
 pub const HEADER_VERSION: u32 = 1;
 /// Longest proof-of-time output or proof, in bytes.
-pub const MAX_TIME_BYTES: usize = 512;
+/// (Rules version 2: a proof of up to 8 runs is 100 + 7 × 208 bytes.)
+pub const MAX_TIME_BYTES: usize = 2_048;
 /// Longest Merkle path (a tree of 2^40 leaves).
 pub const MAX_PATH: usize = 40;
 /// Longest source chain key ("doge", "peptest", ...).
@@ -1299,7 +1300,7 @@ mod tests {
         let mut bytes = Vec::new();
         signed(header(1)).encode(&mut bytes);
         let mut v2 = bytes.clone();
-        v2[0] = 2;
+        v2[0] = params::RULES_KNOWN as u8 + 1;
         assert!(Header::decode(&mut Reader::new(&v2)).is_err());
         let mut long = header(1);
         long.pot.proof = vec![0; MAX_TIME_BYTES + 1];

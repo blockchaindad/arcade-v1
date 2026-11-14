@@ -1,10 +1,13 @@
 //! Updates (the Options tab): this arcade's programs replaced by the newest release, when the
-//! operator turns it on (off by default). Every few hours it asks GitHub for the releases, takes
-//! the newest plain one (vX.Y.Z; the Windows pre-releases aren't for here) with a build for this
-//! machine, checks the download against the release's SHA-256 file, makes sure the new arcaded
-//! says it is that version, swaps the programs where they are installed (the old ones kept as
-//! `<name>.prev`), and restarts: the same clean stop as `systemctl stop` (coin caches written),
-//! then this process starts the new arcaded in its place with the same options.
+//! operator turns it on (off by default). **Releases come from the Arcade V1 network itself**
+//! (Martin 2026-11-14: "Arcade V1 should be where arcade V1 is pulling all future updates"): every
+//! arcade keeps the signed releases of `@arcade/arcade-v1` (crate::arccode: records signed by
+//! Strawberry's release key, every file checked against its record), so a new release reaches this
+//! arcade from the arcades it is linked to, with no website in between. Every few minutes it takes
+//! the newest release (vX.Y.Z) whose program archive for this machine is held here, checks it again,
+//! makes sure the new arcaded says it is that version, swaps the programs where they are installed
+//! (the old ones kept as `<name>.prev`), and restarts: the same clean stop as `systemctl stop` (coin
+//! caches written), then this process starts the new arcaded in its place with the same options.
 //!
 //! "Check now" and "Update now" do the same by hand. Linux only for now (the Windows build
 //! updates with its installer). A local build (no release version) never updates itself.
@@ -12,26 +15,17 @@
 use crate::node::Node;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 const SETTING: &[u8] = b"auto_update";
 /// How often an arcade with updates on looks for a new release (the first look ten minutes after
 /// it starts, each a little later than the last so arcades don't all ask at once).
-const EVERY_SECS: u64 = 6 * 3600;
-const FIRST_SECS: u64 = 600;
+/// (Looking is reading this arcade's own code store, so it can be often.)
+const EVERY_SECS: u64 = 600;
+const FIRST_SECS: u64 = 120;
 /// The programs a release carries; each one present beside arcaded is replaced.
 const PROGRAMS: &[&str] = &["arcaded", "arcade", "arcade-desktop"];
-const MAX_DOWNLOAD: u64 = 300 << 20;
-
-fn repo() -> String {
-    std::env::var("ARCADE_GITHUB").unwrap_or_else(|_| "martinseeger2002/arcade-v1".into())
-}
-
-/// GitHub's API (ARCADE_UPDATE_API: another one, for tests run off the network).
-fn api_base() -> String {
-    std::env::var("ARCADE_UPDATE_API").unwrap_or_else(|_| "https://api.github.com".into())
-}
 
 /// This build's release version (None for a local build).
 pub fn version() -> Option<&'static str> {
@@ -44,7 +38,7 @@ fn parse(v: &str) -> Option<(u64, u64, u64)> {
     it.next().is_none().then_some(t)
 }
 
-/// The release asset built for this machine, if releases carry one.
+/// The release archive built for this machine (the folder inside it is named the same, without .tar.gz).
 fn asset_name() -> Option<String> {
     if !cfg!(target_os = "linux") {
         return None;
@@ -53,6 +47,11 @@ fn asset_name() -> Option<String> {
         a @ ("x86_64" | "aarch64") => Some(format!("arcade-v1-linux-{a}.tar.gz")),
         _ => None,
     }
+}
+
+/// The release file that holds that archive (`program-<platform>`, crate::arccode).
+fn program_file() -> Option<String> {
+    asset_name().map(|a| format!("program-{}", a.trim_start_matches("arcade-v1-").trim_end_matches(".tar.gz")))
 }
 
 #[derive(Default, Clone)]
@@ -115,38 +114,18 @@ pub fn status(node: &Node) -> Value {
         "version": version(), "on": on(node), "supported": unsupported().is_none(), "why_not": unsupported(),
         "newest": s.newest, "newer": newer, "last_check": if s.last_check == 0 { Value::Null } else { json!(s.last_check) },
         "doing": s.doing, "error": s.error, "installed": s.installed,
-        "every_hours": EVERY_SECS / 3600, "from": format!("github.com/{}", repo()),
+        "every_minutes": EVERY_SECS / 60, "from": "the Arcade V1 network: releases of @arcade/arcade-v1 signed by Strawberry's release key",
     })
 }
 
-fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new().timeout_connect(std::time::Duration::from_secs(20)).timeout(std::time::Duration::from_secs(600)).build()
-}
-
-fn get(url: &str) -> Result<ureq::Response, String> {
-    agent().get(url).set("User-Agent", "arcade-v1-updater").set("Accept", "application/vnd.github+json").call().map_err(|e| e.to_string())
-}
-
-/// The newest plain release with a build for this machine: (tag, tarball url, sha256 url).
+/// The newest release of the arcade's own code whose archive for this machine is held here: (tag, archive, sha256).
 fn newest_release() -> Result<Option<(String, String, String)>, String> {
-    let want = asset_name().ok_or("no release build for this system")?;
-    let list: Value = get(&format!("{}/repos/{}/releases?per_page=30", api_base(), repo()))?
-        .into_json().map_err(|e| e.to_string())?;
-    let mut best: Option<((u64, u64, u64), String, String, String)> = None;
-    for r in list.as_array().into_iter().flatten() {
-        if r["draft"] == true || r["prerelease"] == true {
-            continue;
-        }
-        let Some(tag) = r["tag_name"].as_str() else { continue };
-        let Some(v) = parse(tag) else { continue };
-        let url = |name: &str| r["assets"].as_array().into_iter().flatten()
-            .find(|a| a["name"] == name).and_then(|a| a["browser_download_url"].as_str().map(String::from));
-        let (Some(tar), Some(sum)) = (url(&want), url(&format!("{want}.sha256"))) else { continue };
-        if best.as_ref().is_none_or(|b| v > b.0) {
-            best = Some((v, tag.to_string(), tar, sum));
-        }
-    }
-    Ok(best.map(|(_, t, a, s)| (t, a, s)))
+    let file = program_file().ok_or("no release build for this system")?;
+    let best = crate::arccode::held_programs(crate::arccode::ARCADE_V1, &file)
+        .into_iter()
+        .filter_map(|(v, path, sha)| Some((parse(&v)?, v, path, sha)))
+        .max_by(|a, b| a.0.cmp(&b.0));
+    Ok(best.map(|(_, v, path, sha)| (v, path.to_string_lossy().into_owned(), sha)))
 }
 
 /// Look for a release (status updated); Some(the release) when it is newer than this build.
@@ -170,18 +149,8 @@ pub fn check() -> Result<Option<(String, String, String)>, String> {
     }
 }
 
-fn download(url: &str, to: &Path) -> Result<(), String> {
-    let r = get(url)?;
-    let mut f = std::fs::File::create(to).map_err(|e| e.to_string())?;
-    let n = std::io::copy(&mut std::io::Read::take(r.into_reader(), MAX_DOWNLOAD + 1), &mut f).map_err(|e| e.to_string())?;
-    if n > MAX_DOWNLOAD {
-        return Err("the download is too big".into());
-    }
-    Ok(())
-}
-
-/// Download, check and put in place release `tag`; then restart into it.
-fn install(node: &Node, tag: &str, tar_url: &str, sum_url: &str) -> Result<(), String> {
+/// Check and put in place release `tag` (its archive at `archive`, which must hash to `want`); then restart into it.
+fn install(node: &Node, tag: &str, archive: &str, want: &str) -> Result<(), String> {
     if let Some(why) = unsupported() {
         return Err(why);
     }
@@ -191,14 +160,13 @@ fn install(node: &Node, tag: &str, tar_url: &str, sum_url: &str) -> Result<(), S
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
     let result = (|| -> Result<(), String> {
-        st().lock().unwrap().doing = "downloading";
+        st().lock().unwrap().doing = "checking the release";
         let tarball = work.join("release.tar.gz");
-        download(tar_url, &tarball)?;
-        let sums = get(sum_url)?.into_string().map_err(|e| e.to_string())?;
-        let want = sums.split_whitespace().next().filter(|h| h.len() == 64).ok_or("the release's SHA-256 file is unreadable")?.to_lowercase();
+        std::fs::copy(archive, &tarball).map_err(|e| format!("the release archive: {e}"))?;
+        // Checked when it was kept; once more, as it is what runs next.
         let got = hex::encode(Sha256::digest(std::fs::read(&tarball).map_err(|e| e.to_string())?));
         if got != want {
-            return Err(format!("the download doesn't match the release's SHA-256 ({got} is not {want})"));
+            return Err(format!("the release archive doesn't match its record ({got} is not {want})"));
         }
         st().lock().unwrap().doing = "installing";
         let out = std::process::Command::new("tar").arg("--no-same-owner").arg("-xzf").arg(&tarball).arg("-C").arg(&work).output().map_err(|e| format!("tar: {e}"))?;
