@@ -263,6 +263,40 @@ impl Catalog {
         undo.0.push(Op::Confirmed { id: *id, dropped, new_span });
     }
 
+    /// Block 0's catalog (§10): the final genesis list's entries, confirmed at height 0 with no weight behind them yet
+    /// (the list itself is what stands behind them: every one has a replica that passed a full audit). Each is checked
+    /// as an offer is (a listed chain and family, whole ranges, a full segment, its poster's signature), and each
+    /// chain's entries must run from height 0 with no gap or overlap.
+    pub fn list_at_genesis(&mut self, entries: &[CatalogEntry]) -> Result<(), BlockError> {
+        if !self.lines.is_empty() {
+            return Err(no("genesis catalog: only an empty catalog"));
+        }
+        let mut sorted: Vec<&CatalogEntry> = entries.iter().collect();
+        sorted.sort_by(|a, b| line_of(a).cmp(&line_of(b)).then(a.first.cmp(&b.first)));
+        for e in sorted {
+            if !self.net.listed.contains(&e.chain.as_str()) || !segment::FAMILIES.contains(&e.family) || !segment::whole_ranges(e.first, e.last) {
+                return Err(no("genesis catalog: not a listed chain, family or whole ranges"));
+            }
+            let least = (e.last - e.first + 1).checked_mul(segment::ROW).and_then(|table| table.checked_add(self.full));
+            if least.map_or(true, |least| e.bytes < least) {
+                return Err(no("genesis catalog: not a full segment"));
+            }
+            if !block::verify(&e.poster, &e.message(&self.net), &e.sig) {
+                return Err(BlockError::BadSignature("genesis catalog entry"));
+            }
+            let line = line_of(e);
+            let id = e.segment(&self.net);
+            let spans = self.lines.entry(line.clone()).or_default();
+            if e.first != spans.last().map_or(0, |s| s.last + 1) || self.listed.contains_key(&id) {
+                return Err(no("genesis catalog: a chain's entries must run from 0 with no gap or overlap"));
+            }
+            spans.push(Span { first: e.first, last: e.last, listed: Some(Listed { id, entry: e.clone(), height: 0 }) });
+            let at = spans.len() - 1;
+            self.listed.insert(id, (line, at));
+        }
+        Ok(())
+    }
+
     /// Take a confirmed segment out: it was proved wrong, or its holders didn't answer. Its
     /// span stays where it is and is open for another entry. `false` when `id` isn't listed.
     pub fn remove(&mut self, id: &Hash, undo: &mut Undo) -> bool {

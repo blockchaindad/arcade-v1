@@ -83,7 +83,7 @@ const ANSWERS_AFTER: Duration = Duration::from_secs(30);
 /// The most headers in one shared-core answer.
 pub const LENT_HEADERS: usize = 500;
 
-type LocalChain = Chain<Clock, Registry>;
+pub(crate) type LocalChain = Chain<Clock, Registry>;
 
 /// The proof of time a chain runs on (its settings' "time"): Chia's VDF (§6.2, "vdf"), or the stand-in a local test
 /// chain may still use (a hash, made at once; the writer then waits as long as the steps would take).
@@ -110,6 +110,12 @@ impl TimeProofs for Clock {
             Clock::Vdf => ChiaVdf.verify(challenge, steps, proof),
         }
     }
+    fn verify_pot(&self, challenge: &arcade_arc::merkle::Hash, steps: u64, proof: &TimeProof, most: usize) -> bool {
+        match self {
+            Clock::StandIn => StandIn.verify_pot(challenge, steps, proof, most),
+            Clock::Vdf => ChiaVdf.verify_pot(challenge, steps, proof, most),
+        }
+    }
     fn takes_time(&self) -> bool {
         *self == Clock::Vdf
     }
@@ -132,6 +138,9 @@ pub struct Settings {
     pub clock: Clock,
     /// Blocks in an audit period (100 to the rule's 1,152); the rule's when not given. A local test chain sets fewer.
     pub audit_period: u64,
+    /// The rules versions and their first heights ([[1, 0], [2, 30]]); the network's when not given. A local test
+    /// chain sets its own, so a test sees a rules switch in minutes.
+    pub rules: Option<&'static [(u32, u64)]>,
 }
 
 impl Settings {
@@ -183,7 +192,24 @@ impl Settings {
             Value::Null => params::AUDIT_PERIOD_BLOCKS,
             n => n.as_u64().filter(|b| (100..=params::AUDIT_PERIOD_BLOCKS).contains(b)).ok_or("settings: audit_period must be from 100 to the rule's 1,152")?,
         };
-        Ok(Settings { genesis, holders, steps_per_second, segment_bytes, block_seconds, clock, audit_period })
+        let rules = match &v["rules"] {
+            Value::Null => None,
+            r => {
+                let list: Vec<(u32, u64)> = r
+                    .as_array()
+                    .ok_or("settings: rules must be a list of [version, height]")?
+                    .iter()
+                    .map(|x| Some((x[0].as_u64().filter(|v| (1..=params::RULES_KNOWN as u64).contains(v))? as u32, x[1].as_u64()?)))
+                    .collect::<Option<_>>()
+                    .ok_or("settings: rules must be [version, height] pairs of versions this arcade knows")?;
+                if list.first() != Some(&(1, 0)) || list.windows(2).any(|w| w[1].0 <= w[0].0 || w[1].1 <= w[0].1) {
+                    return Err("settings: rules start with [1, 0], versions and heights rising".into());
+                }
+                // Read once per arcade; the rules are 'static as the built-in networks' are.
+                Some(&*Box::leak(list.into_boxed_slice()))
+            }
+        };
+        Ok(Settings { genesis, holders, steps_per_second, segment_bytes, block_seconds, clock, audit_period, rules })
     }
 }
 
@@ -260,6 +286,11 @@ pub struct Svc {
 }
 
 impl Svc {
+    /// The chain, for a moment (time keepers, crate::arckeep).
+    pub(crate) fn with_chain<R>(&self, f: impl FnOnce(&LocalChain) -> R) -> R {
+        f(&self.st.lock().unwrap().chain)
+    }
+
     /// Whether this copy is as far as the arcades it is linked to: none of them has named a
     /// block it lacks, and one has spoken (or none did for a good while: it may be alone).
     fn caught_up(&self) -> bool {
@@ -441,7 +472,7 @@ fn take_tx(svc: &Svc, raw: &[u8]) -> Result<(Hash256, u64), PoolError> {
 
 /// The proof of time behind the draw seed of the epoch the block after the tip starts, where
 /// it starts one.
-fn seed_proof(chain: &LocalChain) -> Option<TimeProof> {
+pub(crate) fn seed_proof(chain: &LocalChain) -> Option<TimeProof> {
     let tip = chain.tip();
     if (tip.height + 1) % params::EPOCH_BLOCKS != 0 {
         return None;
@@ -566,7 +597,8 @@ fn run_writer_on(node: Arc<Node>, svc: Arc<Svc>, wrote: &mut VecDeque<Hash256>, 
     let secret = node.identity.to_bytes();
     // The tip drawn on, and what came of it.
     let mut on: Option<Hash256> = None;
-    let mut ticket: Option<(Ticket, Option<TimeProof>)> = None;
+    // The draw for the tip, its draw seed's proof, and whether it could be the height's best (crate::arckeep).
+    let mut ticket: Option<(Ticket, Option<TimeProof>, bool)> = None;
     let mut written: Option<Block> = None;
     // The VDF's proof of time for this tip's ticket, made in the background: (tip, its proof when done).
     let proving: Arc<Mutex<Option<(Hash256, Option<TimeProof>)>>> = Arc::new(Mutex::new(None));
@@ -587,9 +619,18 @@ fn run_writer_on(node: Arc<Node>, svc: Arc<Svc>, wrote: &mut VecDeque<Hash256>, 
                 on = Some(tip);
                 let seed = seed_proof(&st.chain);
                 // Written on before: never a second block on it.
-                ticket = if wrote.contains(&tip) { None } else { st.chain.ticket(&secret, seed.as_ref()).map(|t| (t, seed)) };
+                ticket = if wrote.contains(&tip) { None } else { st.chain.ticket(&secret, seed.as_ref()).map(|t| (t, seed)) }.map(|(t, seed)| {
+                    let likely = crate::arckeep::plausible(t.score, st.chain.storage().total_weight());
+                    // A draw that could win the height: the keepers hear of it (one serving every candidate, §6.2).
+                    if likely && *st.chain.proofs() == Clock::Vdf {
+                        let me = node.identity.verifying_key().to_bytes();
+                        let f = frame(&svc, "cand", json!({"prev": tip.to_hex(), "w": t.weight, "writer": hex::encode(me), "vrf": hex::encode(t.vrf_proof)}));
+                        crate::arckeep::announce(f, tip, me, t.weight, t.vrf_proof, t.steps);
+                    }
+                    (t, seed, likely)
+                });
             }
-            let Some((t, seed)) = &ticket else { continue };
+            let Some((t, seed, likely)) = &ticket else { continue };
             let pot = match *st.chain.proofs() {
                 // The stand-in: wait as long as the steps would take.
                 Clock::StandIn => {
@@ -600,6 +641,11 @@ fn run_writer_on(node: Arc<Node>, svc: Arc<Svc>, wrote: &mut VecDeque<Hash256>, 
                 }
                 // The VDF: run it once for this tip, in the background; written when it is done (if still the tip).
                 Clock::Vdf => {
+                    // A keeper's proof for our count, if one came first (checked when it came).
+                    if let Some(proof) = crate::arckeep::proof_for(&tip, t.steps) {
+                        eprintln!("arc: writing with a time keeper's proof ({} steps)", t.steps);
+                        *proving.lock().unwrap() = Some((tip, Some(proof)));
+                    }
                     let mut p = proving.lock().unwrap();
                     match p.as_ref() {
                         Some((at, Some(proof))) if *at == tip => proof.clone(),
@@ -611,9 +657,18 @@ fn run_writer_on(node: Arc<Node>, svc: Arc<Svc>, wrote: &mut VecDeque<Hash256>, 
                             for tid in running.lock().unwrap().iter() {
                                 crate::rulecheck::lowest_priority_of(*tid);
                             }
-                            let (job, challenge, steps, running) = (proving.clone(), t.challenge, t.steps, running.clone());
+                            // Tests only: an arcade too slow to make its own proof in time leans on the keepers.
+                            if std::env::var("ARCADE_ARC_TEST_NO_OWN_PROOF").is_ok() {
+                                continue;
+                            }
+                            let (job, challenge, steps, running, likely) = (proving.clone(), t.challenge, t.steps, running.clone(), *likely);
                             let _ = std::thread::Builder::new().name("arc proof of time".into()).spawn(move || {
                                 let me = crate::rulecheck::thread_id();
+                                // A draw that can't be the height's best only keeps the chain moving if every likely
+                                // writer is away: spare CPU only.
+                                if !likely {
+                                    crate::rulecheck::lowest_priority();
+                                }
                                 running.lock().unwrap().push(me);
                                 let proof = Clock::Vdf.prove(&challenge, steps);
                                 running.lock().unwrap().retain(|t| *t != me);
@@ -668,7 +723,7 @@ pub fn define(node: &Arc<Node>, settings: &std::path::Path) -> Result<(), String
 /// [`define`] from the settings' text (the built-in testnet's, or a file's).
 pub fn define_text(node: &Arc<Node>, text: &str) -> Result<(), String> {
     let s = Settings::parse(&params::TESTNET, text)?;
-    let net = Net { block_seconds: s.block_seconds, audit_period: s.audit_period, ..params::TESTNET };
+    let net = Net { block_seconds: s.block_seconds, audit_period: s.audit_period, rules: s.rules.unwrap_or(params::TESTNET.rules), ..params::TESTNET };
     Registry::new(&net, &s.holders, s.segment_bytes).ok_or("settings: the holders list doesn't hold (a key twice, nothing held, or an address of another network)")?;
     let genesis = s.genesis.id(&net);
     let def = Def { net, params: store::chain_params(&net, &genesis), genesis, settings: s };
@@ -864,11 +919,25 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
         let n = node.clone();
         std::thread::Builder::new().name("arc writer".into()).spawn(move || run_writer(n, svc)).map_err(|e| e.to_string())?;
     }
+    // The time keeper (crate::arckeep): one thread for the arcade's life, idle unless turned on.
+    static KEEPER: std::sync::Once = std::sync::Once::new();
+    KEEPER.call_once(|| {
+        let n = node.clone();
+        let _ = std::thread::Builder::new().name("arc keeper".into()).spawn(move || crate::arckeep::run(n));
+    });
     Ok(())
 }
 
 // ---------------------------------------------------------------------------------------
 // The mesh
+
+/// An "ac" frame of the time keepers' (crate::arckeep), as every ARCADE frame is made.
+pub(crate) fn keeper_frame(op: &str, head: Value) -> Frame {
+    match svc() {
+        Some(svc) => frame(&svc, op, head),
+        None => Frame::new(head),
+    }
+}
 
 fn frame(svc: &Svc, op: &str, mut head: Value) -> Frame {
     head["t"] = json!("ac");
@@ -1108,6 +1177,9 @@ pub fn on_frame(node: &Node, link: &mut Link, f: &Frame) -> Result<(), LinkError
         // Fraud proofs (crate::arcfraud): a segment's leaf hashes or a run of its leaves, asked of its holders.
         "lq" => crate::arcfraud::serve(node, &svc.net, link, &f.head, |op, head| frame(svc, op, head))?,
         "la" => crate::arcfraud::on_answer(&f.head, &f.blob),
+        // Time keepers (crate::arckeep): a writer's draw, and a proof of time for one.
+        "cand" => crate::arckeep::on_cand(f),
+        "tp" => crate::arckeep::on_tp(f),
         _ => {}
     }
     Ok(())
@@ -1301,6 +1373,8 @@ pub fn tick(_node: &Node, link: &mut Link) -> Result<(), LinkError> {
         f.blob = blob_of(&news);
         link.send(&f)?;
     }
+    // Time keepers' frames this peer hasn't had (crate::arckeep).
+    crate::arckeep::tick(&link.peer_id.clone(), link)?;
     // Storage items waiting for a block (crate::arcseg).
     if let Some(blob) = crate::arcseg::due_for(&link.peer_id) {
         let mut f = frame(svc, "it", json!({}));
@@ -1351,6 +1425,7 @@ pub fn status(node: &Node) -> Result<Value, String> {
         "waiting_bytes": st.pool.bytes(),
         "stored": node.chain.tip(svc.params.chain_no).map_err(db_err)?.map(|s| s.height),
         "serving_checks": crate::arcserve::status(),
+        "keeper": crate::arckeep::status(node),
         "audits": crate::arcaudit::status(node, st.chain.storage()),
         // The rules (§14.21): the version now, what this arcade knows, and an update the mesh says is needed.
         "rules": {"now": svc.net.rules_at(t.height + 1), "known": params::RULES_KNOWN, "protocol": params::PROTOCOL,
@@ -1586,6 +1661,8 @@ pub fn block(req: &Value) -> Result<Value, String> {
         // With "raw": true, the transactions themselves, in the block's order.
         "raw": if req["raw"] == true { json!(b.map(|b| b.txs.iter().map(|t| hex::encode(&t.raw)).collect::<Vec<_>>()).unwrap_or_default()) } else { Value::Null },
         "bytes": b.map(|b| b.encode().len()).unwrap_or(0),
+        // Runs its proof of time came in: more than 1 is a time keeper's (§6.2, rules version 2).
+        "pot_runs": b.map(|b| 1 + b.header.pot.proof.len().saturating_sub(arcade_arc::time::FORM_BYTES) / arcade_arc::time::SEGMENT_BYTES),
     }))
 }
 

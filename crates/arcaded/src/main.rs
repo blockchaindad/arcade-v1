@@ -21,6 +21,7 @@ mod arcborrow;
 mod arcseal;
 mod arcserve;
 mod arcseg;
+mod arckeep;
 mod arcsvc;
 mod borrow;
 mod appsvc;
