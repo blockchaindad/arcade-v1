@@ -214,6 +214,9 @@ pub struct Applied {
     pub seed: Hash,
     /// The block's transaction fees: they join the pot (docs/ARCADECHAIN.md §14.18).
     pub fees: u64,
+    /// What its coinbase paid its writer (params::writer_reward, when the writer has a payout address): that much of
+    /// the block's 50 doesn't join the pot.
+    pub writer_paid: u64,
 }
 
 /// The storage side of the state, as the chain's rules need it: who has how much draw
@@ -231,6 +234,13 @@ pub trait Storage {
 
     /// What the coinbase of the next block, at `height`, must pay: (amount, script), in order.
     fn payouts(&self, height: u64) -> Vec<(u64, Vec<u8>)>;
+
+    /// Where a block's writer is paid its own share (rules version 2): its payout address as a script. None when it has
+    /// none on record (its share then stays in the pot).
+    fn writer_payout(&self, writer: &Key) -> Option<Vec<u8>> {
+        let _ = writer;
+        None
+    }
 
     /// Take in the next block: check its storage items and do what they and the block say.
     /// Nothing may be changed when the answer is an error.
@@ -388,7 +398,7 @@ pub fn check_header(net: &Net, proofs: &impl TimeProofs, parent: &Entry, branch:
     let drawn = vrf::verify(&header.writer, &input, &header.vrf_proof).ok_or(ChainError::Draw)?;
     let score = draw::score(&drawn, header.weight);
     let steps = draw::steps(score, header.difficulty);
-    if !proofs.verify(&time::block_challenge(net, &header.prev), steps, &header.pot) {
+    if !proofs.verify_pot(&time::block_challenge(net, &header.prev), steps, &header.pot, params::pot_runs(net, height)) {
         return Err(ChainError::TimeProof);
     }
 
@@ -502,9 +512,27 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
         &self.storage
     }
 
-    /// What the next block's coinbase must pay.
+    /// What the next block's coinbase must pay, before its writer's own share.
     pub fn payouts(&self) -> Vec<(u64, Vec<u8>)> {
         self.storage.payouts(self.tip().height + 1)
+    }
+
+    /// What the coinbase of `writer`'s block after the tip must pay: the payouts owed, then the writer's own share.
+    pub fn payouts_for(&self, writer: &Key) -> Vec<(u64, Vec<u8>)> {
+        self.payouts_at(self.tip().height + 1, writer).0
+    }
+
+    fn payouts_at(&self, height: u64, writer: &Key) -> (Vec<(u64, Vec<u8>)>, u64) {
+        let mut out = self.storage.payouts(height);
+        let share = params::writer_reward(&self.net, height);
+        let mut paid = 0;
+        if share > 0 {
+            if let Some(script) = self.storage.writer_payout(writer) {
+                out.push((share, script));
+                paid = share;
+            }
+        }
+        (out, paid)
     }
 
     /// Proof, as found, that a writer signed two blocks on one block (§5.1).
@@ -665,9 +693,9 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
                 return Err(ChainError::Tx(coins::TxError::Order));
             }
         }
-        let payouts = self.storage.payouts(entry.height);
+        let (payouts, writer_paid) = self.payouts_at(entry.height, &block.header.writer);
         let changes = coins::check_block(&block.txs, entry.height, &entry.prev, &self.coins, &payouts)?;
-        let undo = self.storage.apply(block, &Applied { height: entry.height, id: *id, seed: entry.seed, fees: changes.fees })?;
+        let undo = self.storage.apply(block, &Applied { height: entry.height, id: *id, seed: entry.seed, fees: changes.fees, writer_paid })?;
         for (at, _) in &changes.spent {
             self.coins.remove(at);
         }
@@ -745,6 +773,30 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
     pub fn ticket(&self, secret: &[u8; 32], draw_seed: Option<&TimeProof>) -> Option<Ticket> {
         self.ticket_on(self.tip(), secret, self.storage.weight(&vrf::public_key(secret)), draw_seed)
     }
+
+    /// A time keeper's check of another arcade's draw for the block after the tip (§6.2): its VRF proof on the draw
+    /// input, with no more weight than it has. The (score, steps) its block's proof of time needs, or None.
+    pub fn candidate(&self, writer: &Key, weight: u64, vrf_proof: &VrfProof, draw_seed: Option<&TimeProof>) -> Option<(u128, u64)> {
+        let parent = self.tip();
+        if weight == 0 || weight > self.storage.weight(writer) {
+            return None;
+        }
+        let height = parent.height + 1;
+        let seed = if height % params::EPOCH_BLOCKS == 0 {
+            let proof = draw_seed?;
+            let (challenge, steps) = seed_task(&self.net, parent, &self.branch(parent));
+            if !self.proofs.verify(&challenge, steps, proof) {
+                return None;
+            }
+            time::draw_seed(&self.net, &proof.output)
+        } else {
+            parent.draw_seed
+        };
+        let drawn = vrf::verify(writer, &draw::draw_input(&self.net, &seed, height), vrf_proof)?;
+        let score = draw::score(&drawn, weight);
+        Some((score, draw::steps(score, next_difficulty(&self.net, parent, &self.branch(parent)))))
+    }
+
 }
 
 // ---------------------------------------------------------------------------------------
@@ -861,7 +913,7 @@ impl Storage for FixedHolders {
         let catalog = self.catalog.apply(&block.items, at.height, &Fixed(&self.weights, self.total))?;
         let before = self.pot;
         let paid: u64 = self.payouts(at.height).iter().map(|(amount, _)| amount).sum();
-        self.pot = self.pot - paid + params::BLOCK_REWARD + at.fees;
+        self.pot = self.pot - paid + params::BLOCK_REWARD - at.writer_paid + at.fees;
         Ok((before, catalog))
     }
 

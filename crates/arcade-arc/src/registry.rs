@@ -34,7 +34,7 @@
 //!
 //! Everything here is rebuilt from the blocks (the block log is replayed at start).
 
-use crate::block::{self, AuditCommit, AuditOpening, BadHeader, Block, BlockError, Equivocation, Item, Key, Payout, Reaudit, RegCommit, RegProof, RevealAnswer, RevealDemand, TxAnswer, TxChallenge, Verdict};
+use crate::block::{self, AuditCommit, AuditOpening, BadHeader, Block, BlockError, CatalogEntry, Equivocation, Item, Key, Payout, Reaudit, RegCommit, RegProof, RevealAnswer, RevealDemand, TxAnswer, TxChallenge, Verdict};
 use crate::catalog::{self, Catalog};
 use crate::chain::{Applied, Storage};
 use crate::draw;
@@ -192,6 +192,57 @@ pub fn sample(net: &Net, seed: &Hash, owner: &Key, replicas: &[(Hash, u64)], fro
         }
     }
     out
+}
+
+/// A registration proof's leaves (§4 step 2): the ones `seed` picks across the batch (`entries` with their replica
+/// `roots`, in the batch's order), each sealed leaf in its replica, its data in the segment, and unsealing with the
+/// owner's key to that data. Shared by the chain and the genesis list (§10), which differ only in the seed.
+pub fn check_reg_proof(net: &Net, seed: &Hash, owner: &Key, entries: &[CatalogEntry], roots: &[Hash], leaves: &[block::Opened]) -> Result<(), BlockError> {
+    let counts: Vec<u64> = entries.iter().map(|e| e.leaves()).collect();
+    let want = picks(net, seed, owner, &counts);
+    if leaves.len() != want.len() || entries.len() != roots.len() {
+        return Err(no("registration proof: not the leaves picked"));
+    }
+    for (o, &(at, i)) in leaves.iter().zip(&want) {
+        let (e, root, n) = (&entries[at], &roots[at], counts[at]);
+        if !merkle::verify(root, n, i, &merkle::leaf_hash(&o.sealed), &o.sealed_path) {
+            return Err(no("registration proof: a sealed leaf isn't in its replica"));
+        }
+        if !merkle::verify(&e.root, n, i, &merkle::leaf_hash(&o.data), &o.data_path) {
+            return Err(no("registration proof: a data leaf isn't in the segment"));
+        }
+        if sloth::unseal_leaf(owner, &e.slot(net), i, &o.sealed).ok() != Some(o.data) {
+            return Err(no("registration proof: a sealed leaf doesn't unseal to the data"));
+        }
+    }
+    Ok(())
+}
+
+/// An audit's opening (§5.2 step 3) against its commit `root_a`: the AUDIT_OPENINGS leaves `open_seed` picks, each
+/// sealed leaf in the replica (`replica_root`), its data in the segment, unsealing to the data, and its audit leaf
+/// (made with `pick_seed`) in `A`. Shared by the chain and the genesis list (§10).
+#[allow(clippy::too_many_arguments)]
+pub fn check_opening(net: &Net, owner: &Key, entry: &CatalogEntry, replica_root: &Hash, root_a: &Hash, pick_seed: &Hash, open_seed: &Hash, o: &block::AuditOpening) -> Result<(), BlockError> {
+    let n = entry.leaves();
+    if o.leaves.len() != params::AUDIT_OPENINGS {
+        return Err(no("audit opening: not the leaves picked"));
+    }
+    for (k, (opened, apath)) in o.leaves.iter().enumerate() {
+        let at = draw::leaf_pick(net, open_seed, &o.replica, k as u32, n);
+        if !merkle::verify(replica_root, n, at, &merkle::leaf_hash(&opened.sealed), &opened.sealed_path) {
+            return Err(no("audit opening: a sealed leaf isn't in the replica"));
+        }
+        if !merkle::verify(&entry.root, n, at, &merkle::leaf_hash(&opened.data), &opened.data_path) {
+            return Err(no("audit opening: a data leaf isn't in the segment"));
+        }
+        if sloth::unseal_leaf(owner, &entry.slot(net), at, &opened.sealed).ok() != Some(opened.data) {
+            return Err(no("audit opening: a sealed leaf doesn't unseal to the data"));
+        }
+        if !merkle::verify(root_a, n, at, &audit_leaf(net, pick_seed, at, &opened.sealed), apath) {
+            return Err(no("audit opening: a leaf isn't in the commit"));
+        }
+    }
+    Ok(())
 }
 
 /// Serving checks since each owner's last turn, and turns held back (§5.4).
@@ -389,6 +440,34 @@ impl Registry {
             silenced: BTreeMap::new(),
             demands: BTreeMap::new(),
         })
+    }
+
+    /// Block 0's registry on a network started from a genesis list (§10): the final list's catalog entries listed and
+    /// its owners' replicas registered at height 0. Every one of them passed a full audit before block 0, so each counts
+    /// for the writer draw from block 1 (no 200-block wait) and is audited again in the first period like any other.
+    /// Genesis holders by bytes (`holders`, the testnet's) may stand beside it or be empty.
+    pub fn from_list(net: &Net, holders: &[(Key, u64, Payout)], list: &crate::genesis::FinalList, segment_bytes: u64) -> Result<Self, BlockError> {
+        let mut r = Registry::new(net, holders, segment_bytes).ok_or(no("genesis: the holders list doesn't hold"))?;
+        r.catalog.list_at_genesis(&list.entries)?;
+        let mut journal = Vec::new();
+        for o in &list.owners {
+            script::pay_to(net, &o.payout).ok_or(no("genesis: an owner's payout address isn't one of this chain's"))?;
+            if r.owners.contains_key(&o.owner) || o.replicas.is_empty() {
+                return Err(no("genesis: an owner twice, or one with no replicas"));
+            }
+            for (seg, _) in &o.replicas {
+                if r.catalog.get(seg).is_none() {
+                    return Err(no("genesis: a replica of a segment that isn't listed"));
+                }
+            }
+            r.put(Op::Proved(o.owner, Commit { payout: o.payout, replicas: o.replicas.clone(), height: 0 }, None), &mut journal);
+            for (seg, _) in &o.replicas {
+                let id = block::replica_id(net, seg, &o.owner);
+                let rep = r.replicas[&id].clone();
+                r.put(Op::Replica(id, Some(Replica { draw_from: Some(1), ..rep })), &mut journal);
+            }
+        }
+        Ok(r)
     }
 
     pub fn catalog(&self) -> &Catalog {
@@ -882,23 +961,8 @@ impl Registry {
         for (seg, _) in &c.replicas {
             entries.push(self.catalog.get(seg).ok_or(no("registration proof: a segment is no longer listed"))?.entry.clone());
         }
-        let leaves: Vec<u64> = entries.iter().map(|e| e.leaves()).collect();
-        let want = picks(&self.net, &seed, &p.owner, &leaves);
-        if p.leaves.len() != want.len() {
-            return Err(no("registration proof: not the leaves picked"));
-        }
-        for (o, &(at, i)) in p.leaves.iter().zip(&want) {
-            let (e, root, n) = (&entries[at], &c.replicas[at].1, leaves[at]);
-            if !merkle::verify(root, n, i, &merkle::leaf_hash(&o.sealed), &o.sealed_path) {
-                return Err(no("registration proof: a sealed leaf isn't in its replica"));
-            }
-            if !merkle::verify(&e.root, n, i, &merkle::leaf_hash(&o.data), &o.data_path) {
-                return Err(no("registration proof: a data leaf isn't in the segment"));
-            }
-            if sloth::unseal_leaf(&p.owner, &e.slot(&self.net), i, &o.sealed).ok() != Some(o.data) {
-                return Err(no("registration proof: a sealed leaf doesn't unseal to the data"));
-            }
-        }
+        let roots: Vec<Hash> = c.replicas.iter().map(|r| r.1).collect();
+        check_reg_proof(&self.net, &seed, &p.owner, &entries, &roots, &p.leaves)?;
         for (seg, _) in &c.replicas {
             if self.replicas.contains_key(&block::replica_id(&self.net, seg, &p.owner)) {
                 return Err(no("registration proof: a replica of the batch is registered already"));
@@ -1040,25 +1104,7 @@ impl Registry {
         let (_, seed) = self.block_at(challenge).ok_or(no("audit opening: no challenge block"))?;
         let r = self.replicas.get(&o.replica).ok_or(no("audit opening: no such replica"))?.clone();
         let entry = self.catalog.get(&r.segment).ok_or(no("audit opening: the segment is no longer listed"))?.entry.clone();
-        let n = entry.leaves();
-        if o.leaves.len() != params::AUDIT_OPENINGS {
-            return Err(no("audit opening: not the leaves picked"));
-        }
-        for (k, (opened, apath)) in o.leaves.iter().enumerate() {
-            let at = draw::leaf_pick(&self.net, &seed, &o.replica, k as u32, n);
-            if !merkle::verify(&r.root, n, at, &merkle::leaf_hash(&opened.sealed), &opened.sealed_path) {
-                return Err(no("audit opening: a sealed leaf isn't in the replica"));
-            }
-            if !merkle::verify(&entry.root, n, at, &merkle::leaf_hash(&opened.data), &opened.data_path) {
-                return Err(no("audit opening: a data leaf isn't in the segment"));
-            }
-            if sloth::unseal_leaf(&owner, &entry.slot(&self.net), at, &opened.sealed).ok() != Some(opened.data) {
-                return Err(no("audit opening: a sealed leaf doesn't unseal to the data"));
-            }
-            if !merkle::verify(&root_a, n, at, &audit_leaf(&self.net, &pick_seed, at, &opened.sealed), apath) {
-                return Err(no("audit opening: a leaf isn't in the commit"));
-            }
-        }
+        check_opening(&self.net, &owner, &entry, &r.root, &root_a, &pick_seed, &seed, o)?;
         let mut a = self.audits[&owner].clone();
         a.picks[i].passed = true;
         self.put(Op::Audits(owner, Some(a)), ops);
@@ -1375,6 +1421,12 @@ impl Storage for Registry {
         self.release_at(height).paid.into_iter().filter_map(|(pay, amount)| Some((amount, script::pay_to(&self.net, &pay)?))).collect()
     }
 
+    /// An owner is paid at the address its registration named; a genesis holder at its genesis address.
+    fn writer_payout(&self, writer: &Key) -> Option<Vec<u8>> {
+        let pay = self.owners.get(writer).map(|o| o.payout).or_else(|| self.genesis.get(writer).map(|g| g.1))?;
+        script::pay_to(&self.net, &pay)
+    }
+
     /// A block: the turn's payouts (as its coinbase was checked), then its items, then at an
     /// epoch's end the settlement of the pot, then its reward and fees into the pot.
     fn apply(&mut self, block: &Block, at: &Applied) -> Result<Self::Undo, BlockError> {
@@ -1421,8 +1473,8 @@ impl Registry {
                 self.pot = 0;
             }
         }
-        // Fees join the pot with the block reward (§14.18).
-        self.pot += params::BLOCK_REWARD + at.fees;
+        // Fees join the pot with the block reward (§14.18), but the writer's own share its coinbase paid (rules 2).
+        self.pot += params::BLOCK_REWARD - at.writer_paid + at.fees;
         self.blocks.push((at.id, at.seed));
         Ok(Undo { pot: before, catalog, ops })
     }
@@ -1625,7 +1677,7 @@ mod tests {
     }
 
     fn at(h: u64) -> Applied {
-        Applied { height: h, id: Hash256(tagged::hash(&NET, "test id", &[&h.to_le_bytes()])), seed: tagged::hash(&NET, "test seed", &[&h.to_le_bytes()]), fees: 0 }
+        Applied { height: h, id: Hash256(tagged::hash(&NET, "test id", &[&h.to_le_bytes()])), seed: tagged::hash(&NET, "test seed", &[&h.to_le_bytes()]), fees: 0, writer_paid: 0 }
     }
 
     #[test]

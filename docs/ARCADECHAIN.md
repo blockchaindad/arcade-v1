@@ -371,7 +371,7 @@ Decided: **genesis stays 2027-01-01** (Martin, 2026-11-11).
 2. **Blocks only at launch:** index journals and Bitcoin's indexes added by upgrade?
 3. **Time keepers** aren't paid (as in Chia). OK, or should the block writer's fees be shared with the time keeper whose proof it used?
 4. **Address prefix:** **A...** for mainnet addresses?
-5. **A share of the 50 for the block writer?** Today the writer gets only fees, so writing blocks in secret or holding them back costs it nothing. Both reviews point at this. Giving the writer a part of each block's 50 (for example 5, with 45 still split by storage) makes a withheld or lost block cost real coins. It changes "the 50 is split by storage share" slightly: big holders already write more blocks, so shares stay about the same.
+5. **A share of the 50 for the block writer?** *Decided (Martin 2026-11-14): yes, 1 ARCADE per block to its writer, 49 to the storage pot, fees still into the pot* (built from rules version 2: §14.26).
 6. **The wallet's key path:** which BIP44 coin type for ARCADE addresses? The build's stand-in is 3 (Dogecoin's), so a wallet's ARCADE address would have the same key as its Dogecoin one. A number of its own keeps the keys apart; it has to be picked before the first real address is handed out.
 7. **Small fees:** a block whose fees are under 0.001 ARCADE (one small payment pays about 0.00045) can't pay them to its writer, because no output may be that small. Today they are burned. Add them to the storage pot instead?
 
@@ -795,3 +795,104 @@ keep 1,152.
 6. **Registration commits most-work-first** when more wait than a block's places (§4; small).
 7. **Testnet restart** with all of the above but item 4 and 5, then the GX10 and the JB20B updated, the genesis list
    (§10) for mainnet, and release checkpoints.
+
+
+### 14.23 Time keepers as built (2026-11-14, rules version 2)
+
+One calculation per height serves every candidate (§6.2). Chia's library proves only one run at a time, but it can start
+a run from any form, and the squaring is the same however it is cut. So a **time keeper** runs from the challenge to the
+lowest candidate's count, hands that candidate its proof, runs on from that output to the next candidate's count, and so
+on. The k-th candidate's proof is the first k runs (`time::join`).
+
+- **In a block:** the runs ride in the proof's bytes, with no change to the header. `output` is the last run's output;
+  `proof` is each earlier run (8 bytes of steps, its output, its proof: 208 bytes) in order, then the last run's proof.
+  The last run's steps are what is left of the block's count. A plain single run is the case of no earlier runs.
+- **Rules version 2** (`params::pot_runs`): a block's proof may come in up to `MAX_POT_RUNS` = 8 runs (`MAX_TIME_BYTES`
+  is 2,048). Version 1 takes single runs only. Testnet: version 2 from block 2,200; mainnet: from block 0. The draw
+  seed's proof stays a single run (one calculator per epoch).
+- **Over the mesh** (`arckeep.rs`, "ac" frames, each passed on once per link): `cand {prev, w, writer, vrf}`, a writer's
+  draw for the block after `prev`; `tp {prev, steps, ol} + output ‖ proof`, a proof for one candidate's count. A keeper
+  takes a `cand` only on its own tip, with a draw that checks (`Chain::candidate`: the VRF on the draw input, no more
+  weight than the writer has) and a score that could win; it takes a `tp` only for a count some candidate needs, checked
+  in full before it is passed on.
+- **Writers:** a draw that could be the height's best (score below 3× the best expected from the whole weight, about 19
+  heights in 20) is announced and the writer also runs its own proof; it writes with whichever is ready first. A draw
+  that can't win is not announced and its own proof runs at the lowest CPU priority, so the chain moves even if every
+  likely writer is away. Nothing depends on a keeper.
+- **Keepers are opt-in** (`arc.keeper {on: true}`; a core while on). `arc.status` → `keeper`; `arc.block` → `pot_runs`.
+- **Tested:** real-VDF unit test (cut runs = single run, tampering refused); a local three-arcade net where two arcades
+  make no proofs of their own and write only with the keeper's (`ARCADE_ARC_TEST_NO_OWN_PROOF`, tests only). Two bugs it
+  found: the "could win" threshold was 2^32 too strict (score units are 2^96), and block ids in frames were decoded
+  without `Hash256::from_hex`'s byte order. Local test settings may set `"rules"`.
+- **Still open (§13 question 3):** keepers aren't paid.
+
+### 14.24 The genesis list as built (2026-11-14)
+
+The list of §10 runs the chain's own checks with the seeds of the list in place of blocks (`genesis.rs`):
+
+| Where the chain uses | the list uses |
+|---|---|
+| a commit's anchor block | `list_anchor(net)` (anchor 0) |
+| the challenge block (proof leaves), the picking block (audit leaves) | `proof_seed = H(closed hash ‖ beacon 1)` |
+| the block after an audit commit (openings) | `open_seed = H(closed hash ‖ beacon 2)` |
+
+- `registry::check_reg_proof` and `registry::check_opening` are shared by the chain and the list.
+- `finalize` keeps each owner's batch with the most stamp work, strikes (with a reason) a batch whose proof fails or
+  whose segments aren't on the list, and each replica whose audit commit or opening fails. A range claimed by two
+  different entries stands for neither, nor anything after it in its chain, until a fraud proof takes the wrong one out;
+  each chain's entries must run from height 0. Entries left with no replica go, and so does what comes after them.
+- `FinalList::hash` is what block 0 carries; `Registry::from_list` starts block 0 with the list's catalog
+  (`Catalog::list_at_genesis`, confirmed at height 0) and replicas registered, counting for the draw from block 1.
+- **The bulletin** (`arcgenesis.rs`, `--arc-genesis <settings>`): records (items, the assembler's receipts, its signed
+  closed hash) kept in `<home>/arc/genesis-<net>/board.bin` and passed on once over every link ("gb" frames). The
+  assembler receipts an item only in its window; every arcade builds the lists from receipted items only. An arcade with
+  Earn ARCADE on for a kept listed chain seals it, posts its entries and one commit, answers beacon 1 (proof and an audit
+  commit per replica) and beacon 2 (openings) by itself, and writes `final.json` once the last window closes.
+  `arc.genesis` shows where it stands. Before block 0, `arc.earn` only marks the coin (it doesn't install a chain).
+- **Beacons:** the first block of `beacon_chain` (Bitcoin on mainnet) with a header time at or after the beacon's moment,
+  `beacon_depth` deep; closed test networks give fixed ones.
+- **Not built yet:** block 0 from `final.json` (settings that name a final list instead of genesis holders), the
+  assembler's 12-31 correction step, and a ready-made mainnet settings file.
+
+### 14.25 The arcade's own code, kept by every arcade (Martin 2026-11-14)
+
+Martin: "make arcade v1 the code into the genesis block and make everyone keep it": the source with its whole git
+history, the vendored dependencies so it rebuilds with no internet, and the prebuilt programs. Built (`arccode.rs`,
+`scripts/code-publish.py`):
+
+- **A release** is a signed record (canonical JSON: name `@arcade/arcade-v1`, version, git commit id, time, and its
+  files by SHA-256 and size): `arcade-v1.bundle` (a git bundle of the history up to the commit: `git clone` reads it),
+  `vendor.tar.zst` (`cargo vendor --versioned-dirs` into `cargo-deps/`, not `vendor/`, which the repo uses for a patched crate of its own; tarred with a fixed order, times and owners), `program-<platform>`
+  (release archives), `BUILD.txt` (how to rebuild offline). Its id is the SHA-256 of the record; the signature
+  (ed25519) is over `"ARCADE code release\0" ‖ id` by a trusted release key (`RELEASE_KEYS`: Strawberry's release signing key
+  `9c955cd5…008a`, the original arcade's (Martin 2026-11-14); `--code-key` adds one on closed test networks). Vendored crates check against the checksums in `Cargo.lock`, which is
+  in the commit; programs rest on the signature (builds aren't reproducible yet).
+- **Kept by every arcade** in `<home>/code/files/<sha256>`: every release's bundle and dependencies, and the programs of
+  the newest 5 releases of each name. Each file is hashed before it is kept.
+- **Over the mesh** ("co" frames): `r` a release record (once per link), `h` the files held, `g {id, f, at}` 48 kB of a
+  file asked over the link one already has (`crvia`, so arcades behind a NAT are reached), answered `a`; 16 pieces are
+  asked at once (58.6 MB in about 2 s between two arcades on one machine; one at a time took 86 s). A file fetch
+  resumes where it stopped.
+- **API:** `code.status`, `code.add {record, sig, files}` (what code-publish writes as `release.json`), `code.export {id, dir}`.
+- **The publisher scans the whole history** up to the commit for what must never be published (private keys,
+  WIF-shaped strings, extended private keys, home paths, private network addresses) and stops on any hit unless told
+  otherwise: published code is public forever.
+- **Sizes (v0.1.66, 2026-11-14):** bundle 8.8 MB (577 commits), dependencies 58.6 MB (537 crates, 763 MB unpacked),
+  ARM Linux programs 13.8 MB.
+- **Updates come from the network** (Martin 2026-11-14: "Arcade V1 should be where arcade V1 is pulling all future
+  updates"): `updater.rs` takes the newest `@arcade/arcade-v1` release whose `program-linux-<arch>` archive is held
+  here (looking every 10 minutes is a read of the code store), checks it again, and installs it as before (`.prev`
+  kept, clean restart). GitHub is no longer asked. Tested: an arcade on v0.1.90 behind no open port fetched v0.1.91
+  from another arcade, installed it and restarted into it in about 20 s.
+- **Still to do:** mainnet block 0 naming the first release's id; repos for everyone under @tags (`@tag/name`, push = signed ref update) once the ledger runs on ARCADE.
+
+### 14.26 The writer's share (Martin 2026-11-14, rules version 2)
+
+From rules version 2 (testnet block 2,200; mainnet from block 0) a block's coinbase pays, after what is owed, **1 ARCADE
+to its writer** (`params::WRITER_REWARD`) at its payout address: the one its registration names, or its genesis entry's.
+The pot takes the other 49 and the fees (`Applied::writer_paid`). Fees stay in the pot, so a block with large fees is no
+prize to fight over (no fee sniping); the writer's share is fixed. Why: both reviews pointed out that a writer paid
+nothing for writing loses nothing by holding a block back or building in secret; now each withheld or orphaned block
+costs it. The draw is by storage weight, so the share falls to writers in the same proportions as storage pay; splitting
+into many keys gains nothing. Tested on a local chain switching at block 5: 49 blocks, every coinbase from block 5 pays its
+writer exactly 1 ARCADE, none before, nothing refused.
