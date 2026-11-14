@@ -29,10 +29,11 @@ pub const MAX_TX: usize = 400_000;
 
 fn chain(node: &Node, req: &Value) -> Result<&'static ChainParams, String> {
     let p: &'static ChainParams = match req["chain"].as_str().filter(|k| !k.is_empty()) {
-        Some(k) => by_key(k).ok_or_else(|| format!("unknown chain {k}"))?,
+        // The ARCADE chain too (crate::arcsvc), as the wallet finds it.
+        Some(k) => crate::chains::find(k).ok_or_else(|| format!("unknown chain {k}"))?,
         None => node.params,
     };
-    if p.chain_no != node.params.chain_no && !node.extra.lock().unwrap().contains_key(p.key) {
+    if !crate::chains::kept(node, p) {
         return Err(format!("{} is not installed on this arcade", p.name));
     }
     Ok(p)
@@ -128,6 +129,10 @@ fn not_final(node: &Node, p: &ChainParams, tx: &Tx) -> Option<String> {
 
 /// The pool, parsed once: (first seen, tx).
 fn pool(node: &Node, p: &ChainParams) -> Vec<(u64, Tx)> {
+    // The ARCADE chain's waiting transactions are its own pool's (crate::arcsvc).
+    if crate::arcsvc::runs(p) {
+        return crate::arcsvc::waiting(100_000).into_iter().filter_map(|raw| Tx::parse_with(&raw, &p.format).ok().map(|t| (0, t))).collect();
+    }
     node.chain
         .mempool(p.chain_no)
         .unwrap_or_default()
@@ -325,6 +330,13 @@ fn send_raw(node: &Node, req: &Value, checked: bool) -> R {
     let tx = Tx::parse_with(&raw, &p.format).map_err(|e| format!("not a {} transaction: {e}", p.name))?;
     if tx.is_coinbase() || tx.inputs.is_empty() {
         return Err("a coinbase or input-less transaction can't be broadcast".into());
+    }
+    // An ARCADE transaction goes into the ARCADE chain's own pool, which checks it by that chain's rules and passes it
+    // on to the arcades it is linked to.
+    if crate::arcsvc::runs(p) {
+        let r = crate::arcsvc::submit(&json!({"hex": hex_tx.trim()})).map_err(|e| format!("refused: {e}"))?;
+        let _ = node.app.event("wallet", &format!("pooled ARCADE transaction {} for a website user", tx.txid.to_hex()));
+        return Ok(json!({"txid": tx.txid.to_hex(), "fee": r["fee"], "size": tx.raw.len(), "pooled": true}));
     }
     if !borrowed {
         // Not final yet (a refund before its lock time, say): every node refuses it, so it is
