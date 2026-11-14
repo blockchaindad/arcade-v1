@@ -337,10 +337,37 @@ fn with_pass(html: &[u8], pass: &str) -> Vec<u8> {
     [&html[..at], script.as_bytes(), &html[at..]].concat()
 }
 
-/// Who may frame an app page: this arcade's own pages and the desktop app's windows.
+/// Home-network entrances the operator named (--ui-origin, ARCADE_UI_ORIGINS; docs/WEBUI.md): an
+/// https page in front of this arcade that shows its window. An entrance must present itself to
+/// arcaded as this computer (Host 127.0.0.1), so the request can't tell which entrance it came
+/// through: the operator says.
+pub static UI_ORIGINS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// An origin as frame-ancestors takes it: scheme, host, optional port; nothing else.
+pub fn ui_origin_ok(o: &str) -> bool {
+    let Some(rest) = o.strip_prefix("https://").or_else(|| o.strip_prefix("http://")) else { return false };
+    // [v6 address] or name/v4, then an optional :port.
+    let (host, port) = if let Some(r) = rest.strip_prefix('[') {
+        let Some((h, after)) = r.split_once(']') else { return false };
+        if h.is_empty() || !h.bytes().all(|b| b.is_ascii_hexdigit() || b == b':') {
+            return false;
+        }
+        (None, after)
+    } else {
+        let (h, after) = match rest.find(':') { Some(i) => (&rest[..i], &rest[i..]), None => (rest, "") };
+        (Some(h), after)
+    };
+    let host_ok = host.map_or(true, |h| !h.is_empty() && h.len() <= 253 && h.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-'));
+    let port_ok = port.is_empty() || port.strip_prefix(':').is_some_and(|p| !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit()));
+    host_ok && port_ok
+}
+
+/// Who may frame an app page: this arcade's own pages, the desktop app's windows, and the
+/// entrances the operator named.
 fn frame_ancestors(node: &Node) -> String {
     let [a, b, c] = own_origins(node);
-    format!("frame-ancestors {a} {b} {c} tauri:")
+    let extra: String = UI_ORIGINS.get().map(|v| v.iter().map(|o| format!(" {o}")).collect()).unwrap_or_default();
+    format!("frame-ancestors {a} {b} {c} tauri:{extra}")
 }
 
 /// Query string to request fields (numbers and true/false as such).
@@ -1034,6 +1061,17 @@ fn rpc(node: &Node, s: &mut TcpStream, r: &Req) {
 
 #[cfg(test)]
 pub(crate) mod tests {
+
+    #[test]
+    fn an_entrance_origin_is_scheme_host_and_port_only() {
+        for good in ["https://192.168.1.10:8443", "https://arcade.lan", "http://10.0.0.2:8433", "https://[fd00::1]:8443"] {
+            assert!(ui_origin_ok(good), "{good}");
+        }
+        for bad in ["192.168.1.10:8443", "https://x.lan/ui/", "https://x.lan:84a3", "https://", "https://a b", "javascript:x", "https://x.lan; script-src *", "https://[zz]:1"] {
+            assert!(!ui_origin_ok(bad), "{bad}");
+        }
+    }
+
     use super::*;
 
     /// A test arcade (crate::sitesvc's), one at a time across these tests: each maps a database,

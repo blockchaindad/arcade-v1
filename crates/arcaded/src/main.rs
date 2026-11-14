@@ -218,6 +218,8 @@ usage: arcaded [options]
   --site DIR            serve this folder as the app
   --behind-proxy        the web port is reached through a reverse proxy or tunnel: nothing
                         over it counts as this computer (the API answers the socket only)
+  --ui-origin ORIGIN    a home-network entrance (https://host:port) that shows this arcade's
+                        window: app pages may open inside it (repeatable; or ARCADE_UI_ORIGINS)
   --mesh-port N|0       mesh port (default 8421; 0: none)
   --mesh-peer HOST:PORT also link to this arcade (repeatable)
   --no-mesh             no mesh links at all
@@ -524,6 +526,15 @@ fn main() {
             Err(e) => eprintln!("arcaded: no RPC cookie ({e}); /rpc will refuse everyone"),
         }
         let _ = node.http_port.set(http_port);
+        // Home-network entrances that show this arcade's window (docs/WEBUI.md): app pages may be
+        // framed by them. Each --ui-origin, and ARCADE_UI_ORIGINS (comma-separated).
+        let mut ui: Vec<String> = args.iter().enumerate().filter(|(_, a)| *a == "--ui-origin").filter_map(|(i, _)| args.get(i + 1).cloned()).collect();
+        ui.extend(std::env::var("ARCADE_UI_ORIGINS").unwrap_or_default().split(',').map(|s| s.trim().trim_end_matches('/').to_string()).filter(|s| !s.is_empty()));
+        let (good, bad): (Vec<String>, Vec<String>) = ui.into_iter().map(|s| s.trim_end_matches('/').to_string()).partition(|o| http::ui_origin_ok(o));
+        for b in bad {
+            eprintln!("arcaded: --ui-origin {b} ignored: an origin is https://host[:port] (no path)");
+        }
+        let _ = http::UI_ORIGINS.set(good);
         let o = http::Opts {
             // 127.0.0.1 unless the operator opens it; the API and RPC still answer only this computer.
             bind: opt("--http-bind").unwrap_or_else(|| "127.0.0.1".into()),

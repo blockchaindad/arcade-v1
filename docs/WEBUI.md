@@ -42,6 +42,11 @@ or such an entrance. The arcade's `http://127.0.0.1:<port>` addresses (app frame
 covers, pictures) are rewritten to it (common.js `arcadeUrl`), and the window's CSP allows
 `frame-src 'self'`.
 
+App pages say who may show them (`frame-ancestors`): this computer's own addresses and the desktop
+app. Start arcaded with the entrance's origin so apps and theme previews open inside it too, not blank:
+`--ui-origin https://192.168.1.10:8443` (repeatable), or `ARCADE_UI_ORIGINS=https://…,https://…`.
+It has to be named because the entrance presents itself to arcaded as this computer.
+
 ## What it lets in
 
 - **Nothing new.** The window's calls go to `/rpc`, arcaded's JSON-RPC: the cookie (`<home>/.cookie`,

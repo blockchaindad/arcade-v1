@@ -60,7 +60,6 @@ const THEME = (() => {
     "justify-content", "align-items", "backdrop-filter", "width", "height", "min-width", "min-height",
     "max-width", "max-height", "transition"]);
   const SIZES = new Set(["width", "height", "min-width", "min-height", "max-width", "max-height"]);
-  const WALL = /^url\(\s*["']?data:image\/(png|gif|webp|jpeg|svg\+xml);base64,[A-Za-z0-9+/=]+["']?\s*\)$/;
 
   // --- checking a theme ------------------------------------------------------------------------------------------
   const hexOk = (v) => typeof v === "string" && /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(v);
@@ -89,15 +88,47 @@ const THEME = (() => {
     return out;
   }
 
+  // Every length a theme writes, in an allowed unit and under a cap in pixels (an em counted as 16 px).
+  // Any other unit (cm, pt, in, vh, dvh, vw, ...) is refused, so no shadow, bar or margin can grow over a
+  // screen. Percentages only where they can't: background positions and sizes, gradient stops, corners.
+  const UNITS = { "": 0, px: 1, em: 16, rem: 16, "%": 0, deg: 0, s: 0, ms: 0 };
   function lengthsOk(prop, value) {
-    for (const m of value.matchAll(/(-?\d*\.?\d+)(px|em|rem|%|vh|vw|vmin|vmax|ch|ex|deg|s|ms)?/g)) {
-      const n = Math.abs(parseFloat(m[1])); const u = m[2] || "";
-      if (["vh", "vw", "vmin", "vmax"].includes(u)) return false;
-      if ((u === "em" || u === "rem" || u === "ch" || u === "ex") && n > 4) return false;
-      if (u === "px" && !prop.startsWith("background") && n > (SIZES.has(prop) ? 240 : 64)) return false;
-      if (prop === "letter-spacing" && (u === "px" ? n > 4 : n > 0.3)) return false;
+    // Colours aren't lengths: #rrggbb, rgb()/hsl() and their alpha forms are taken out first.
+    const v = value.replace(/#[0-9a-fA-F]{3,8}\b/g, " ").replace(/\b(rgba?|hsla?)\([^)]*\)/gi, " ");
+    const bg = prop.startsWith("background");
+    for (const m of v.matchAll(/(-?\d*\.?\d+)([a-z%]*)/gi)) {
+      const n = Math.abs(parseFloat(m[1])); const u = m[2].toLowerCase();
+      if (!(u in UNITS)) return false;
+      // (a max-width or max-height in % only ever makes a part smaller)
+      if (u === "%") { if (!(bg || (prop.includes("radius") && n <= 50) || (prop.startsWith("max-") && n <= 100))) return false; continue; }
+      if (u === "deg") { if (!bg) return false; continue; }
+      if (u === "s" || u === "ms") { if (prop !== "transition" || (u === "s" ? n : n / 1000) > 1) return false; continue; }
+      if (u === "") {
+        // A bare number: 0, a weight, a line height, a gradient's or transition's own numbers.
+        if (n === 0 || (prop === "font-weight" && n <= 900) || (prop === "line-height" && n <= 3) || bg || prop === "transition") continue;
+        return false;
+      }
+      const px = n * UNITS[u];
+      const cap = bg ? 4096 : SIZES.has(prop) ? 240 : prop === "letter-spacing" ? 4 : prop === "font-size" ? 24 : 64;
+      if (px > cap) return false;
     }
     return true;
+  }
+
+  // A rule's declarations, split at the semicolons outside parentheses and quotes, so a picture's
+  // url(data:image/png;base64,...) stays whole.
+  function splitDecls(body) {
+    const out = []; let cur = "", depth = 0, quote = "";
+    for (const ch of body) {
+      if (quote) { if (ch === quote) quote = ""; cur += ch; continue; }
+      if (ch === '"' || ch === "'") quote = ch;
+      else if (ch === "(") depth++;
+      else if (ch === ")") depth = Math.max(0, depth - 1);
+      else if (ch === ";" && depth === 0) { out.push(cur); cur = ""; continue; }
+      cur += ch;
+    }
+    out.push(cur);
+    return out;
   }
 
   function selectorOk(sel) {
@@ -113,7 +144,7 @@ const THEME = (() => {
 
   function declsOk(sel, body) {
     const out = [];
-    for (const d of body.split(";")) {
+    for (const d of splitDecls(body)) {
       if (!d.trim()) continue;
       const at = d.indexOf(":"); if (at < 1) throw new Error(`frame CSS: "${d.trim().slice(0, 40)}" isn't a property`);
       const prop = d.slice(0, at).trim().toLowerCase(); const value = d.slice(at + 1).trim();
@@ -592,7 +623,8 @@ button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:defa
   }
   // A checked theme kept in the cache, back into the form `check` takes (it is checked again on every start).
   function unparse(m) {
-    return { layout: m.layout, colors: { light: m.light, dark: m.dark }, font: m.font, size: m.size, radius: m.radius,
+    // A light-only theme stays light-only: its dark palette (a copy of the light one) isn't written back.
+    return { layout: m.layout, colors: m.single ? { light: m.light } : { light: m.light, dark: m.dark }, font: m.font, size: m.size, radius: m.radius,
       desktop: m.desktop, icons: m.icons, brand: m.brand, window: m.window, chrome: m.chrome, name: m.name };
   }
 

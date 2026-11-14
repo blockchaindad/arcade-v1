@@ -78,8 +78,12 @@ worn**, and a theme that fails isn't worn at all (the reason is shown):
   `cursor`, `line-height`, `transition`. Sizes (`width`, `height`, and their min and max) are allowed
   only on bars, buttons and icons. Nothing that moves, hides or covers anything is allowed: no
   `position`, `display`, `opacity`, `visibility`, `transform`, `filter`, `clip`, `content`,
-  `z-index`, `!important`, negative margins, or lengths over 64 px. `backdrop-filter` is allowed
-  as `blur()` only.
+  `z-index`, `!important` or negative margins. `backdrop-filter` is allowed as `blur()` only.
+- **Lengths**: only `px`, `em`/`rem` (counted as 16 px), `%`, `deg`, `s` and `ms`; any other unit
+  (`cm`, `pt`, `in`, `vh`, `dvh`, `vw` …) is refused. Each length has a cap: 64 px (sizes on bars,
+  buttons and icons 240 px, letter spacing 4 px, font size 24 px, backgrounds 4096 px). `%` is
+  allowed only in backgrounds, corners (up to 50%) and `max-width`/`max-height`; `deg` only in
+  backgrounds; `s`/`ms` only in `transition`, up to 1 s.
 - **Nothing from outside**: pictures only as base64 `data:` images in a background; no `@import`,
   `@font-face`, `@keyframes` or escapes. `@media (prefers-color-scheme: …)` is the only at-rule.
 - The screens set their own text colour, font, size, spacing and line height, so nothing the frame
