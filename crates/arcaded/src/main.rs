@@ -21,6 +21,7 @@ mod arcborrow;
 mod arcseal;
 mod arcserve;
 mod arcseg;
+mod arccode;
 mod arcgenesis;
 mod arckeep;
 mod arcsvc;
@@ -355,6 +356,8 @@ fn main() {
     } else if let Err(e) = arcsvc::define_text(&node, arcsvc::TESTNET_SETTINGS) {
         eprintln!("arcaded: the built-in ARCADE testnet: {e}");
     }
+    // The arcade's own code, kept by every arcade (crate::arccode); --code-key adds a release key (test networks).
+    arccode::start(&node, opt("--code-key"));
     // A genesis list to keep and take part in (§10), before that network's block 0.
     if let Some(settings) = opt("--arc-genesis") {
         if let Err(e) = arcgenesis::start(&node, std::path::Path::new(&settings)) {

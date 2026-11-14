@@ -853,3 +853,31 @@ The list of §10 runs the chain's own checks with the seeds of the list in place
   `beacon_depth` deep; closed test networks give fixed ones.
 - **Not built yet:** block 0 from `final.json` (settings that name a final list instead of genesis holders), the
   assembler's 12-31 correction step, and a ready-made mainnet settings file.
+
+### 14.25 The arcade's own code, kept by every arcade (Martin 2026-11-14)
+
+Martin: "make arcade v1 the code into the genesis block and make everyone keep it": the source with its whole git
+history, the vendored dependencies so it rebuilds with no internet, and the prebuilt programs. Built (`arccode.rs`,
+`scripts/code-publish.py`):
+
+- **A release** is a signed record (canonical JSON: name `@arcade/arcade-v1`, version, git commit id, time, and its
+  files by SHA-256 and size): `arcade-v1.bundle` (a git bundle of the history up to the commit: `git clone` reads it),
+  `vendor.tar.zst` (`cargo vendor --versioned-dirs` into `cargo-deps/`, not `vendor/`, which the repo uses for a patched crate of its own; tarred with a fixed order, times and owners), `program-<platform>`
+  (release archives), `BUILD.txt` (how to rebuild offline). Its id is the SHA-256 of the record; the signature
+  (ed25519) is over `"ARCADE code release\0" ‖ id` by a trusted release key (`RELEASE_KEYS`; empty until the key is
+  chosen; `--code-key` on closed test networks). Vendored crates check against the checksums in `Cargo.lock`, which is
+  in the commit; programs rest on the signature (builds aren't reproducible yet).
+- **Kept by every arcade** in `<home>/code/files/<sha256>`: every release's bundle and dependencies, and the programs of
+  the newest 5 releases of each name. Each file is hashed before it is kept.
+- **Over the mesh** ("co" frames): `r` a release record (once per link), `h` the files held, `g {id, f, at}` 48 kB of a
+  file asked over the link one already has (`crvia`, so arcades behind a NAT are reached), answered `a`; 16 pieces are
+  asked at once (58.6 MB in about 2 s between two arcades on one machine; one at a time took 86 s). A file fetch
+  resumes where it stopped.
+- **API:** `code.status`, `code.add {record, sig, files}` (what code-publish writes as `release.json`), `code.export {id, dir}`.
+- **The publisher scans the whole history** up to the commit for what must never be published (private keys,
+  WIF-shaped strings, extended private keys, home paths, private network addresses) and stops on any hit unless told
+  otherwise: published code is public forever.
+- **Sizes (v0.1.66, 2026-11-14):** bundle 8.8 MB (577 commits), dependencies 58.6 MB (537 crates, 763 MB unpacked),
+  ARM Linux programs 13.8 MB.
+- **Still to do:** mainnet block 0 naming the first release's id; the release key (Martin's call); the updater installing
+  from the chain; repos for everyone under @tags (`@tag/name`, push = signed ref update) once the ledger runs on ARCADE.

@@ -538,6 +538,7 @@ fn serve_loop(
         crate::vxshare::tick(node, link)?;
         crate::arcsvc::tick(node, link)?;
         crate::arcgenesis::tick(&link.peer_id.clone(), link)?;
+        crate::arccode::tick(&link.peer_id.clone(), link)?;
         crate::shares::tick(link)?;
         crate::mempoolshare::tick(node, peer, link)?;
         crate::crvia::tick(peer, link)?;
@@ -628,6 +629,9 @@ fn serve_loop(
             "cb" => crate::coreboot::on_frame(node, link, &f)?,
             "vx" => crate::vxshare::on_frame(node, link, &f)?,
             "ac" => crate::arcsvc::on_frame(node, link, &f)?,
+            // The arcade's own code (crate::arccode): a piece we asked for over this link, or a record, a list, an ask.
+            "co" if crate::crvia::on_answer(peer, &f) => {}
+            "co" => crate::arccode::on_frame(link, &f)?,
             // The genesis bulletin (crate::arcgenesis), before an ARCADE network has a block 0.
             "gb" => crate::arcgenesis::on_frame(node, &f),
             #[cfg(feature = "oldimport")]

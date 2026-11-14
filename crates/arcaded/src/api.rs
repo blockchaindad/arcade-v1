@@ -581,6 +581,9 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         }
         "arc.keeper" => crate::arckeep::api(node, req),
         "arc.genesis" => crate::arcgenesis::status(node),
+        "code.status" => Ok(crate::arccode::status()),
+        "code.add" => crate::arccode::add(req),
+        "code.export" => crate::arccode::export(req),
         "arc.open" => crate::arcsvc::open(node, req),
         "arc.sealing" => crate::arcsvc::sealing(node, req),
         "arc.earn" => crate::arcsvc::earn(node, req),
