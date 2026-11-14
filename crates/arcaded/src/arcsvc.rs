@@ -710,11 +710,11 @@ fn run_writer_on(node: Arc<Node>, svc: Arc<Svc>, wrote: &mut VecDeque<Hash256>, 
                             let (job, challenge, steps, running, likely) = (proving.clone(), t.challenge, t.steps, running.clone(), *likely);
                             let _ = std::thread::Builder::new().name("arc proof of time".into()).spawn(move || {
                                 let me = crate::rulecheck::thread_id();
-                                // A draw that can't be the height's best only keeps the chain moving if every likely
-                                // writer is away: spare CPU only.
-                                if !likely {
-                                    crate::rulecheck::lowest_priority();
-                                }
+                                // A draw that can't be the height's best still runs at normal priority while it is for the
+                                // tip: with few writers every draw can look unlikely, and at the lowest priority on a busy
+                                // machine nobody's proof finished (testnet stall at block 1,061, 2026-11-14). Only runs for
+                                // tips that moved on are pushed down (above), as before.
+                                let _ = likely;
                                 running.lock().unwrap().push(me);
                                 let proof = Clock::Vdf.prove(&challenge, steps);
                                 running.lock().unwrap().retain(|t| *t != me);
