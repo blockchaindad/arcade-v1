@@ -53,11 +53,22 @@
     paint();
     const text = h("input", { placeholder: "Your review (optional)", maxlength: "200", style: "flex:1;min-width:12em" });
     const send = h("button", { class: "primary small" }, r.mine ? "Change my rating" : "Rate");
-    send.onclick = () => { if (!pick) return note("Pick 1 to 5 stars first.", true); act("reply", a, { text: `${STARS(pick)}${text.value.trim() ? " " + text.value.trim() : ""}` }); };
+    // Changing edits the review that counts (a new review only when there is none), so no older
+    // one is left behind to count again; removing deletes every starred review of mine.
+    send.onclick = () => {
+      if (!pick) return note("Pick 1 to 5 stars first.", true);
+      const body = `${STARS(pick)}${text.value.trim() ? " " + text.value.trim() : ""}`;
+      if (r.my_review) act("edit", { ...a, txid: r.my_review }, { text: body });
+      else act("reply", a, { text: body });
+    };
     const kids = [h("div", { class: "row" }, ...stars, text, send)];
     if (r.my_review) {
       const take = h("button", { class: "small" }, "Remove my rating");
-      take.onclick = () => act("delete", { ...a, txid: r.my_review });
+      take.onclick = async () => {
+        take.disabled = true;
+        const mine = r.my_reviews && r.my_reviews.length ? r.my_reviews : [r.my_review];
+        for (const txid of mine) if (!(await act("delete", { ...a, txid }))) break;
+      };
       kids.push(h("div", { class: "row s" }, `Your rating: ${STARS(r.mine)}`, take));
     }
     const dist = (r.dist || [0, 0, 0, 0, 0]).map((x, i) => [5 - i, (r.dist || [])[4 - i] || 0]);
@@ -82,7 +93,8 @@
       if (a.chain !== HOME.key) throw new Error(`likes, comments and tips work on ${HOME.name} apps for now`);
       const r = await api("feed.act", { kind, target: a.txid, ...extra });
       note(`${kind} sent (fee ${PEP(r.fee)}); it counts once it's in a block.`);
-    } catch (e) { note(e.message, true); }
+      return true;
+    } catch (e) { note(e.message, true); return false; }
   }
 
   function storeCard(a) {

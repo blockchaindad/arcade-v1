@@ -49,7 +49,10 @@ base.html 332-770 and 1852, web/docs/games.md), 2026-11-08. V1.0 calls them **ap
 - **V1.0 star ratings live in reviews.** A review is an ordinary comment (FEED_ACT REPLY on the card,
   any version) whose text begins with five marks, ★ for each star and ☆ for the rest, stars first
   ("★★★★☆ works well" = 4). The original shows it as a comment. Each person's latest review with
-  stars counts; an EDIT by its writer changes it, a DELETE by its writer takes it back. Shown: average,
+  stars counts; an EDIT by its writer changes it, a DELETE by its writer takes it back (then an
+  older starred review of theirs that still stands counts). The store's "Change my rating" sends an
+  EDIT of the review that counts (a new review only when there is none) and "Remove my rating" a
+  DELETE of every starred review of theirs on that app, so nothing older comes back. Shown: average,
   count, 1–5 spread. Popularity adds (stars − 3) / 2 per rater (5 stars +1, 1 star −1) to the score.
 
 ## 4. Launch and sandbox
