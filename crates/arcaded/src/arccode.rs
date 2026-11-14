@@ -351,6 +351,23 @@ pub fn on_frame(link: &mut Link, f: &Frame) -> Result<(), LinkError> {
     Ok(())
 }
 
+/// The name the arcade's own releases go by.
+pub const ARCADE_V1: &str = "@arcade/arcade-v1";
+
+/// For the updater: every release of `name` whose `file` is held here, as (version, path to the file, its sha256).
+/// Each was signed by a trusted release key and its file checked against the record when it was kept.
+pub fn held_programs(name: &str, file: &str) -> Vec<(String, PathBuf, String)> {
+    let s = st();
+    s.releases
+        .values()
+        .filter(|r| r.name == name)
+        .filter_map(|r| {
+            let (sha, _) = r.files.get(file)?;
+            s.have.contains(sha).then(|| (r.version.clone(), file_path(sha), sha.clone()))
+        })
+        .collect()
+}
+
 // ---------------- the local API ----------------
 
 /// `code.status`: the releases known here and which of their files are held.

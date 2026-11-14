@@ -36,8 +36,8 @@ async function optionsDo(what, f) {
 
 $("o-auto").addEventListener("change", (e) => optionsDo(e.target.checked ? "Turning automatic updates on…" : "Turning automatic updates off…",
   () => api("update.set", { on: e.target.checked })));
-$("o-check").addEventListener("click", () => optionsDo("Looking for a new release…", () => api("update.check")));
+$("o-check").addEventListener("click", () => optionsDo("Looking for a new release on the network…", () => api("update.check")));
 $("o-now").addEventListener("click", () => {
   if (!confirm("Install the newest release now? The service restarts; your wallet and data stay as they are.")) return;
-  optionsDo("Downloading the new release…", () => api("update.now"));
+  optionsDo("Installing the new release…", () => api("update.now"));
 });
