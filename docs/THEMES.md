@@ -13,8 +13,10 @@ about themes is built into a release except the small piece that wears one (`cra
 
 The choice is kept by the window itself (localStorage): the desktop app and each browser choose for
 themselves. A theme follows its publisher's updates the way an installed app does: the newest version
-is worn from the next start. On a screen narrower than 700 px a desktop theme isn't worn (the default
-look is).
+is worn from the next start. A theme is worn at every window size and either orientation: on a small
+screen (a desk under 640 × 420 px: a phone, a window that isn't full screen) a desktop theme goes compact,
+every window filling the desk with the taskbar showing icons; when the window grows again, the windows
+go back to their places, kept on the desk. In *Your apps* a theme's tile wears it.
 
 ## What a theme is
 

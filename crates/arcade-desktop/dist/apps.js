@@ -121,7 +121,8 @@
       return h("div", { class: "ap-mine" }, h("div", { class: "ap-cover ap-tile" }, "?"), h("b", {}, a.card?.name || a.id), h("div", { class: "s" }, "Not found on the chains here now"), un);
     }
     const tile = h("div", { class: "ap-mine" + (a.removed ? " gone" : "") }, cover(a), h("b", {}, a.card.name), h("div", { class: "s" }, a.removed ? "removed by its publisher" : (a.card.version ? "v" + a.card.version : "")));
-    tile.onclick = (e) => { if (e.target.tagName !== "BUTTON" && !a.removed) open(a); };
+    // A theme's tile wears it (its page is only a preview of the look; Preview in the store opens that).
+    tile.onclick = (e) => { if (e.target.tagName !== "BUTTON" && !a.removed) (a.card.category === "themes" ? useTheme(a) : open(a)); };
     const un = h("button", { class: "small" }, "Uninstall");
     un.onclick = async () => { if (!un.dataset.sure) { un.dataset.sure = 1; un.textContent = "Sure?"; return; } await api("apps.uninstall", { id: a.id }); draw(); };
     const det = h("button", { class: "small" }, "Details"); det.onclick = () => { detail = a; draw(); };

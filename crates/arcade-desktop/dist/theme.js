@@ -266,6 +266,25 @@ button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:defa
 .ditem{width:40px;height:40px;display:flex;align-items:center;justify-content:center}
 .topbar .grow{flex:1}
 .topbar .center{position:absolute;left:50%;transform:translateX(-50%)}
+.menu{max-height:70vh;overflow-y:auto}
+.startmenu{overflow-y:auto;max-width:100%}
+.menubar{flex-wrap:wrap}
+.statusbar{flex-wrap:wrap;min-width:0}
+.tray{min-width:0;overflow:hidden}
+.dock-left{overflow-y:auto;overflow-x:hidden}
+.dock-bottom{overflow-x:auto;max-width:100%}
+/* a narrow window frame (layout "window"): the toolbar shows its icons only */
+.narrow .tbitem>span:not(.ticon),.narrow .brand{display:none}
+/* compact (layout "desktop" on a small screen: a phone, a window that isn't full screen, either orientation):
+   every window fills the desk, the taskbar shows icons, buttons are big enough for a finger */
+.compact .win{inset:0!important;width:auto!important;height:auto!important;resize:none}
+.compact .tmax{display:none}
+.compact .tbtn{width:28px;height:24px}
+.compact .task{flex:0 0 auto;max-width:none}
+.compact .task>span:not(.ticn),.compact .topbar .brand{display:none}
+.compact .ditem{width:34px;height:34px}
+.compact .icon{width:68px}
+.tiny .clock{display:none}
 `;
   const ICONS = {
     home: "M3 11 12 4l9 7v9h-6v-6H9v6H3z", wallet: "M3 7h15a3 3 0 0 1 3 3v8H3zM3 7l12-3v3M16 13h2",
@@ -344,6 +363,7 @@ button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:defa
     const body = el("div", "wbody"); const all = document.createElement("slot"); all.name = "screens"; body.append(all);
     const status = el("div", "statusbar"); status.append(...statusParts());
     frame.append(bar); if (th.window.toolbar) frame.append(tb); frame.append(body, status);
+    new ResizeObserver(() => frame.classList.toggle("narrow", frame.clientWidth < 640)).observe(frame);
     const mark = () => { const on = document.querySelector("section.tab.on")?.id; items.forEach((b) => b.classList.toggle("selected", b.dataset.tab === on)); };
     new MutationObserver(mark).observe(document.body, { subtree: true, attributes: true, attributeFilter: ["class"] });
     mark();
@@ -359,6 +379,8 @@ button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:defa
     const save = () => { try { localStorage.setItem(DESK + id, JSON.stringify(places)); } catch {} };
     const desk = el("div", "desk"); const middle = el("div", "middle");
     const wins = {}; let z = 10;
+    // Small screens (either orientation) are compact: see FRAME_CSS. Saved places are kept for a bigger screen.
+    let compact = false, fitAt = 0;
     const tasks = el("div", "tasks");
     const taskOf = {}, dockOf = {};
     const front = (k) => {
@@ -396,7 +418,7 @@ button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:defa
       const tb = el("div", "titlebar"); const btns = el("div", "tbtns");
       const mk = (cls, txt, f) => { const b = el("button", "tbtn " + cls, txt); b.onclick = (e) => { e.stopPropagation(); f(); }; return b; };
       const bMin = mk("tmin", "_", () => { w.hidden = true; places[k].min = true; save(); taskOf[k]?.classList.remove("on"); away(k); });
-      const bMax = mk("tmax", "□", () => { w.classList.toggle("max"); places[k] = { ...(places[k] || {}), max: w.classList.contains("max") }; save(); });
+      const bMax = mk("tmax", "□", () => { if (compact) return; w.classList.toggle("max"); places[k] = { ...(places[k] || {}), max: w.classList.contains("max") }; save(); });
       const bClose = mk("tclose", "×", () => closeWin(k));
       const order = [bMin, bMax, bClose];
       // a Mac's order (close first) when the buttons sit at the left
@@ -408,18 +430,21 @@ button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:defa
       w.addEventListener("pointerdown", () => { if (!w.classList.contains("active")) { front(k); go(k); } });
       tb.addEventListener("dblclick", () => btns.querySelector(".tmax").click());
       tb.addEventListener("pointerdown", (e) => {
-        if (e.target.closest(".tbtn") || w.classList.contains("max")) return;
+        if (e.target.closest(".tbtn") || w.classList.contains("max") || compact) return;
         const sx = e.clientX - w.offsetLeft, sy = e.clientY - w.offsetTop; tb.setPointerCapture(e.pointerId);
-        const move = (m) => { w.style.left = Math.max(-200, m.clientX - sx) + "px"; w.style.top = Math.max(0, m.clientY - sy) + "px"; };
+        // the title bar always stays on the desk, so a window can be grabbed again
+        const move = (m) => { w.style.left = Math.min(desk.clientWidth - 60, Math.max(60 - w.offsetWidth, m.clientX - sx)) + "px"; w.style.top = Math.min(desk.clientHeight - 30, Math.max(0, m.clientY - sy)) + "px"; };
         const up = () => { tb.removeEventListener("pointermove", move); tb.removeEventListener("pointerup", up); places[k] = { ...(places[k] || {}), x: w.offsetLeft, y: w.offsetTop }; save(); };
         tb.addEventListener("pointermove", move); tb.addEventListener("pointerup", up);
       });
-      new ResizeObserver(() => { if (!w.hidden && !w.classList.contains("max")) { places[k] = { ...(places[k] || {}), w: w.offsetWidth, h: w.offsetHeight }; save(); } }).observe(w);
+      // (its first report is the size it was given, not one the user chose: not kept)
+      let seenSize = false;
+      new ResizeObserver(() => { if (!seenSize) { seenSize = true; return; } if (!w.hidden && !w.classList.contains("max") && !compact && Date.now() - fitAt > 500) { places[k] = { ...(places[k] || {}), w: w.offsetWidth, h: w.offsetHeight }; save(); } }).observe(w);
       wins[k] = w; desk.append(w);
     }
     if (D.icons) {
       const icons = el("div", "icons");
-      for (const [k, l] of TABS) { const i = el("button", "icon"); i.append(iconEl(th, k, "icon-img"), el("span", "icon-label", l)); i.ondblclick = () => openWin(k); i.onclick = (e) => { if (e.detail === 0) openWin(k); }; icons.append(i); }
+      for (const [k, l] of TABS) { const i = el("button", "icon"); i.append(iconEl(th, k, "icon-img"), el("span", "icon-label", l)); i.ondblclick = () => openWin(k); i.onclick = (e) => { if (e.detail === 0 || compact || e.pointerType === "touch") openWin(k); }; icons.append(i); }
       desk.prepend(icons);
     }
     // the start menu (or Activities): every screen, then the looks
@@ -436,7 +461,8 @@ button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:defa
       b.onclick = async (e) => { e.stopPropagation(); const was = !sm.hidden; closeMenus(); if (!was) { await fillStart(); sm.hidden = false; b.classList.add("on");
         const r = b.getBoundingClientRect(), f = frame.getBoundingClientRect();
         sm.style.left = Math.max(0, r.left - f.left) + "px";
-        if (r.top - f.top > f.height / 2) { sm.style.bottom = (f.bottom - r.top) + "px"; sm.style.top = "auto"; } else { sm.style.top = (r.bottom - f.top) + "px"; sm.style.bottom = "auto"; } } };
+        if (r.top - f.top > f.height / 2) { sm.style.bottom = (f.bottom - r.top) + "px"; sm.style.top = "auto"; sm.style.maxHeight = (r.top - f.top - 4) + "px"; }
+        else { sm.style.top = (r.bottom - f.top) + "px"; sm.style.bottom = "auto"; sm.style.maxHeight = (f.bottom - r.bottom - 4) + "px"; } } };
       return b;
     };
     // the bar along the top: none, a clock (and Activities), or menus (a Mac's)
@@ -461,6 +487,24 @@ button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:defa
       if (D.bar === "top") frame.prepend(bar); else frame.append(bar);
     }
     frame.append(sm);
+    // The desk changed size (a window resized, a phone turned): compact or not, and every window kept on it.
+    const fit = () => {
+      const W = desk.clientWidth, H = desk.clientHeight; if (!W || !H) return;
+      compact = W < 640 || H < 420;
+      frame.classList.toggle("compact", compact); frame.classList.toggle("tiny", W < 420);
+      if (compact) return;
+      fitAt = Date.now();
+      for (const [k, w] of Object.entries(wins)) {
+        if (w.classList.contains("max")) continue;
+        // a window never sized by hand takes the default size for this desk (it may have been made on a small one)
+        if (places[k]?.w == null) { w.style.width = Math.min(900, W - 120) + "px"; w.style.height = Math.min(640, H - 120) + "px"; }
+        const ww = Math.min(parseFloat(w.style.width) || 0, W), hh = Math.min(parseFloat(w.style.height) || 0, H);
+        w.style.width = ww + "px"; w.style.height = hh + "px";
+        w.style.left = Math.max(0, Math.min(parseFloat(w.style.left) || 0, W - ww)) + "px";
+        w.style.top = Math.max(0, Math.min(parseFloat(w.style.top) || 0, H - hh)) + "px";
+      }
+    };
+    fit(); new ResizeObserver(fit).observe(desk);
     // Windows open at the last start come back, minimized ones first so the shown ones end in front.
     const opened = TABS.map(([k]) => k).filter((k) => places[k]?.open);
     const minimized = opened.filter((k) => places[k]?.min), shown = opened.filter((k) => !places[k]?.min);
@@ -531,11 +575,10 @@ button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:defa
   async function start() {
     const ref = read(KEY); if (!ref) return;
     current = ref;
-    const narrow = () => innerWidth < 700;
     const cached = read(CACHE);
     let th = null;
     try { if (cached?.manifest) th = check({ arcade_theme: 1, ...unparse(cached.manifest) }); } catch { th = null; }
-    if (th && !(th.layout === "desktop" && narrow())) draw(th, ref.id);
+    if (th) draw(th, ref.id);
     // then the newest version of it, in the background: a publisher's update is worn at the next start
     try {
       const a = (await installedThemes()).find((x) => x.id === ref.id);
@@ -543,7 +586,7 @@ button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:defa
       if (a.txid !== cached?.txid) {
         const fresh = await manifestOf(a);
         write(CACHE, { txid: a.txid, manifest: fresh }); write(KEY, { ...ref, txid: a.txid });
-        if (!th && !(fresh.layout === "desktop" && narrow())) draw(fresh, ref.id);
+        if (!th) draw(fresh, ref.id);
       }
     } catch (e) { console.warn("theme:", e.message); }
   }
