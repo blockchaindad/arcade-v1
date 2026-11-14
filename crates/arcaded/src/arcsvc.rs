@@ -57,7 +57,7 @@ use std::time::{Duration, Instant};
 /// Blocks in one answer, and its most bytes (at least one full block: 4 MB of storage
 /// section and 1 MB of transactions since §14.19).
 const ANSWER_BLOCKS: usize = 50;
-const ANSWER_BYTES: usize = 8 << 20;
+const ANSWER_BYTES: usize = 16 << 20;
 const _: () = assert!(ANSWER_BYTES >= arcade_arc::block::MAX_BLOCK_BYTES);
 /// A peer is asked again for a branch it named after this long without it.
 const ASK_AGAIN: Duration = Duration::from_secs(10);
@@ -440,6 +440,9 @@ fn take(node: &Node, svc: &Svc, block: Block) -> Result<Accepted, ChainError> {
     if got == Accepted::Known {
         return Ok(got);
     }
+    // Its blobs' bytes (checked by the chain) into the store, on any branch: a block taken on a side branch may yet be
+    // joined, and handed on.
+    crate::arcblob::keep_block(&block);
     if let Accepted::Tip { undone, .. } = &got {
         crate::arcseg::forget(&block.items);
         new_tip(node, svc, &mut st, undone);
@@ -453,6 +456,9 @@ fn new_tip(node: &Node, svc: &Svc, st: &mut State, undone: &[Hash256]) {
     let back: Vec<Tx> = undone.iter().rev().filter_map(|id| st.chain.block(id)).flat_map(|b| b.txs.iter().skip(1).cloned()).collect();
     st.pool.retip(st.chain.coins(), st.chain.tip().height + 1, back);
     st.refused.clear();
+    // Waiting blobs no waiting transaction brings any more go (the store keeps what blocks brought).
+    let named: std::collections::HashSet<arcade_arc::merkle::Hash> = st.pool.iter().flat_map(|w| w.blobs.iter().map(|b| b.0)).collect();
+    crate::arcblob::forget_except(&named);
     if let Err(e) = reconcile(&node.chain, svc.params, &st.chain) {
         eprintln!("arc: {e}");
     }
@@ -502,7 +508,15 @@ fn take_tx(svc: &Svc, raw: &[u8]) -> Result<(Hash256, u64), PoolError> {
     if st.refused.contains(&id) {
         return Err(PoolError::Refused);
     }
-    match st.pool.add(tx, st.chain.coins(), st.chain.tip().height + 1) {
+    // Its records' blobs the chain hasn't got must be here (they came with it, or ahead of it in `bl` frames).
+    if arcade_arc::blob::records(&tx).iter().any(|r| {
+        let id = r.id(&svc.net);
+        !st.chain.holds_blob(&id) && !crate::arcblob::here(&id)
+    }) {
+        return Err(PoolError::BlobMissing);
+    }
+    let chain = &st.chain;
+    match st.pool.add_with(tx, chain.coins(), chain.tip().height + 1, &svc.net, &|id| chain.holds_blob(id)) {
         Ok(fee) => Ok((id, fee)),
         Err(e) => {
             // A coin that isn't there may yet come (its transaction is on the way, or a
@@ -568,9 +582,21 @@ fn write_block(chain: &LocalChain, pool: &Pool, secret: &[u8; 32], ticket: &Tick
     // The coinbase pays what is owed, then (rules 2) the writer's own share; fees join the pot (§14.18).
     let outputs = chain.payouts_for(&arcade_arc::vrf::public_key(secret));
     let coinbase_bytes = coins::coinbase(ticket.height, &ticket.prev, b"", &outputs).raw.len();
-    let (mut txs, _fees) = pool.pick(params::MAX_TX_BYTES.saturating_sub(coinbase_bytes));
+    let (mut txs, _fees) = pool.pick_with(params::MAX_TX_BYTES.saturating_sub(coinbase_bytes), arcade_arc::blob::MAX_BLOB_BYTES, &|id| !chain.holds_blob(id));
+    // The bytes of the blobs those bring that the chain hasn't got (the pool took them only with their bytes here).
+    let mut new = HashMap::new();
+    for tx in &txs {
+        for r in arcade_arc::blob::records(tx) {
+            let id = r.id(chain.net());
+            if !chain.holds_blob(&id) && !new.contains_key(&id) {
+                if let Some(b) = crate::arcblob::get(&id) {
+                    new.insert(id, b);
+                }
+            }
+        }
+    }
     txs.insert(0, coins::coinbase(ticket.height, &ticket.prev, b"", &outputs));
-    ticket.seal(chain.net(), secret, time, txs, items, pot, seed)
+    ticket.seal_with_blobs(chain.net(), secret, time, txs, items, pot, seed, &new)
 }
 
 /// What a block carries of `waiting` (§9): in group order; registration commits by their stamp's work, most first
@@ -848,6 +874,7 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
 
     let dir = node.home.join("arc").join(net.key);
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    crate::arcblob::init(dir.join("blobs"));
     let t0 = Instant::now();
     let mut refused = 0;
     // The chain's one copy on disk is the store's (docs/ARCADECHAIN.md §14.17): its best branch
@@ -858,7 +885,9 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
         let mut batch = Vec::new();
         for h in 1..=tip {
             let Some(b) = node.chain.hash_at(p.chain_no, h).ok().flatten().and_then(|id| node.chain.block_raw(p.chain_no, &id).ok().flatten())
-                .and_then(|raw| arcade_chain::Block::parse_with(&raw, &p.format).ok()).and_then(|sb| unstored(&sb)) else { break };
+                .and_then(|raw| arcade_chain::Block::parse_with(&raw, &p.format).ok()).and_then(|sb| unstored(&sb))
+                // The store keeps a block's blob ids; their bytes come back from the blob store to be checked again.
+                .and_then(|b| crate::arcblob::attach(&b)) else { break };
             batch.push(b);
             if batch.len() == 1_000 {
                 held += batch.len();
@@ -1108,7 +1137,9 @@ fn serve(svc: &Svc, link: &mut Link, head: &Value) -> Result<(), LinkError> {
         let mut next = known.unwrap_or(0) + 1;
         let (mut blocks, mut bytes) = (Vec::new(), 0usize);
         while next <= top && blocks.len() < ANSWER_BLOCKS {
-            let b = chain.block(&chain.id_at(next).expect("a height of the branch")).expect("a block of the branch").encode();
+            // With its blobs' bytes again (the chain keeps their ids only); a block whose blob is gone ends the answer.
+            let Some(full) = crate::arcblob::attach(chain.block(&chain.id_at(next).expect("a height of the branch")).expect("a block of the branch")) else { break };
+            let b = full.encode();
             if !blocks.is_empty() && bytes + b.len() > ANSWER_BYTES {
                 break;
             }
@@ -1223,6 +1254,8 @@ pub fn on_frame(node: &Node, link: &mut Link, f: &Frame) -> Result<(), LinkError
             }
         }
         "txs" => on_txs(svc, link, f)?,
+        // A waiting blob ahead of the transactions that bring it (crate::arcblob).
+        "bl" => crate::arcblob::on_piece(&svc.net, &link.peer_id, &f.head, &f.blob),
         "it" => {
             crate::arcseg::on_items(&svc.net, &f.blob);
         }
@@ -1324,6 +1357,26 @@ fn serve_txs(svc: &Svc, link: &mut Link, id: u64, blob: &[u8]) -> Result<(), Lin
         }
         (txs, ids.len() - reached)
     };
+    // The blobs they bring that the chain hasn't got go first, so they are here when the transactions arrive.
+    let blobs: Vec<(arcade_arc::merkle::Hash, Vec<u8>)> = {
+        let st = svc.st.lock().unwrap();
+        let mut seen = std::collections::HashSet::new();
+        ids.iter()
+            .filter_map(|t| st.pool.get(t))
+            .flat_map(|w| w.blobs.iter().map(|b| b.0))
+            .filter(|b| !st.chain.holds_blob(b) && seen.insert(*b))
+            .filter_map(|b| crate::arcblob::get(&b).map(|bytes| (b, bytes)))
+            .collect()
+    };
+    for (bid, bytes) in blobs {
+        let pieces: Vec<&[u8]> = bytes.chunks(CHUNK).collect();
+        let k = pieces.len();
+        for (i, c) in pieces.into_iter().enumerate() {
+            let mut f = frame(svc, "bl", json!({"id": hex::encode(bid), "seq": i, "end": i + 1 == k}));
+            f.blob = c.to_vec();
+            link.send(&f)?;
+        }
+    }
     let data = join_blocks(&txs);
     let chunks: Vec<&[u8]> = if data.is_empty() { vec![&[][..]] } else { data.chunks(CHUNK).collect() };
     let n = chunks.len();
@@ -1532,6 +1585,23 @@ pub fn spender(at: &OutPoint) -> Option<Hash256> {
 }
 
 /// A wallet's signed transaction: into the pool, from where it goes to the other arcades.
+/// The running ARCADE chain's network.
+pub fn svc_net() -> Option<Net> {
+    svc().map(|s| s.net)
+}
+
+/// Whether the running ARCADE chain's best branch holds blob `id` (crate::arcblob).
+pub fn holds_blob(id: &arcade_arc::merkle::Hash) -> bool {
+    svc().is_some_and(|s| s.st.lock().unwrap().chain.holds_blob(id))
+}
+
+/// `arc.blob {id}`: a blob's bytes (hex) and whether the chain holds it.
+pub fn blob(req: &Value) -> Result<Value, String> {
+    let id: arcade_arc::merkle::Hash = req["id"].as_str().and_then(|s| hex::decode(s).ok()).and_then(|b| b.try_into().ok()).ok_or("id required (64 hex)")?;
+    let bytes = crate::arcblob::get(&id).ok_or("no such blob here")?;
+    Ok(json!({"id": hex::encode(id), "bytes": bytes.len(), "on_chain": holds_blob(&id), "hex": hex::encode(&bytes)}))
+}
+
 pub fn send_raw(raw: &[u8]) -> Result<(Hash256, u64), String> {
     let svc = svc().ok_or("the ARCADE chain isn't running here")?;
     take_tx(&svc, raw).map_err(|e| e.to_string())
@@ -1946,6 +2016,11 @@ pub fn segment_root(node: &Node, req: &Value) -> Result<Value, String> {
 pub fn submit(req: &Value) -> Result<Value, String> {
     let svc = svc().ok_or("the ARCADE chain isn't running here")?;
     let raw = req["hex"].as_str().and_then(|h| hex::decode(h).ok()).ok_or("hex required")?;
+    // The bytes of the blobs it brings (crate::arcblob), held until a block brings them.
+    for b in req["blobs"].as_array().into_iter().flatten() {
+        let bytes = b.as_str().and_then(|h| hex::decode(h).ok()).ok_or("blobs are hex")?;
+        crate::arcblob::hold(&svc.net, bytes).ok_or("a blob is too big, or there is no room for more waiting blobs")?;
+    }
     let (id, fee) = take_tx(&svc, &raw).map_err(|e| e.to_string())?;
     Ok(json!({"id": id.to_hex(), "fee": fee}))
 }

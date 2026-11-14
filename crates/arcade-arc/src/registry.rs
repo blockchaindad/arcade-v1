@@ -1985,7 +1985,7 @@ mod tests {
         let h = |time: u64| {
             let mut h = block::Header {
                 version: 1, height: 9, prev: Hash256([prev; 32]), time, tx_root: [0; 32], storage_root: [0; 32], difficulty: 1 << 40,
-                writer: [0; 32], weight: 1 << 30, vrf_proof: [3; 80], pot: block::TimeProof { output: vec![1; 8], proof: vec![2; 8] }, draw_seed: None, sig: [0; 64],
+                writer: [0; 32], weight: 1 << 30, vrf_proof: [3; 80], pot: block::TimeProof { output: vec![1; 8], proof: vec![2; 8] }, draw_seed: None, blob_root: [0; 32], sig: [0; 64],
             };
             h.sign(&NET, &sk);
             h

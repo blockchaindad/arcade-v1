@@ -217,6 +217,8 @@ pub struct Changes {
     /// The coins made and left unspent by the end of the block.
     pub made: Vec<(OutPoint, Coin)>,
     pub fees: u64,
+    /// Each transaction's own fee, after the coinbase, in block order (the blob fee is checked per transaction).
+    pub fees_by_tx: Vec<u64>,
     /// What the coinbase took of the fees.
     pub claimed: u64,
 }
@@ -262,6 +264,7 @@ pub fn check_block(txs: &[Tx], height: u64, prev: &Hash256, coins: &impl Coins, 
     for tx in rest {
         let fee = check_spend(tx, height, &within, &mut checks)?;
         changes.fees = changes.fees.checked_add(fee).filter(|t| *t <= MAX_MONEY).ok_or(TxError::Amount)?;
+        changes.fees_by_tx.push(fee);
         for input in &tx.inputs {
             match within.made.remove(&input.prevout) {
                 // Made and spent inside this block: it never reaches the coin set.

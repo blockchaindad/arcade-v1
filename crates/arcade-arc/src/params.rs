@@ -111,8 +111,8 @@ pub struct Net {
 }
 
 /// The newest rules version this arcade knows. Version 2 (time keepers, §6.2): a block's proof of time may come in
-/// up to [`MAX_POT_RUNS`] runs one after another.
-pub const RULES_KNOWN: u32 = 2;
+/// up to [`MAX_POT_RUNS`] runs one after another. Version 3 (blobs, §15 step 1): blob records and a block's blob section.
+pub const RULES_KNOWN: u32 = 3;
 
 /// The most runs a block's proof of time may come in from rules version 2 (a time keeper serving the 8 lowest
 /// candidates of a height; the 8th candidate's proof is 8 runs).

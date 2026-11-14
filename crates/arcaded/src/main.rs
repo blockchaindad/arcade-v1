@@ -22,6 +22,7 @@ mod arcborrow;
 mod arcseal;
 mod arcserve;
 mod arcseg;
+mod arcblob;
 mod arccode;
 mod arcgenesis;
 mod arckeep;

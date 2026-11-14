@@ -42,6 +42,10 @@ pub enum PoolError {
     Conflict,
     #[error("too many waiting transactions in a row")]
     Row,
+    #[error("the fee doesn't cover the blobs it brings (0.01 ARCADE per 1,000 bytes of blob)")]
+    LowBlobFee,
+    #[error("a blob it brings isn't here: send its bytes with it")]
+    BlobMissing,
     #[error("the pool is full of transactions that pay more")]
     Full,
     /// Not the pool's own answer: an arcade's, for a transaction it refused a moment ago.
@@ -61,6 +65,8 @@ pub struct Waiting {
     /// The waiting transactions it spends.
     parents: Vec<Hash256>,
     row: usize,
+    /// The blobs its records name that the chain didn't hold when it came (id, bytes): it paid the blob fee for them.
+    pub blobs: Vec<(crate::merkle::Hash, u64)>,
 }
 
 impl Waiting {
@@ -160,6 +166,13 @@ impl Pool {
     /// Take in a transaction for the block at `height` (the one after the tip), whose coins
     /// before it are `coins`. Its fee.
     pub fn add(&mut self, tx: Tx, coins: &impl Coins, height: u64) -> Result<u64, PoolError> {
+        self.add_with(tx, coins, height, &crate::params::TESTNET, &|_| true)
+    }
+
+    /// [`Pool::add`] for a chain with blobs (rules version 3): of the blobs `tx`'s records name, those `held` says the
+    /// chain hasn't got are paid for at the blob rate on top of the transaction's own floor (every waiting transaction
+    /// naming a blob new to the chain pays for it, so whichever a block puts first may bring it).
+    pub fn add_with(&mut self, tx: Tx, coins: &impl Coins, height: u64, net: &crate::params::Net, held: &dyn Fn(&crate::merkle::Hash) -> bool) -> Result<u64, PoolError> {
         if self.txs.contains_key(&tx.txid) {
             return Err(PoolError::Known);
         }
@@ -175,7 +188,18 @@ impl Pool {
         let mut checks = 0u32;
         let fee = coins::check_spend(&tx, height, &View { base: coins, pool: self, height }, &mut checks)?;
         let bytes = tx.raw.len();
-        if (fee as u128) * 1_000 < MIN_FEE_PER_KB as u128 * bytes as u128 {
+        let mut blobs: Vec<(crate::merkle::Hash, u64)> = Vec::new();
+        for r in crate::blob::records(&tx) {
+            let id = r.id(net);
+            if !held(&id) && !blobs.iter().any(|b| b.0 == id) {
+                blobs.push((id, r.len));
+            }
+        }
+        let blob_fee = crate::blob::fee_for(blobs.iter().map(|b| b.1).sum());
+        if fee < blob_fee {
+            return Err(PoolError::LowBlobFee);
+        }
+        if ((fee - blob_fee) as u128) * 1_000 < MIN_FEE_PER_KB as u128 * bytes as u128 {
             return Err(PoolError::LowFee);
         }
         if self.bytes + bytes > self.max_bytes {
@@ -183,7 +207,7 @@ impl Pool {
         }
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.admit(Waiting { tx, fee, checks, seq, parents, row });
+        self.admit(Waiting { tx, fee, checks, seq, parents, row, blobs });
         Ok(fee)
     }
 
@@ -318,6 +342,14 @@ impl Pool {
     /// waiting transactions it spends, within `max_bytes` and the block's signature checks.
     /// With them, their fees.
     pub fn pick(&self, max_bytes: usize) -> (Vec<Tx>, u64) {
+        self.pick_with(max_bytes, usize::MAX, &|_| false)
+    }
+
+    /// [`Pool::pick`] within a blob budget too: `new` says which of a transaction's blobs the chain hasn't got yet
+    /// (each counted once, however many transactions name it).
+    pub fn pick_with(&self, max_bytes: usize, max_blob_bytes: usize, new: &dyn Fn(&crate::merkle::Hash) -> bool) -> (Vec<Tx>, u64) {
+        let mut blob_ids: HashSet<crate::merkle::Hash> = HashSet::new();
+        let mut blob_bytes = 0usize;
         let mut best: Vec<&Waiting> = self.txs.values().collect();
         best.sort_unstable_by(|a, b| (b.fee as u128 * a.bytes() as u128).cmp(&(a.fee as u128 * b.bytes() as u128)).then(a.seq.cmp(&b.seq)));
         let mut picked: HashSet<Hash256> = HashSet::new();
@@ -333,6 +365,12 @@ impl Pool {
                 if !w.parents.iter().all(|p| picked.contains(p)) {
                     continue;
                 }
+                let more: usize = w.blobs.iter().filter(|b| new(&b.0) && !blob_ids.contains(&b.0)).map(|b| b.1 as usize).sum();
+                if blob_bytes + more > max_blob_bytes {
+                    continue;
+                }
+                blob_bytes += more;
+                blob_ids.extend(w.blobs.iter().filter(|b| new(&b.0)).map(|b| b.0));
                 picked.insert(w.tx.txid);
                 bytes += w.bytes();
                 checks += w.checks;

@@ -599,6 +599,19 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         }
         "arc.keeper" => crate::arckeep::api(node, req),
         "arc.genesis" => crate::arcgenesis::status(node),
+        "arc.blob" => crate::arcsvc::blob(req),
+        // A blob from this arcade's wallet: `path` (a file here) or `hex`, its `type`, `class` (0 permanent, 1 release,
+        // 2 temporary), `gzip`; `send` to put it in the pool (without: only what it would cost).
+        "arc.blob_publish" => {
+            let bytes = match (s("path"), s("hex")) {
+                (Some(path), _) => std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?,
+                (None, Some(h)) => hex::decode(h.trim()).map_err(|_| "hex is not hex".to_string())?,
+                _ => return Err("path or hex required".into()),
+            };
+            let class = arcade_arc::blob::Class::from_u8(req["class"].as_u64().unwrap_or(0) as u8).ok_or("class is 0, 1 or 2")?;
+            let enc = if req["gzip"] == true { arcade_arc::blob::Encoding::Gzip } else { arcade_arc::blob::Encoding::Plain };
+            crate::coinsend::publish_blob(node, &bytes, &s("type").unwrap_or_else(|| "application/octet-stream".into()), class, enc, req["send"] == true)
+        }
         "code.status" => Ok(crate::arccode::status()),
         "code.add" => crate::arccode::add(req),
         "code.export" => crate::arccode::export(req),

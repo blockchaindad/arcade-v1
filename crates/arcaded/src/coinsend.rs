@@ -193,6 +193,75 @@ pub fn send(node: &Node, key: Option<&str>, to: &str, amount: u64, from: Option<
     Ok(out)
 }
 
+
+/// `arc.blob_publish`: put `bytes` on the ARCADE chain as a blob (arcade-arc `blob.rs`): a transaction from this
+/// arcade's wallet with the blob's record and change back, paying the wallet's rate for its own bytes and, when the
+/// chain doesn't hold the blob yet, 0.01 ARCADE a kB of the blob; into the pool with the blob's bytes. Without `send`,
+/// only what it would be.
+pub fn publish_blob(node: &Node, bytes: &[u8], kind: &str, class: arcade_arc::blob::Class, encoding: arcade_arc::blob::Encoding, send: bool) -> Result<Value, String> {
+    use arcade_arc::blob::{self, Record};
+    use arcade_wallet::tx::{fee_for_size, sign_keyhash, verify_keyhash, TxOutSpec};
+    let p = crate::arcsvc::defined().filter(|p| crate::arcsvc::runs(p)).ok_or("the ARCADE chain isn't running here")?;
+    if bytes.is_empty() || bytes.len() > blob::MAX_BLOB_BYTES || kind.len() > blob::MAX_TYPE {
+        return Err(format!("a blob is 1 to {} bytes, its type at most {} characters", blob::MAX_BLOB_BYTES, blob::MAX_TYPE));
+    }
+    let net = crate::arcsvc::svc_net().ok_or("the ARCADE chain isn't running here")?;
+    let rec = Record::of(bytes, class, encoding, kind);
+    let id = rec.id(&net);
+    let new = !crate::arcsvc::holds_blob(&id);
+    let tip = node.chain.tip(p.chain_no).map_err(|e| e.to_string())?.map(|t| t.height).unwrap_or(0);
+    let (k, sk) = node.app.tag_key(p, 0).map_err(|e| e.to_string())?;
+    let pk = PublicKey::from_slice(&hex::decode(&k.pubkey).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let scripts = key_scripts(p, &pk);
+    let mut coins = Vec::new();
+    for (_, sc) in &scripts {
+        for (op, value, _h) in node.chain.coins_for_script(p, sc).map_err(|e| e.to_string())? {
+            if crate::arcsvc::spender(&op).is_some() {
+                continue;
+            }
+            if let Some(c) = node.chain.coin(p, &op).map_err(|e| e.to_string())? {
+                if c.coinbase && c.height + p.coinbase_maturity > tip {
+                    continue;
+                }
+            }
+            coins.push(Utxo { outpoint: op, value, script: sc.clone() });
+        }
+    }
+    coins.sort_by(|a, b| b.value.cmp(&a.value));
+    let fp = fee_policy(p);
+    let record = rec.script();
+    let change_script = scripts[0].1.clone();
+    let blob_fee = if new { blob::fee_for(bytes.len() as u64) } else { 0 };
+    let fee_of = |n: usize| fee_for_size(p, arcade_wallet::tx::estimate_size(n, &[record.len(), change_script.len()]) as u64, fp.fallback_per_kb) + blob_fee;
+    let (mut chosen, mut have) = (Vec::new(), 0u64);
+    for c in coins {
+        have += c.value;
+        chosen.push(c);
+        if have >= fee_of(chosen.len()) + fp.dust {
+            break;
+        }
+    }
+    let fee = fee_of(chosen.len());
+    if have < fee + fp.dust {
+        return Err(format!("not enough ARCADE: have {have}, need {} (the blob fee is {blob_fee})", fee + fp.dust));
+    }
+    let outs = vec![TxOutSpec { value: 0, script: record }, TxOutSpec { value: have - fee, script: change_script }];
+    let tx = sign_keyhash(p, 1, &chosen, &outs, &sk, arcade_app::now() as u32)?;
+    if !verify_keyhash(p, &tx, &chosen) {
+        return Err("the signed transaction didn't verify".into());
+    }
+    let mut out = json!({"blob": hex::encode(id), "root": hex::encode(rec.root), "bytes": bytes.len(), "type": kind, "class": class as u8,
+                         "new": new, "blob_fee": blob_fee, "fee": fee, "txid": tx.txid.to_hex(), "hex": hex::encode(&tx.raw), "sent": false});
+    if send {
+        crate::arcblob::hold(&net, bytes.to_vec()).ok_or("no room for more waiting blobs")?;
+        let (txid, fee) = crate::arcsvc::send_raw(&tx.raw)?;
+        out["sent"] = json!(true);
+        out["txid"] = json!(txid.to_hex());
+        out["fee"] = json!(fee);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

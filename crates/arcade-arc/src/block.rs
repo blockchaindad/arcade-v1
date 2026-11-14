@@ -46,7 +46,8 @@ pub const MAX_PATH: usize = 40;
 /// Longest source chain key ("doge", "peptest", ...).
 pub const MAX_CHAIN_KEY: usize = 16;
 /// No block is longer than this: both parts full, plus the header and the counts.
-pub const MAX_BLOCK_BYTES: usize = params::MAX_TX_BYTES + params::MAX_STORAGE_BYTES + 4_096;
+/// (Rules version 3: and the blob section, crate::blob, with a few bytes per blob for its length.)
+pub const MAX_BLOCK_BYTES: usize = params::MAX_TX_BYTES + params::MAX_STORAGE_BYTES + crate::blob::MAX_BLOB_BYTES + 65_536;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum BlockError {
@@ -56,6 +57,8 @@ pub enum BlockError {
     UnknownTag(u8),
     #[error("bytes left over after {0}")]
     Trailing(&'static str),
+    #[error("blobs: {0}")]
+    Blobs(&'static str),
     #[error("block has no transactions")]
     Empty,
     #[error("first transaction is not a coinbase")]
@@ -173,6 +176,9 @@ pub struct Header {
     pub pot: TimeProof,
     /// In the first block of an epoch: the proof of time behind the epoch's draw seed (§6.1).
     pub draw_seed: Option<TimeProof>,
+    /// From rules version 3: the Merkle root over the ids of the blobs the block carries (crate::blob); zeros when it
+    /// carries none. Not in a version 1 or 2 header's bytes, so their ids are as they were.
+    pub blob_root: Hash,
     pub sig: Sig,
 }
 
@@ -197,6 +203,9 @@ impl Header {
                 o.push(1);
                 t.encode(&mut o);
             }
+        }
+        if self.version >= 3 {
+            o.extend_from_slice(&self.blob_root);
         }
         o
     }
@@ -229,6 +238,7 @@ impl Header {
             1 => Some(TimeProof::decode(r)?),
             _ => return Err(DecodeError::Invalid("bad draw-seed flag")),
         };
+        let blob_root = if version >= 3 { r.array()? } else { [0; 32] };
         let sig = r.array()?;
         Ok(Header {
             version,
@@ -243,6 +253,7 @@ impl Header {
             vrf_proof,
             pot,
             draw_seed,
+            blob_root,
             sig,
         })
     }
@@ -938,6 +949,11 @@ pub struct Block {
     pub header: Header,
     pub txs: Vec<Tx>,
     pub items: Vec<Item>,
+    /// From rules version 3 (crate::blob): the ids of the blobs the block brings, in order, and their bytes. A block
+    /// arrives with its bytes and is checked so; a chain keeps only the ids afterwards (the bytes go to a blob store),
+    /// so `blobs` is empty in a block it holds, and filled again from the store when the block is handed on.
+    pub blob_ids: Vec<Hash>,
+    pub blobs: Vec<Vec<u8>>,
 }
 
 /// The header's root over transaction ids, in block order.
@@ -974,7 +990,28 @@ impl Block {
         for item in &self.items {
             item.encode(&mut o);
         }
+        if self.header.version >= 3 {
+            write_varint(&mut o, self.blobs.len() as u64);
+            for b in &self.blobs {
+                write_varint(&mut o, b.len() as u64);
+                o.extend_from_slice(b);
+            }
+        }
         o
+    }
+
+    /// Its blob ids, from the bytes it came with (decoding doesn't know the network, so this is the chain's first step).
+    pub fn with_blob_ids(mut self, net: &Net) -> Block {
+        if self.blob_ids.is_empty() && !self.blobs.is_empty() {
+            self.blob_ids = self.blobs.iter().map(|b| crate::blob::id_of_bytes(net, b)).collect();
+        }
+        self
+    }
+
+    /// The block as a chain keeps it: its blob ids but not their bytes.
+    pub fn without_blob_bytes(mut self) -> Block {
+        self.blobs = Vec::new();
+        self
     }
 
     /// Everything but the transactions: the header, then the storage section (how the chain
@@ -985,6 +1022,13 @@ impl Block {
         write_varint(&mut o, self.items.len() as u64);
         for item in &self.items {
             item.encode(&mut o);
+        }
+        // The blobs by id only: their bytes are kept once, in the blob store.
+        if self.header.version >= 3 {
+            write_varint(&mut o, self.blob_ids.len() as u64);
+            for id in &self.blob_ids {
+                o.extend_from_slice(id);
+            }
         }
         o
     }
@@ -998,10 +1042,17 @@ impl Block {
         for _ in 0..m {
             items.push(Item::decode(r)?);
         }
+        let mut blob_ids = Vec::new();
+        if header.version >= 3 {
+            let k = r.len()?;
+            for _ in 0..k.min(100_000) {
+                blob_ids.push(r.array()?);
+            }
+        }
         if !r.is_empty() {
             return Err(BlockError::Trailing("the block"));
         }
-        Ok(Block { header, txs, items })
+        Ok(Block { header, txs, items, blob_ids, blobs: Vec::new() })
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Block, BlockError> {
@@ -1020,10 +1071,23 @@ impl Block {
         for _ in 0..m {
             items.push(Item::decode(r)?);
         }
+        let mut blobs = Vec::new();
+        if header.version >= 3 {
+            let k = r.len()?;
+            let mut total = 0usize;
+            for _ in 0..k {
+                let n = r.len()?;
+                total = total.saturating_add(n);
+                if n == 0 || n > crate::blob::MAX_BLOB_BYTES || total > crate::blob::MAX_BLOB_BYTES {
+                    return Err(BlockError::TooBig("blobs"));
+                }
+                blobs.push(r.bytes(n)?.to_vec());
+            }
+        }
         if !r.is_empty() {
             return Err(BlockError::Trailing("the block"));
         }
-        Ok(Block { header, txs, items })
+        Ok(Block { header, txs, items, blob_ids: Vec::new(), blobs })
     }
 
     /// Everything about a block (1 or later) that can be checked without the chain.
@@ -1048,6 +1112,29 @@ impl Block {
         }
         if tx_root(&self.txs) != self.header.tx_root {
             return Err(BlockError::TxRoot);
+        }
+
+        // Blobs (rules version 3): every id's bytes here and hashing to it, under the header's root. Which blobs a block
+        // must bring is the chain's to say (its records naming blobs new to it).
+        if self.header.version >= 3 {
+            if self.blobs.len() != self.blob_ids.len() {
+                return Err(BlockError::Blobs("a blob's bytes aren't in the block"));
+            }
+            let mut total = 0usize;
+            for (id, bytes) in self.blob_ids.iter().zip(&self.blobs) {
+                total += bytes.len();
+                if crate::blob::id_of_bytes(net, bytes) != *id {
+                    return Err(BlockError::Blobs("a blob's bytes aren't its id's"));
+                }
+            }
+            if total > crate::blob::MAX_BLOB_BYTES {
+                return Err(BlockError::TooBig("blobs"));
+            }
+            if crate::blob::ids_root(&self.blob_ids) != self.header.blob_root {
+                return Err(BlockError::Blobs("the header's blob root"));
+            }
+        } else if !self.blobs.is_empty() || !self.blob_ids.is_empty() || self.header.blob_root != [0; 32] {
+            return Err(BlockError::Blobs("blobs before rules version 3"));
         }
 
         // The storage section: in order, and within each kind's limit (§9).
@@ -1139,6 +1226,7 @@ mod tests {
             vrf_proof: [3; 80],
             pot: TimeProof { output: vec![1; 100], proof: vec![2; 100] },
             draw_seed: (height % params::EPOCH_BLOCKS == 0).then(|| TimeProof { output: vec![4; 100], proof: vec![5; 100] }),
+            blob_root: [0; 32],
             sig: [0; 64],
         }
     }
@@ -1203,7 +1291,7 @@ mod tests {
         h.tx_root = tx_root(&txs);
         h.storage_root = storage_root(&items);
         h.sign(&TESTNET, &key(1));
-        Block { header: h, txs, items }
+        Block { header: h, txs, items, blob_ids: Vec::new(), blobs: Vec::new() }
     }
 
     #[test]
