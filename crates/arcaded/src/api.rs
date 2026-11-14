@@ -598,13 +598,9 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         "arc.earn" => crate::arcsvc::earn(node, req),
         "chains.add" => {
             let with: Vec<String> = req["with"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
-            // A drive chosen for it (crate::chaindrive): its file starts there.
-            if let (Some(d), Some(p)) = (s("drive").filter(|d| !d.is_empty() && d != "home"), s("key").as_deref().and_then(crate::chains::find)) {
-                if !node.extra.lock().unwrap().contains_key(p.key) && p.chain_no != node.params.chain_no {
-                    crate::chaindrive::place_new(node, p.chain_no, p.key, &d)?;
-                }
-            }
-            crate::chains::add(&node.self_arc(), &s("key").ok_or("key required")?, &s("mode").unwrap_or_else(|| "full".into()), with)
+            let key = s("key").ok_or("key required")?;
+            // The drive chosen for it, else this arcade's own (crate::chaindrive): its file starts there.
+            crate::chaindrive::add(node, &key, &s("drive").unwrap_or_default(), || crate::chains::add(&node.self_arc(), &key, &s("mode").unwrap_or_else(|| "full".into()), with))
         }
         "chains.unqueue" => crate::chains::unqueue(node, &s("key").ok_or("key required")?),
         "chains.pause" => crate::chains::set_paused(node, &s("key").ok_or("key required")?, true),

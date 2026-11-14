@@ -334,6 +334,10 @@ pub fn run_queue(node: Arc<Node>) {
                     let _ = node.app.event("chains", &format!("installing {key} (its turn in the queue)"));
                 }
                 Err(err) => {
+                    // A drive chosen for it is forgotten (crate::chaindrive): a later add starts afresh.
+                    if let Some(p) = by_key(&key) {
+                        let _ = node.chain.set_place(p.chain_no, None);
+                    }
                     let _ = node.app.event("chains", &format!("could not install {key} from the queue: {err}"));
                 }
             }
@@ -412,6 +416,7 @@ fn add_now(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>) -> Res
 pub fn set_paused(node: &Node, key: &str, paused: bool) -> Result<Value, String> {
     // Any capitalisation (DOGE, PEPtest) and the old mesh names map to the chain's key.
     let key = by_key(key).map(|p| p.key).unwrap_or(key);
+    crate::chaindrive::not_moving(key)?;
     let r = node.extra.lock().unwrap().get(key).cloned().ok_or_else(|| format!("{key} is not installed"))?;
     r.paused.store(paused, Ordering::Relaxed);
     save(node);
@@ -461,6 +466,7 @@ fn rebuilding(key: &str) -> Option<Vec<String>> {
 pub fn add_index(node: &Arc<Node>, key: &str, index: &str) -> Result<Value, String> {
     // Any capitalisation (DOGE, PEPtest) and the old mesh names map to the chain's key.
     let key = by_key(key).map(|p| p.key).unwrap_or(key);
+    crate::chaindrive::not_moving(key)?;
     let p = by_key(key).ok_or_else(|| format!("unknown chain {key}"))?;
     let (home, cur, run) = current(node, key)?;
     if let Some(pending) = rebuilding(key) {
@@ -573,6 +579,7 @@ pub fn add_index(node: &Arc<Node>, key: &str, index: &str) -> Result<Value, Stri
 pub fn remove_index(node: &Arc<Node>, key: &str, index: &str) -> Result<Value, String> {
     // Any capitalisation (DOGE, PEPtest) and the old mesh names map to the chain's key.
     let key = by_key(key).map(|p| p.key).unwrap_or(key);
+    crate::chaindrive::not_moving(key)?;
     let p = by_key(key).ok_or_else(|| format!("unknown chain {key}"))?;
     let (home, cur, run) = current(node, key)?;
     if rebuilding(key).is_some() {
@@ -660,6 +667,7 @@ pub fn remove(node: &Arc<Node>, key: &str) -> Result<Value, String> {
     }
     // Any capitalisation (DOGE, PEPtest) and the old mesh names map to the chain's key.
     let key = by_key(key).map(|p| p.key).unwrap_or(key);
+    crate::chaindrive::not_moving(key)?;
     let r = node.extra.lock().unwrap().remove(key).ok_or_else(|| format!("{key} is not installed"))?;
     r.stop.store(true, Ordering::Relaxed);
     crate::addrsvc::stop(r.params.chain_no);
@@ -1191,10 +1199,17 @@ pub(crate) fn wait_stopped(c: u16) -> Option<Following> {
     })
 }
 
-/// Start a chain's follower again after a move held it: the same mode, indexes and share.
-pub(crate) fn relaunch(node: &Arc<Node>, run: &ChainRun, paused: bool) -> Result<(), String> {
-    node.extra.lock().unwrap().remove(run.params.key);
-    launch(node, run.params.key, &run.mode, run.indexes.clone(), run.added, paused, run.share.clone())?;
+/// Start a chain's follower again after a move held it, with its settings as they are now (mode,
+/// indexes, share: read again, not kept from before the copy). Removed meanwhile: nothing to
+/// start. If it can't start, its old entry stays in the list (launch replaces it only once it
+/// starts), so the chain doesn't vanish until the arcade restarts.
+pub(crate) fn relaunch(node: &Arc<Node>, key: &str, paused: bool) -> Result<(), String> {
+    let Some(run) = node.extra.lock().unwrap().get(key).cloned() else { return Ok(()) };
+    if let Err(e) = launch(node, key, &run.mode, run.indexes.clone(), run.added, paused, run.share.clone()) {
+        // Saved as the user left it, not as the move held it.
+        run.paused.store(paused, Ordering::Relaxed);
+        return Err(e);
+    }
     save(node);
     Ok(())
 }
