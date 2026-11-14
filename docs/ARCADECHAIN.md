@@ -918,7 +918,7 @@ mainnet. Marked *(default)* where Martin has not said yes.
 | Segment confirmation | block and coins segments: 10% of the draw weight and a 100-block challenge window; index segments: more than half *(default)* |
 | @tag expiry | activity keeps a tag; a check-in costs 0.1 ARCADE into the pot; 12 months then 30 days' grace; claims committed ahead *(default)* |
 | Repo names | under the owner's @tag, `@tag/name` (**Martin: yes**) |
-| Home chain | ARCADE at mainnet, the Pepecoin ledger migrated by snapshot; on the testnet the ledger also runs on ARCADE beside Pepecoin testnet, so nothing that runs today breaks *(default)* |
+| Home chain | ARCADE at mainnet, the Pepecoin ledger migrated by snapshot; on the testnet the ledger also runs on ARCADE beside Pepecoin testnet, so nothing that runs today breaks (**Martin 2026-11-14: "Yes, arcade should become the home chain"**) |
 | Writer's share | 1 ARCADE of each block's 50 (**Martin: yes**, built, §14.26) |
 | Pay delay (§13 q1) | as built: pay is released by passed audits *(default)* |
 | Blocks only at launch (§13 q2) | blocks, the coins family and index journals at launch *(default)* |
@@ -970,7 +970,8 @@ mainnet. Marked *(default)* where Martin has not said yes.
 
 | Step | Status |
 |---|---|
-| 1–22 | todo |
+| 1 | built: chain unit test and local three-arcade net pass (blobnet: publish, hold byte for byte, relay, named again free, refused without bytes, restart); live testnet with the rules version 3 release |
+| 2–22 | todo |
 | 23 | Martin |
 | 24 | todo |
 | 25 | running (waits for block 1,165) |
