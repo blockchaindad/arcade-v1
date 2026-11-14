@@ -565,8 +565,8 @@ fn write_block(chain: &LocalChain, pool: &Pool, secret: &[u8; 32], ticket: &Tick
     let items = pack(chain.storage(), crate::arcseg::waiting(), ticket.height);
     let items = chain.storage().fitting(&items, ticket.height);
     let time = now.max(chain.tip().time + 1);
-    // The coinbase pays what is owed; fees join the pot (docs/ARCADECHAIN.md §14.18).
-    let outputs = chain.payouts();
+    // The coinbase pays what is owed, then (rules 2) the writer's own share; fees join the pot (§14.18).
+    let outputs = chain.payouts_for(&arcade_arc::vrf::public_key(secret));
     let coinbase_bytes = coins::coinbase(ticket.height, &ticket.prev, b"", &outputs).raw.len();
     let (mut txs, _fees) = pool.pick(params::MAX_TX_BYTES.saturating_sub(coinbase_bytes));
     txs.insert(0, coins::coinbase(ticket.height, &ticket.prev, b"", &outputs));

@@ -214,6 +214,9 @@ pub struct Applied {
     pub seed: Hash,
     /// The block's transaction fees: they join the pot (docs/ARCADECHAIN.md §14.18).
     pub fees: u64,
+    /// What its coinbase paid its writer (params::writer_reward, when the writer has a payout address): that much of
+    /// the block's 50 doesn't join the pot.
+    pub writer_paid: u64,
 }
 
 /// The storage side of the state, as the chain's rules need it: who has how much draw
@@ -231,6 +234,13 @@ pub trait Storage {
 
     /// What the coinbase of the next block, at `height`, must pay: (amount, script), in order.
     fn payouts(&self, height: u64) -> Vec<(u64, Vec<u8>)>;
+
+    /// Where a block's writer is paid its own share (rules version 2): its payout address as a script. None when it has
+    /// none on record (its share then stays in the pot).
+    fn writer_payout(&self, writer: &Key) -> Option<Vec<u8>> {
+        let _ = writer;
+        None
+    }
 
     /// Take in the next block: check its storage items and do what they and the block say.
     /// Nothing may be changed when the answer is an error.
@@ -502,9 +512,27 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
         &self.storage
     }
 
-    /// What the next block's coinbase must pay.
+    /// What the next block's coinbase must pay, before its writer's own share.
     pub fn payouts(&self) -> Vec<(u64, Vec<u8>)> {
         self.storage.payouts(self.tip().height + 1)
+    }
+
+    /// What the coinbase of `writer`'s block after the tip must pay: the payouts owed, then the writer's own share.
+    pub fn payouts_for(&self, writer: &Key) -> Vec<(u64, Vec<u8>)> {
+        self.payouts_at(self.tip().height + 1, writer).0
+    }
+
+    fn payouts_at(&self, height: u64, writer: &Key) -> (Vec<(u64, Vec<u8>)>, u64) {
+        let mut out = self.storage.payouts(height);
+        let share = params::writer_reward(&self.net, height);
+        let mut paid = 0;
+        if share > 0 {
+            if let Some(script) = self.storage.writer_payout(writer) {
+                out.push((share, script));
+                paid = share;
+            }
+        }
+        (out, paid)
     }
 
     /// Proof, as found, that a writer signed two blocks on one block (§5.1).
@@ -665,9 +693,9 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
                 return Err(ChainError::Tx(coins::TxError::Order));
             }
         }
-        let payouts = self.storage.payouts(entry.height);
+        let (payouts, writer_paid) = self.payouts_at(entry.height, &block.header.writer);
         let changes = coins::check_block(&block.txs, entry.height, &entry.prev, &self.coins, &payouts)?;
-        let undo = self.storage.apply(block, &Applied { height: entry.height, id: *id, seed: entry.seed, fees: changes.fees })?;
+        let undo = self.storage.apply(block, &Applied { height: entry.height, id: *id, seed: entry.seed, fees: changes.fees, writer_paid })?;
         for (at, _) in &changes.spent {
             self.coins.remove(at);
         }
@@ -885,7 +913,7 @@ impl Storage for FixedHolders {
         let catalog = self.catalog.apply(&block.items, at.height, &Fixed(&self.weights, self.total))?;
         let before = self.pot;
         let paid: u64 = self.payouts(at.height).iter().map(|(amount, _)| amount).sum();
-        self.pot = self.pot - paid + params::BLOCK_REWARD + at.fees;
+        self.pot = self.pot - paid + params::BLOCK_REWARD - at.writer_paid + at.fees;
         Ok((before, catalog))
     }
 

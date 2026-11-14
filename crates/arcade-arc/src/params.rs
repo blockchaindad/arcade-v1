@@ -118,6 +118,19 @@ pub const RULES_KNOWN: u32 = 2;
 /// candidates of a height; the 8th candidate's proof is 8 runs).
 pub const MAX_POT_RUNS: usize = 8;
 
+/// The block writer's own share of each block's 50 from rules version 2 (Martin 2026-11-14: 1 to the writer, 49 to the
+/// storage pot, fees still into the pot): a withheld or lost block costs its writer something.
+pub const WRITER_REWARD: u64 = COIN;
+
+/// What the writer of the block at `height` is paid in its own coinbase.
+pub fn writer_reward(net: &Net, height: u64) -> u64 {
+    if net.rules_at(height) >= 2 {
+        WRITER_REWARD
+    } else {
+        0
+    }
+}
+
 /// The most runs a block at `height` may carry in its proof of time.
 pub fn pot_runs(net: &Net, height: u64) -> usize {
     if net.rules_at(height) >= 2 {

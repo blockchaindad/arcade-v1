@@ -1421,6 +1421,12 @@ impl Storage for Registry {
         self.release_at(height).paid.into_iter().filter_map(|(pay, amount)| Some((amount, script::pay_to(&self.net, &pay)?))).collect()
     }
 
+    /// An owner is paid at the address its registration named; a genesis holder at its genesis address.
+    fn writer_payout(&self, writer: &Key) -> Option<Vec<u8>> {
+        let pay = self.owners.get(writer).map(|o| o.payout).or_else(|| self.genesis.get(writer).map(|g| g.1))?;
+        script::pay_to(&self.net, &pay)
+    }
+
     /// A block: the turn's payouts (as its coinbase was checked), then its items, then at an
     /// epoch's end the settlement of the pot, then its reward and fees into the pot.
     fn apply(&mut self, block: &Block, at: &Applied) -> Result<Self::Undo, BlockError> {
@@ -1467,8 +1473,8 @@ impl Registry {
                 self.pot = 0;
             }
         }
-        // Fees join the pot with the block reward (§14.18).
-        self.pot += params::BLOCK_REWARD + at.fees;
+        // Fees join the pot with the block reward (§14.18), but the writer's own share its coinbase paid (rules 2).
+        self.pot += params::BLOCK_REWARD - at.writer_paid + at.fees;
         self.blocks.push((at.id, at.seed));
         Ok(Undo { pot: before, catalog, ops })
     }
@@ -1671,7 +1677,7 @@ mod tests {
     }
 
     fn at(h: u64) -> Applied {
-        Applied { height: h, id: Hash256(tagged::hash(&NET, "test id", &[&h.to_le_bytes()])), seed: tagged::hash(&NET, "test seed", &[&h.to_le_bytes()]), fees: 0 }
+        Applied { height: h, id: Hash256(tagged::hash(&NET, "test id", &[&h.to_le_bytes()])), seed: tagged::hash(&NET, "test seed", &[&h.to_le_bytes()]), fees: 0, writer_paid: 0 }
     }
 
     #[test]

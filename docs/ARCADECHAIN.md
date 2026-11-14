@@ -371,7 +371,7 @@ Decided: **genesis stays 2027-01-01** (Martin, 2026-11-11).
 2. **Blocks only at launch:** index journals and Bitcoin's indexes added by upgrade?
 3. **Time keepers** aren't paid (as in Chia). OK, or should the block writer's fees be shared with the time keeper whose proof it used?
 4. **Address prefix:** **A...** for mainnet addresses?
-5. **A share of the 50 for the block writer?** Today the writer gets only fees, so writing blocks in secret or holding them back costs it nothing. Both reviews point at this. Giving the writer a part of each block's 50 (for example 5, with 45 still split by storage) makes a withheld or lost block cost real coins. It changes "the 50 is split by storage share" slightly: big holders already write more blocks, so shares stay about the same.
+5. **A share of the 50 for the block writer?** *Decided (Martin 2026-11-14): yes, 1 ARCADE per block to its writer, 49 to the storage pot, fees still into the pot* (built from rules version 2: §14.26).
 6. **The wallet's key path:** which BIP44 coin type for ARCADE addresses? The build's stand-in is 3 (Dogecoin's), so a wallet's ARCADE address would have the same key as its Dogecoin one. A number of its own keeps the keys apart; it has to be picked before the first real address is handed out.
 7. **Small fees:** a block whose fees are under 0.001 ARCADE (one small payment pays about 0.00045) can't pay them to its writer, because no output may be that small. Today they are burned. Add them to the storage pot instead?
 
@@ -885,3 +885,14 @@ history, the vendored dependencies so it rebuilds with no internet, and the preb
   kept, clean restart). GitHub is no longer asked. Tested: an arcade on v0.1.90 behind no open port fetched v0.1.91
   from another arcade, installed it and restarted into it in about 20 s.
 - **Still to do:** mainnet block 0 naming the first release's id; repos for everyone under @tags (`@tag/name`, push = signed ref update) once the ledger runs on ARCADE.
+
+### 14.26 The writer's share (Martin 2026-11-14, rules version 2)
+
+From rules version 2 (testnet block 2,200; mainnet from block 0) a block's coinbase pays, after what is owed, **1 ARCADE
+to its writer** (`params::WRITER_REWARD`) at its payout address: the one its registration names, or its genesis entry's.
+The pot takes the other 49 and the fees (`Applied::writer_paid`). Fees stay in the pot, so a block with large fees is no
+prize to fight over (no fee sniping); the writer's share is fixed. Why: both reviews pointed out that a writer paid
+nothing for writing loses nothing by holding a block back or building in secret; now each withheld or orphaned block
+costs it. The draw is by storage weight, so the share falls to writers in the same proportions as storage pay; splitting
+into many keys gains nothing. Tested on a local chain switching at block 5: 49 blocks, every coinbase from block 5 pays its
+writer exactly 1 ARCADE, none before, nothing refused.
