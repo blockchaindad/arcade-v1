@@ -8,6 +8,7 @@ const HELP: &str = "arcade — Arcade V1.0
 
   arcade setup                   first-run setup (mesh, chain, wallet, handle)
   arcade status                  sync, tag index, mesh links
+  arcade web                     the link that opens the app's window in a browser (here, or through an SSH tunnel)
   arcade peers                   mesh links
   arcade stop                    stop arcaded cleanly (writes its caches first)
   arcade wallet create           new wallet; shows the 12-word recovery phrase ONCE
@@ -21,8 +22,10 @@ const HELP: &str = "arcade — Arcade V1.0
   arcade events                  recent activity
   arcade mempool                 unconfirmed transactions and pending tag claims
   arcade chain list                         chains you can install, and their state
-  arcade chain add <key> [--mode full|chain] [--with ledger,profiles,ord,names,maps,tokens]
+  arcade chain add <key> [--mode full|chain] [--with ledger,profiles,ord,names,maps,tokens] [--drive <mount>]
                      every index is opt-in; names, maps and tokens ride on ord
+  arcade chain drives                       drives a chain's file can go on (free space, whether the arcade can write there)
+  arcade chain move <key> <mount|home>      move an installed chain's file to another drive (in the background)
   arcade chain status <key>                 staged progress (headers, blocks, coins, indexes)
   arcade chain offers                       which arcades on the mesh offer which chains
   arcade chain sizes                        measure this arcade's chains now; sizes other arcades report
@@ -308,6 +311,7 @@ fn main() {
     }
     let req = match a.as_slice() {
         ["status"] => json!({"cmd": "status"}),
+        ["web"] => json!({"cmd": "ui.link"}),
         ["peers"] => json!({"cmd": "peers"}),
         ["stop"] => json!({"cmd": "service.stop"}),
         ["wallet", "create"] => json!({"cmd": "wallet.create"}),
@@ -345,6 +349,8 @@ fn main() {
         ["chain", "pause", k] => json!({"cmd": "chains.pause", "key": k}),
         ["chain", "resume", k] => json!({"cmd": "chains.resume", "key": k}),
         ["chain", "remove", k] => json!({"cmd": "chains.remove", "key": k}),
+        ["chain", "drives"] => json!({"cmd": "chains.drives"}),
+        ["chain", "move", k, d] => json!({"cmd": "chains.move", "key": k, "drive": d}),
         ["chain", "copy", "status"] => json!({"cmd": "chains.copy_status"}),
         ["chain", "copy", "status", k] => json!({"cmd": "chains.copy_status", "key": k}),
         ["chain", "copy", "start", k] => json!({"cmd": "chains.copy_start", "key": k}),
@@ -383,16 +389,18 @@ fn main() {
         ["chain", "add", k, rest @ ..] => {
             let mut mode = "full".to_string();
             let mut with: Vec<String> = vec![];
+            let mut drive = String::new();
             let mut i = 0;
             while i < rest.len() {
                 match rest[i] {
                     "--mode" if i + 1 < rest.len() => { mode = rest[i + 1].to_string(); i += 1; }
                     "--with" if i + 1 < rest.len() => { with = rest[i + 1].split(',').map(String::from).collect(); i += 1; }
+                    "--drive" if i + 1 < rest.len() => { drive = rest[i + 1].to_string(); i += 1; }
                     _ => {}
                 }
                 i += 1;
             }
-            json!({"cmd": "chains.add", "key": k, "mode": mode, "with": with})
+            json!({"cmd": "chains.add", "key": k, "mode": mode, "with": with, "drive": drive})
         }
         ["ledger"] => json!({"cmd": "ledger"}),
         ["ledger", h] => json!({"cmd": "ledger", "height": h}),
@@ -421,6 +429,14 @@ fn main() {
     BufReader::new(s).read_line(&mut line).unwrap();
     let v: Value = serde_json::from_str(&line).unwrap_or(json!({"ok": false, "error": "bad reply"}));
     if v["ok"] == true {
+        if a.as_slice() == ["web"] {
+            if let Some(u) = v["result"]["url"].as_str() {
+                println!("Open in a browser on this computer:\n\n  {u}\n");
+                println!("From another computer, first open a tunnel (the same port on both ends):\n\n  {}\n", v["result"]["tunnel"].as_str().unwrap_or(""));
+                println!("The link holds this arcade's key: anyone with it and a way in can use the arcade as you. It changes each time the arcade starts.");
+                return;
+            }
+        }
         if a.first() == Some(&"wallet") && a.get(1) == Some(&"create") {
             if let Some(p) = v["result"]["phrase"].as_str() {
                 println!("Your recovery phrase (write it down, it is shown only now):\n\n  {p}\n");

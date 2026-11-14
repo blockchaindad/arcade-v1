@@ -174,7 +174,107 @@ fn flags(node: &Node, apps: &[App]) -> BTreeMap<String, String> {
 }
 
 /// Opinions, comments and tips on any version of an app (home chain feed acts).
-fn social(acts: &[Value], txids: &BTreeSet<String>, me: &str) -> Value {
+/// A review's stars: a comment that begins with five marks, ★ for each star given and ☆ for the
+/// rest, given ones first ("★★★★☆ works well" = 4). The original arcade shows it as a comment.
+pub fn stars_of(text: &str) -> Option<(u8, &str)> {
+    let head: Vec<char> = text.chars().take(5).collect();
+    if head.len() < 5 || !head.iter().all(|c| *c == '★' || *c == '☆') {
+        return None;
+    }
+    let n = head.iter().take_while(|c| **c == '★').count();
+    if n == 0 || head[n..].iter().any(|c| *c == '★') {
+        return None;
+    }
+    let rest = &text[head.iter().map(|c| c.len_utf8()).sum::<usize>()..];
+    Some((n as u8, rest.trim()))
+}
+
+/// Where an act sits in time: its block height (unconfirmed last), then its txid.
+fn act_order(a: &Value) -> (u64, String) {
+    (a["h"].as_u64().filter(|h| *h > 0).unwrap_or(1 << 60), a["txid"].as_str().unwrap_or("").to_string())
+}
+
+/// Every edit (kind 5) and delete (kind 6) keyed by (target txid, writer), built once per request
+/// so each comment finds its own in one lookup instead of a scan of every act.
+struct Fixes {
+    /// The latest edit's order and text.
+    edits: BTreeMap<(String, String), ((u64, String), Value)>,
+    deletes: BTreeSet<(String, String)>,
+}
+
+fn fixes(acts: &[Value]) -> Fixes {
+    let mut f = Fixes { edits: BTreeMap::new(), deletes: BTreeSet::new() };
+    for a in acts {
+        let key = || (a["target"].as_str().unwrap_or("").to_string(), a["from"].as_str().unwrap_or("").to_string());
+        match a["kind"].as_u64().unwrap_or(0) {
+            5 => {
+                let o = act_order(a);
+                // Ties go to the later row, as max_by_key would.
+                if f.edits.get(&key()).is_none_or(|(x, _)| o >= *x) {
+                    f.edits.insert(key(), (o, a["text"].clone()));
+                }
+            }
+            6 => {
+                f.deletes.insert(key());
+            }
+            _ => {}
+        }
+    }
+    f
+}
+
+/// Comments on an app (any version) as they stand: an edit by its writer replaces its text, a
+/// delete by its writer takes it out. Oldest first.
+fn comments_on(acts: &[Value], fx: &Fixes, txids: &BTreeSet<String>) -> Vec<Value> {
+    let k = |a: &Value| a["kind"].as_u64().unwrap_or(0);
+    let key = |c: &Value| (c["txid"].as_str().unwrap_or("").to_string(), c["from"].as_str().unwrap_or("").to_string());
+    let mut out: Vec<Value> = acts
+        .iter()
+        .filter(|a| k(a) == 3 && txids.contains(a["target"].as_str().unwrap_or("")))
+        .filter(|c| !fx.deletes.contains(&key(c)))
+        .cloned()
+        .collect();
+    for c in out.iter_mut() {
+        if let Some((_, text)) = fx.edits.get(&key(c)) {
+            c["text"] = text.clone();
+        }
+        if let Some((n, _)) = stars_of(c["text"].as_str().unwrap_or("")) {
+            c["stars"] = json!(n);
+        }
+    }
+    out.sort_by_key(act_order);
+    out
+}
+
+/// Star ratings from the reviews: each person's latest surviving review with stars counts (edits
+/// applied, deleted ones gone). `my_review` is the one that counts for me, the one "change" edits;
+/// `my_reviews` is every starred review of mine still standing, oldest first, so "remove" can
+/// delete them all and an older one does not count again.
+fn ratings(comments: &[Value], me: &str) -> Value {
+    let mut by: BTreeMap<String, (u8, String)> = BTreeMap::new();
+    let mut mine_all: Vec<String> = Vec::new();
+    for c in comments {
+        if let Some(n) = c["stars"].as_u64() {
+            let from = c["from"].as_str().unwrap_or("");
+            let txid = c["txid"].as_str().unwrap_or("").to_string();
+            if from == me {
+                mine_all.push(txid.clone());
+            }
+            by.insert(from.to_string(), (n as u8, txid));
+        }
+    }
+    let mut dist = [0u64; 5];
+    for (n, _) in by.values() {
+        dist[*n as usize - 1] += 1;
+    }
+    let count: u64 = dist.iter().sum();
+    let sum: u64 = dist.iter().enumerate().map(|(i, x)| (i as u64 + 1) * x).sum();
+    let mine = by.get(me);
+    json!({"count": count, "average": if count == 0 { Value::Null } else { json!((sum as f64 / count as f64 * 10.0).round() / 10.0) },
+           "dist": dist, "mine": mine.map(|m| m.0), "my_review": mine.map(|m| m.1.clone()), "my_reviews": mine_all})
+}
+
+fn social(acts: &[Value], fx: &Fixes, txids: &BTreeSet<String>, me: &str) -> Value {
     let on: Vec<&Value> = acts.iter().filter(|a| txids.contains(a["target"].as_str().unwrap_or(""))).collect();
     let k = |a: &Value| a["kind"].as_u64().unwrap_or(0);
     let order = |a: &Value| (a["h"].as_u64().filter(|h| *h > 0).unwrap_or(1 << 60), a["txid"].as_str().unwrap_or("").to_string());
@@ -194,13 +294,17 @@ fn social(acts: &[Value], txids: &BTreeSet<String>, me: &str) -> Value {
     }
     let nl = likes.values().filter(|x| x.0 == 1).count();
     let nd = dislikes.values().filter(|x| x.0 == 8).count();
-    let mut comments: Vec<&Value> = on.iter().filter(|a| k(a) == 3).copied().collect();
-    comments.sort_by_key(|a| order(a));
+    let comments = comments_on(acts, fx, txids);
+    let rating = ratings(&comments, me);
+    // Each rating moves the score like a like or a dislike would: +1 for 5 stars, -1 for 1.
+    // (stars - 3) / 2 per rater: 5 stars +1, 4 +0.5, 3 nothing, 2 -0.5, 1 -1.
+    let stars_score: f64 = rating["dist"].as_array().map(|d| d.iter().enumerate().map(|(i, x)| (i as f64 - 2.0) / 2.0 * x.as_f64().unwrap_or(0.0)).sum()).unwrap_or(0.0);
     let tips = on.iter().filter(|a| matches!(k(a), 7 | 10)).count();
     let mine = if likes.get(me).is_some_and(|x| x.0 == 1) { "like" } else if dislikes.get(me).is_some_and(|x| x.0 == 8) { "dislike" } else { "none" };
     json!({"likes": nl, "dislikes": nd, "comments": comments.len(), "tips": tips, "my_opinion": mine,
-           "last_comments": comments.iter().rev().take(3).rev().map(|a| json!({"from": a["from"], "text": a["text"], "txid": a["txid"]})).collect::<Vec<_>>(),
-           "score": nl as f64 - nd as f64 + 0.5 * comments.len() as f64})
+           "last_comments": comments.iter().rev().take(3).rev().map(|a| json!({"from": a["from"], "text": a["text"], "txid": a["txid"], "stars": a["stars"]})).collect::<Vec<_>>(),
+           "rating": rating,
+           "score": nl as f64 - nd as f64 + 0.5 * comments.len() as f64 + stars_score})
 }
 
 fn installed_ids(node: &Node) -> Vec<Value> {
@@ -211,7 +315,7 @@ fn starred_ids(node: &Node) -> BTreeSet<String> {
     meta_get(node, "apps_starred").as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default()
 }
 
-fn entry(node: &Node, a: &App, acts: &[Value], me: &str, flag: Option<&String>, installed: &BTreeSet<String>, starred: &BTreeSet<String>) -> Value {
+fn entry(node: &Node, a: &App, acts: &[Value], fx: &Fixes, me: &str, flag: Option<&String>, installed: &BTreeSet<String>, starred: &BTreeSet<String>) -> Value {
     let n = &a.versions[0];
     let c = a.chain.chain_no;
     let id = app_id(a.chain.key, &n.creator, &n.card.key());
@@ -224,7 +328,7 @@ fn entry(node: &Node, a: &App, acts: &[Value], me: &str, flag: Option<&String>, 
         n.txid.clone()
     };
     let txids: BTreeSet<String> = a.versions.iter().map(|v| v.txid.clone()).collect();
-    let mut s = social(acts, &txids, me);
+    let mut s = social(acts, fx, &txids, me);
     let time = block_time(node, c, n.height);
     let age_h = arcade_app::now().saturating_sub(time) as f64 / 3600.0;
     let hot = (1.0 + s["score"].as_f64().unwrap_or(0.0)) / (age_h + 2.0).powf(1.5);
@@ -243,11 +347,39 @@ fn me(node: &Node) -> String {
     crate::msgsvc::sender_key(node).map(|(a, _, _)| a).unwrap_or_default()
 }
 
-/// The App Store: every app (not removed; flagged only when asked), starred first.
-pub fn store(node: &Node, sort: &str, q: &str, show_flagged: bool) -> Value {
+/// App Store categories: these first, in this order. Any other category a card names shows after
+/// them, so a new kind of app needs no new arcade. (key, label, what it holds)
+pub const CATEGORIES: &[(&str, &str, &str)] = &[
+    ("games", "Games", "Things to play"),
+    ("apps", "Apps", "Tools and everything else"),
+    ("social", "Social", "Chats, groups and feeds"),
+    ("node-modules", "Node modules", "Features for this arcade itself, published and installed like any app"),
+    ("themes", "Themes", "How this window looks: an application window or a desktop, its colours and frame (docs/THEMES.md)"),
+];
+
+/// A category for the store's list: a known one's label, else its name in words.
+fn category_json(key: &str, count: usize) -> Value {
+    match CATEGORIES.iter().find(|c| c.0 == key) {
+        Some((k, l, a)) => json!({"key": k, "label": l, "about": a, "count": count, "known": true}),
+        None => {
+            let label: String = key.split('-').map(|w| { let mut c = w.chars(); c.next().map(|f| f.to_uppercase().chain(c).collect::<String>()).unwrap_or_default() }).collect::<Vec<_>>().join(" ");
+            json!({"key": key, "label": label, "about": "", "count": count, "known": false})
+        }
+    }
+}
+
+/// The categories, for publishing (the known ones).
+pub fn categories() -> Value {
+    Value::Array(CATEGORIES.iter().map(|c| category_json(c.0, 0)).collect())
+}
+
+/// The App Store: every app (not removed; flagged only when asked), starred first. `category`
+/// "" is all of them; the reply counts each category among the apps the search finds.
+pub fn store(node: &Node, sort: &str, q: &str, show_flagged: bool, category: &str) -> Value {
     let apps = gather(node);
     let fl = flags(node, &apps);
     let acts = arcade_ledger::messages::rows(&node.chain, arcade_ledger::messages::ACT, node.params.chain_no).unwrap_or_default();
+    let fx = fixes(&acts);
     let me = me(node);
     let installed: BTreeSet<String> = installed_ids(node).iter().filter_map(|x| x["id"].as_str().map(String::from)).collect();
     let starred = starred_ids(node);
@@ -260,9 +392,18 @@ pub fn store(node: &Node, sort: &str, q: &str, show_flagged: bool) -> Value {
             let hidden = f.is_some_and(|f| f.starts_with("flagged") || f == "confirmed");
             show_flagged == hidden
         })
-        .filter(|a| q.is_empty() || a.versions[0].card.name.to_lowercase().contains(&q) || a.versions[0].card.genre.to_lowercase().contains(&q) || a.versions[0].card.description.to_lowercase().contains(&q))
-        .map(|a| entry(node, a, &acts, &me, fl.get(&a.versions[0].txid), &installed, &starred))
+        .filter(|a| q.is_empty() || a.versions[0].card.name.to_lowercase().contains(&q) || a.versions[0].card.genre.to_lowercase().contains(&q) || a.versions[0].card.description.to_lowercase().contains(&q) || a.versions[0].card.category.contains(&q))
+        .map(|a| entry(node, a, &acts, &fx, &me, fl.get(&a.versions[0].txid), &installed, &starred))
         .collect();
+    let mut counts: BTreeMap<String, usize> = CATEGORIES.iter().map(|c| (c.0.to_string(), 0)).collect();
+    for a in &out {
+        *counts.entry(a["card"]["category"].as_str().unwrap_or("apps").to_string()).or_default() += 1;
+    }
+    let mut cats: Vec<Value> = CATEGORIES.iter().map(|c| category_json(c.0, counts[c.0])).collect();
+    cats.extend(counts.iter().filter(|(k, _)| !CATEGORIES.iter().any(|c| c.0 == k.as_str())).map(|(k, n)| category_json(k, *n)));
+    if !category.is_empty() {
+        out.retain(|a| a["card"]["category"] == category);
+    }
     out.sort_by(|a, b| {
         let st = b["starred"].as_bool().cmp(&a["starred"].as_bool());
         st.then_with(|| if sort == "new" {
@@ -271,7 +412,7 @@ pub fn store(node: &Node, sort: &str, q: &str, show_flagged: bool) -> Value {
             b["social"]["hot"].as_f64().partial_cmp(&a["social"]["hot"].as_f64()).unwrap_or(std::cmp::Ordering::Equal)
         })
     });
-    json!({"apps": out, "chains": ledger_chains(node).iter().map(|p| p.key).collect::<Vec<_>>()})
+    json!({"apps": out, "categories": cats, "chains": ledger_chains(node).iter().map(|p| p.key).collect::<Vec<_>>()})
 }
 
 /// The apps installed here, each at its newest version.
@@ -280,6 +421,7 @@ pub fn installed(node: &Node) -> Value {
     let apps = gather(node);
     let fl = flags(node, &apps);
     let acts = arcade_ledger::messages::rows(&node.chain, arcade_ledger::messages::ACT, node.params.chain_no).unwrap_or_default();
+    let fx = fixes(&acts);
     let me = me(node);
     let set: BTreeSet<String> = ids.iter().filter_map(|x| x["id"].as_str().map(String::from)).collect();
     let starred = starred_ids(node);
@@ -288,7 +430,7 @@ pub fn installed(node: &Node) -> Value {
         let id = i["id"].as_str().unwrap_or("");
         match apps.iter().find(|a| app_id(a.chain.key, &a.versions[0].creator, &a.versions[0].card.key()) == id) {
             Some(a) => {
-                let mut e = entry(node, a, &acts, &me, fl.get(&a.versions[0].txid), &set, &starred);
+                let mut e = entry(node, a, &acts, &fx, &me, fl.get(&a.versions[0].txid), &set, &starred);
                 e["installed_at"] = i["at"].clone();
                 out.push(e);
             }
@@ -339,12 +481,12 @@ pub fn card(node: &Node, chain: &str, txid: &str) -> Result<Value, String> {
     let apps = vec![a];
     let fl = flags(node, &gather(node));
     let acts = arcade_ledger::messages::rows(&node.chain, arcade_ledger::messages::ACT, node.params.chain_no).unwrap_or_default();
+    let fx = fixes(&acts);
     let installed: BTreeSet<String> = installed_ids(node).iter().filter_map(|x| x["id"].as_str().map(String::from)).collect();
-    let mut e = entry(node, &apps[0], &acts, &me(node), fl.get(&apps[0].versions[0].txid), &installed, &starred_ids(node));
+    let mut e = entry(node, &apps[0], &acts, &fx, &me(node), fl.get(&apps[0].versions[0].txid), &installed, &starred_ids(node));
     let txids: BTreeSet<String> = apps[0].versions.iter().map(|v| v.txid.clone()).collect();
-    let mut comments: Vec<Value> = acts.iter().filter(|a| a["kind"] == 3 && txids.contains(a["target"].as_str().unwrap_or(""))).cloned().collect();
-    comments.sort_by_key(|a| a["h"].as_u64().unwrap_or(u64::MAX));
-    e["comments"] = json!(comments.iter().map(|a| json!({"from": a["from"], "text": a["text"], "txid": a["txid"], "height": a["h"]})).collect::<Vec<_>>());
+    let comments = comments_on(&acts, &fx, &txids);
+    e["comments"] = json!(comments.iter().map(|a| json!({"from": a["from"], "text": a["text"], "txid": a["txid"], "height": a["h"], "stars": a["stars"]})).collect::<Vec<_>>());
     e["permissions"] = perms(node, &id);
     Ok(e)
 }
@@ -489,4 +631,143 @@ pub fn storage(node: &Node, page: &str, op: &str, key: Option<&str>, value: Opti
     meta_put(node, &format!("pagestore:{page}"), &Value::Object(items))?;
     meta_put(node, &format!("pagehist:{page}"), &Value::Object(hist))?;
     Ok(json!({}))
+}
+
+#[cfg(test)]
+mod rating_tests {
+    use super::*;
+
+    #[test]
+    fn reviews_carry_stars_and_the_latest_counts() {
+        assert_eq!(stars_of("★★★★☆ works well"), Some((4, "works well")));
+        assert_eq!(stars_of("★★★★★"), Some((5, "")));
+        assert_eq!(stars_of("★☆☆☆☆meh"), Some((1, "meh")));
+        for no in ["☆☆☆☆☆ zero", "★★☆★☆ mixed", "★★★★ four marks", "great ★★★★★", ""] {
+            assert_eq!(stars_of(no), None, "{no}");
+        }
+        let app: BTreeSet<String> = ["a1".to_string()].into();
+        let act = |kind: u64, txid: &str, from: &str, target: &str, text: &str, h: u64| json!({"kind": kind, "txid": txid, "from": from, "target": target, "text": text, "h": h});
+        let acts = vec![
+            act(3, "r1", "bob", "a1", "★★☆☆☆ crashes", 10),
+            act(3, "r2", "bob", "a1", "★★★★★ fixed now", 12),      // bob's latest counts: 5
+            act(3, "r3", "amy", "a1", "★★★☆☆ ok", 11),
+            act(5, "e1", "amy", "r3", "★★★★☆ better", 13),         // amy edits hers: 4
+            act(3, "r4", "cat", "a1", "★☆☆☆☆ no", 11),
+            act(6, "d1", "cat", "r4", "", 14),                     // cat takes hers back
+            act(6, "d2", "bob", "r3", "", 14),                     // not bob's to delete
+            act(3, "r5", "dan", "a1", "nice app", 11),             // a comment without stars
+        ];
+        let c = comments_on(&acts, &fixes(&acts), &app);
+        assert_eq!(c.iter().map(|x| x["txid"].as_str().unwrap()).collect::<Vec<_>>(), ["r1", "r3", "r5", "r2"]);
+        let r = ratings(&c, "amy");
+        assert_eq!((r["count"].as_u64(), r["average"].as_f64(), r["mine"].as_u64()), (Some(2), Some(4.5), Some(4)));
+        assert_eq!(r["dist"], json!([0, 0, 0, 1, 1]));
+        assert_eq!(r["my_review"], "r3");
+        let s = social(&acts, &fixes(&acts), &app, "bob");
+        assert_eq!(s["rating"]["mine"], 5);
+        assert_eq!(s["score"].as_f64(), Some(0.5 * 4.0 + 1.0 + 0.5));
+        assert_eq!(s["rating"]["my_reviews"], json!(["r1", "r2"]));
+    }
+
+    fn act(kind: u64, txid: &str, from: &str, target: &str, text: &str, h: u64) -> Value {
+        json!({"kind": kind, "txid": txid, "from": from, "target": target, "text": text, "h": h})
+    }
+
+    fn rated(acts: &[Value], who: &str) -> Value {
+        let app: BTreeSet<String> = ["a1".to_string()].into();
+        ratings(&comments_on(acts, &fixes(acts), &app), who)
+    }
+
+    /// What the store's buttons send: "Change my rating" edits `my_review` (a new review only when
+    /// there is none), "Remove my rating" deletes every one in `my_reviews`.
+    #[test]
+    fn change_then_remove_leaves_no_rating() {
+        let mut acts = vec![act(3, "r1", "bob", "a1", "★★☆☆☆ crashes", 10)];
+        let r = rated(&acts, "bob");
+        assert_eq!((r["mine"].as_u64(), r["my_review"].as_str()), (Some(2), Some("r1")));
+        // Change to 5: an edit of the review that counts.
+        acts.push(act(5, "e1", "bob", "r1", "★★★★★ fixed now", 11));
+        let r = rated(&acts, "bob");
+        assert_eq!((r["mine"].as_u64(), r["count"].as_u64(), r["my_review"].as_str()), (Some(5), Some(1), Some("r1")));
+        assert_eq!(r["dist"], json!([0, 0, 0, 0, 1]));
+        // A later edit wins over an earlier one, and an unconfirmed one over both.
+        acts.push(act(5, "e2", "bob", "r1", "★★★☆☆ hmm", 0));
+        assert_eq!(rated(&acts, "bob")["mine"], 3);
+        // Remove: every starred review of bob's goes.
+        for t in rated(&acts, "bob")["my_reviews"].as_array().unwrap().clone() {
+            acts.push(act(6, &format!("d-{}", t.as_str().unwrap()), "bob", t.as_str().unwrap(), "", 12));
+        }
+        let r = rated(&acts, "bob");
+        assert_eq!((r["count"].as_u64(), r["mine"].as_u64(), r["my_review"].as_str()), (Some(0), None, None));
+        assert_eq!(r["my_reviews"], json!([]));
+
+        // Reviews from before "change" was an edit: rate 2, rate 5 as a new review, remove.
+        let mut acts = vec![act(3, "r1", "bob", "a1", "★★☆☆☆", 10), act(3, "r2", "bob", "a1", "★★★★★", 11)];
+        let r = rated(&acts, "bob");
+        assert_eq!((r["mine"].as_u64(), r["count"].as_u64(), r["my_reviews"].clone()), (Some(5), Some(1), json!(["r1", "r2"])));
+        // Deleting only the latest would bring the 2 back...
+        let mut only_latest = acts.clone();
+        only_latest.push(act(6, "d2", "bob", "r2", "", 12));
+        assert_eq!(rated(&only_latest, "bob")["mine"], 2);
+        // ...so remove deletes them all.
+        acts.push(act(6, "d1", "bob", "r1", "", 12));
+        acts.push(act(6, "d2", "bob", "r2", "", 12));
+        assert_eq!(rated(&acts, "bob")["count"], 0);
+    }
+
+    /// The per-comment scan the edit/delete index replaced, kept to check they agree.
+    fn comments_on_scan(acts: &[Value], txids: &BTreeSet<String>) -> Vec<Value> {
+        let k = |a: &Value| a["kind"].as_u64().unwrap_or(0);
+        let mut out: Vec<Value> = acts.iter().filter(|a| k(a) == 3 && txids.contains(a["target"].as_str().unwrap_or(""))).cloned().collect();
+        out.retain(|c| !acts.iter().any(|a| k(a) == 6 && a["target"] == c["txid"] && a["from"] == c["from"]));
+        for c in out.iter_mut() {
+            if let Some(e) = acts.iter().filter(|a| k(a) == 5 && a["target"] == c["txid"] && a["from"] == c["from"]).max_by_key(|a| act_order(a)) {
+                c["text"] = e["text"].clone();
+            }
+            if let Some((n, _)) = stars_of(c["text"].as_str().unwrap_or("")) {
+                c["stars"] = json!(n);
+            }
+        }
+        out.sort_by_key(act_order);
+        out
+    }
+
+    #[test]
+    fn indexed_comments_match_the_scan() {
+        // A made-up feed: comments on three apps by five people, with edits (some unconfirmed, some
+        // by someone else), deletes (some not the writer's), likes and replies to replies.
+        let people = ["amy", "bob", "cat", "dan", "eve"];
+        let texts = ["★★☆☆☆ meh", "★★★★★", "nice", "★☆☆☆☆ broken", "★★★★☆ good"];
+        let mut acts = Vec::new();
+        let mut seed: u64 = 7;
+        let mut next = |m: u64| { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) % m };
+        for i in 0..400u64 {
+            let from = people[next(5) as usize];
+            let h = if next(10) == 0 { 0 } else { 1 + next(50) };
+            let txid = format!("t{i:03}");
+            let comments: Vec<String> = acts.iter().filter(|a: &&Value| a["kind"] == 3).map(|a| a["txid"].as_str().unwrap().to_string()).collect();
+            let pick = |n: u64| comments.get(n as usize).cloned().unwrap_or_else(|| "a1".into());
+            let a = match next(6) {
+                0 | 1 => act(3, &txid, from, ["a1", "a2", "a3"][next(3) as usize], texts[next(5) as usize], h),
+                2 | 3 => { let n = next(comments.len().max(1) as u64); act(5, &txid, from, &pick(n), texts[next(5) as usize], h) }
+                4 => { let n = next(comments.len().max(1) as u64); act(6, &txid, from, &pick(n), "", h) }
+                _ => act(1, &txid, from, "a1", "", h),
+            };
+            acts.push(a);
+        }
+        let fx = fixes(&acts);
+        for app in [vec!["a1"], vec!["a2", "a3"], vec!["a1", "a2", "a3"], vec!["none"]] {
+            let txids: BTreeSet<String> = app.iter().map(|s| s.to_string()).collect();
+            let fast = comments_on(&acts, &fx, &txids);
+            assert_eq!(fast, comments_on_scan(&acts, &txids), "{app:?}");
+            for who in people {
+                assert_eq!(ratings(&fast, who), ratings(&comments_on_scan(&acts, &txids), who));
+            }
+        }
+        // The feed is busy enough to mean something.
+        let all: BTreeSet<String> = ["a1", "a2", "a3"].iter().map(|s| s.to_string()).collect();
+        let c = comments_on(&acts, &fx, &all);
+        assert!(c.len() > 20 && c.iter().any(|x| x["stars"].is_u64()), "{}", c.len());
+        assert!(fx.edits.len() > 10 && fx.deletes.len() > 10);
+    }
 }

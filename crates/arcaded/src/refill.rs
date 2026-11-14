@@ -263,6 +263,7 @@ pub fn cancel(key: &str) -> Result<Value, String> {
 /// `sources` (default 2) independent sources.
 pub fn start(node: Arc<Node>, key: &str, from: Option<u64>, to: Option<u64>, sources: Option<u64>) -> Result<Value, String> {
     let p = node.chain_params(key).ok_or_else(|| format!("{key} isn't installed here"))?;
+    crate::chaindrive::not_moving(p.key)?;
     if crate::arcsvc::runs(p) {
         return Err("the ARCADE chain keeps its blocks its own way: nothing to refill".into());
     }
