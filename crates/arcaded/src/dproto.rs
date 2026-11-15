@@ -678,6 +678,16 @@ pub fn handle_of(_node: &Node, address: &str) -> Option<String> {
     one_name(HANDLES.lock().unwrap().as_ref()?, address)
 }
 
+/// DogeFeed names holding `q`, with their holder's Dogecoin address (each holder's one name, as [`handle_of`]).
+pub fn handles_matching(q: &str, most: usize) -> Vec<(String, String)> {
+    let g = HANDLES.lock().unwrap();
+    let Some(map) = g.as_ref() else { return Vec::new() };
+    map.iter().filter_map(|(a, names)| match names.as_slice() {
+        [one] if one.contains(q) => Some((a.clone(), one.clone())),
+        _ => None,
+    }).take(most).collect()
+}
+
 /// The handle rule: exactly one winning name held.
 fn one_name(by_holder: &HashMap<String, Vec<String>>, address: &str) -> Option<String> {
     match by_holder.get(address).map(|v| v.as_slice()) {

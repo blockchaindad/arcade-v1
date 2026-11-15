@@ -440,7 +440,7 @@ impl Engine<'_, '_, '_> {
                 self.jput(A_PROFILE, &key, &json!({"v": v, "h": self.h, "txid": r.txid, "n": n}))?;
             }
             AOp::Follow(t) => {
-                if (EngineTags { e: self }).tag(&t)?.is_none() {
+                if !t.starts_with('#') && (EngineTags { e: self }).tag(&t)?.is_none() {
                     return Ok(Err(format!("@{t} isn't claimed on this chain")));
                 }
                 if self.l.get(A_FOLLOW, &at(&t))?.is_some() {
