@@ -201,7 +201,8 @@ fn install(node: &Node, tag: &str, archive: &str, want: &str) -> Result<(), Stri
     std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
     let result = (|| -> Result<(), String> {
         st().lock().unwrap().doing = "checking the release";
-        let tarball = work.join("release.tar.gz");
+        // (named as its kind: Expand-Archive, the Windows fallback, takes only a .zip)
+        let tarball = work.join(if cfg!(windows) { "release.zip" } else { "release.tar.gz" });
         std::fs::copy(archive, &tarball).map_err(|e| format!("the release archive: {e}"))?;
         // Checked when it was kept; once more, as it is what runs next.
         let got = hex::encode(Sha256::digest(std::fs::read(&tarball).map_err(|e| e.to_string())?));
