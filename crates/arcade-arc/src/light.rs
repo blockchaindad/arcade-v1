@@ -230,13 +230,14 @@ mod tests {
     use crate::block::BlockError;
     use crate::chain::tests::{chain, grow, grow_to, second_best_block, TestChain, LATE};
     use crate::chain::Storage;
-    use crate::params::TESTNET;
+    // The chain tests' network (the testnet's schedule before its 2026-11-15 restart).
+    const TESTNET: crate::params::Net = crate::params::Net { rules: &[(1, 0), (2, 1_065)], ..crate::params::TESTNET };
     use crate::time::StandIn;
 
     fn genesis(c: &TestChain) -> Genesis {
         // The test chain's block 0, read back from what the chain made of it.
         let zero = c.entry(&c.id_at(0).unwrap()).unwrap();
-        Genesis { time: zero.time, closed_list: [1; 32], final_list: [2; 32], beacon_1: [3; 32], beacon_2: [4; 32], difficulty: zero.difficulty }
+        Genesis { time: zero.time, closed_list: [1; 32], final_list: [2; 32], beacon_1: [3; 32], beacon_2: [4; 32], difficulty: zero.difficulty, code: None, ledger: None }
     }
 
     fn light(c: &TestChain) -> Headers<StandIn> {

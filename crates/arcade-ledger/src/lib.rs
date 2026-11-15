@@ -21,6 +21,8 @@ pub mod ordtypes;
 pub mod ordwit;
 pub mod tokens;
 pub mod payload;
+pub mod repos;
 pub mod script;
 pub mod sites;
+pub mod snapshot;
 pub mod tags;

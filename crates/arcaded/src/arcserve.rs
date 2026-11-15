@@ -223,6 +223,8 @@ pub fn forget_stale(reg: &Registry, tip: u64) {
             Item::RevealDemand(d) => reg.demand_open(&d.id(&reg.catalog().net())) || reg.catalog().get(&d.segment).is_none(),
             Item::RevealAnswer(a) => !reg.demand_open(&a.demand),
             Item::BadHeader(f) => reg.catalog().get(&f.segment).is_none(),
+            Item::BadCoins(f) => reg.catalog().get(&f.segment).is_none(),
+            Item::BadOrd(f) => reg.catalog().get(&f.segment).is_none(),
             _ => false,
         })
         .collect();

@@ -12,6 +12,10 @@
 //! - An entry is **confirmed** in the block that brings the weight behind it over half of all
 //!   draw weight, counted as the weights are in that block. The other entries offered for
 //!   its span are dropped with their attestations.
+//! - From rules version 3 (§15 step 11), a segment of **blocks or coins** — the families a fraud proof can take out —
+//!   is confirmed with **more than a tenth** of the draw weight, so a chain kept by few arcades is listed too. Such a
+//!   segment is in its **challenge window** for [`CHALLENGE_WINDOW`] blocks: listed, so fraud proofs and reveal demands
+//!   can reach it, but no replica of it registers (so it earns nothing) until the window is over.
 //! - A removed entry is never taken again.
 //!
 //! What this can't check is whether the root is the right one: that is what the attesters
@@ -22,6 +26,15 @@ use crate::merkle::Hash;
 use crate::params::Net;
 use crate::segment;
 use std::collections::{BTreeMap, HashMap, HashSet};
+
+/// Blocks a segment confirmed by a tenth of the weight waits before replicas of it register (§15 step 11).
+pub const CHALLENGE_WINDOW: u64 = 100;
+
+/// Whether a family's segments confirm with a tenth of the draw weight at `height` (rules version 3 on): those a fraud
+/// proof can take out (blocks; coins).
+pub fn light_family(net: &Net, family: u8, height: u64) -> bool {
+    net.rules_at(height) >= 3 && (family == segment::FAMILY_BLOCKS || family == segment::FAMILY_COINS)
+}
 
 /// The draw weights the catalog counts with.
 pub trait Weights {
@@ -38,6 +51,16 @@ pub struct Listed {
     pub entry: CatalogEntry,
     /// The height of the block that confirmed it.
     pub height: u64,
+    /// Confirmed with less than half of the draw weight (a tenth or more): in its challenge window until
+    /// `height + CHALLENGE_WINDOW`.
+    pub light: bool,
+}
+
+impl Listed {
+    /// Whether replicas of it may register at `height` (its challenge window over, if it has one).
+    pub fn settled(&self, height: u64) -> bool {
+        !self.light || height >= self.height + CHALLENGE_WINDOW
+    }
 }
 
 /// An entry that waits for attestations.
@@ -236,18 +259,21 @@ impl Catalog {
         Ok(())
     }
 
-    /// Confirm the waiting entry `id` if more than half of all draw weight is behind it.
+    /// Confirm the waiting entry `id` if more than half of all draw weight is behind it (a tenth, for the families
+    /// fraud proofs reach from rules version 3).
     fn settle(&mut self, id: &Hash, height: u64, weights: &impl Weights, undo: &mut Undo) {
         let c = &self.waiting[id];
         let behind: u128 = c.behind.iter().map(|key| weights.weight(key) as u128).sum();
-        if behind * 2 <= weights.total() {
+        let half = behind * 2 > weights.total();
+        let light = !half && light_family(&self.net, c.entry.family, height) && behind * 10 > weights.total();
+        if !half && !light {
             return;
         }
         let (line, first, last) = (line_of(&c.entry), c.entry.first, c.entry.last);
         let rivals: Vec<Hash> = self.waiting.iter().filter(|(_, o)| o.entry.first == first && line_of(&o.entry) == line).map(|(id, _)| *id).collect();
         let dropped: Vec<(Hash, Candidate)> = rivals.into_iter().map(|id| (id, self.waiting.remove(&id).expect("just listed"))).collect();
         let entry = dropped.iter().find(|(other, _)| other == id).expect("its own").1.entry.clone();
-        let listed = Some(Listed { id: *id, entry, height });
+        let listed = Some(Listed { id: *id, entry, height, light });
         let spans = self.lines.entry(line.clone()).or_default();
         let (at, new_span) = match spans.binary_search_by_key(&first, |s| s.first) {
             Ok(at) => {
@@ -290,7 +316,7 @@ impl Catalog {
             if e.first != spans.last().map_or(0, |s| s.last + 1) || self.listed.contains_key(&id) {
                 return Err(no("genesis catalog: a chain's entries must run from 0 with no gap or overlap"));
             }
-            spans.push(Span { first: e.first, last: e.last, listed: Some(Listed { id, entry: e.clone(), height: 0 }) });
+            spans.push(Span { first: e.first, last: e.last, listed: Some(Listed { id, entry: e.clone(), height: 0, light: false }) });
             let at = spans.len() - 1;
             self.listed.insert(id, (line, at));
         }
@@ -349,7 +375,8 @@ pub(crate) mod tests {
     use crate::params::{MAINNET, RANGE, TESTNET};
     use ed25519_dalek::SigningKey;
 
-    const NET: Net = TESTNET;
+    // The testnet as it ran before its 2026-11-15 restart (rules 1, then 2 from 1,065): what these tests were written for.
+    const NET: Net = Net { rules: &[(1, 0), (2, 1_065)], ..TESTNET };
     const FULL: u64 = 1_000;
 
     struct Held(Vec<(Key, u64)>);
@@ -437,7 +464,7 @@ pub(crate) mod tests {
         assert!(c.get(&id).is_none());
         let half = c.clone();
         let u3 = c.apply(&[Item::Attest(attest(2, id))], 7, &held()).unwrap();
-        assert_eq!(c.get(&id), Some(&Listed { id, entry: e.clone(), height: 7 }));
+        assert_eq!(c.get(&id), Some(&Listed { id, entry: e.clone(), height: 7, light: false }));
         assert!(c.waiting(&id).is_none());
         assert_eq!(c.next("doge", 0), RANGE);
         assert_eq!(c.spans("doge", 0).map(|(first, last, l)| (first, last, l.is_some())).collect::<Vec<_>>(), vec![(0, RANGE - 1, true)]);
@@ -461,6 +488,39 @@ pub(crate) mod tests {
         let alone = Held(vec![(key(1), 51), (key(2), 49)]);
         c.apply(&[Item::CatalogEntry(e)], 5, &alone).unwrap();
         assert!(c.get(&id).is_some());
+    }
+
+    #[test]
+    fn from_rules_version_3_a_tenth_lists_blocks_with_a_challenge_window() {
+        const NET3: Net = Net { rules: &[(1, 0), (2, 1), (3, 2)], ..TESTNET };
+        let mut c = Catalog::new(NET3, FULL);
+        let e = entry_on(&NET3, &secret(1), "doge", 0, 0, just_full(1), 1);
+        let id = e.segment(&NET3);
+        // 10 of 100 is a tenth, not more: it waits. Arcade 2's 20 more make 30: listed, light.
+        c.apply(&[Item::CatalogEntry(e.clone())], 5, &held()).unwrap();
+        assert!(c.get(&id).is_none());
+        c.apply(&[Item::Attest(attest_on(&NET3, &secret(2), id))], 6, &held()).unwrap();
+        let l = c.get(&id).unwrap();
+        assert!(l.light && l.height == 6);
+        assert!(!l.settled(6) && !l.settled(6 + CHALLENGE_WINDOW - 1) && l.settled(6 + CHALLENGE_WINDOW));
+        // Before rules version 3 (height 1 here) the same weight isn't enough.
+        let mut old = Catalog::new(NET3, FULL);
+        old.apply(&[Item::CatalogEntry(e.clone()), Item::Attest(attest_on(&NET3, &secret(2), id))], 1, &held()).unwrap();
+        assert!(old.get(&id).is_none());
+        // An index family still needs more than half.
+        let mut ix = entry_on(&NET3, &secret(1), "doge", 0, 0, just_full(1), 2);
+        ix.family = segment::FAMILY_ORD;
+        ix.sig = block::sign(&secret(1), &ix.message(&NET3));
+        let ix_id = ix.segment(&NET3);
+        let mut c2 = Catalog::new(NET3, FULL);
+        c2.apply(&[Item::CatalogEntry(ix), Item::Attest(attest_on(&NET3, &secret(2), ix_id))], 6, &held()).unwrap();
+        assert!(c2.get(&ix_id).is_none());
+        // A tenth lists it at once, so later attestations find nothing waiting; a poster with more than half lists it
+        // with no window.
+        assert!(c.apply(&[Item::Attest(attest_on(&NET3, &secret(4), id))], 7, &held()).is_err());
+        let mut c3 = Catalog::new(NET3, FULL);
+        c3.apply(&[Item::CatalogEntry(e)], 6, &Held(vec![(key(1), 51), (key(2), 49)])).unwrap();
+        assert!(c3.get(&id).is_some_and(|l| !l.light && l.settled(6)));
     }
 
     #[test]
@@ -514,7 +574,7 @@ pub(crate) mod tests {
             Item::CatalogEntry(e)
         };
         assert_eq!(refused(&mut c, resigned(&|e| e.chain = "mine".into())), no("catalog entry: not a listed chain"));
-        assert_eq!(refused(&mut c, resigned(&|e| e.family = 10)), no("catalog entry: no such family"));
+        assert_eq!(refused(&mut c, resigned(&|e| e.family = 11)), no("catalog entry: no such family"));
         for change in [(|e| e.first = 1) as fn(&mut CatalogEntry), |e| e.last -= 1, |e| e.last = u64::MAX, |e| (e.first, e.last) = (RANGE, RANGE - 1)] {
             assert_eq!(refused(&mut c, resigned(&change)), no("catalog entry: not whole ranges"));
         }
