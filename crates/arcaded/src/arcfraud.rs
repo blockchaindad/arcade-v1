@@ -190,6 +190,32 @@ fn watch(node: &Node) -> Result<(), String> {
         if crate::arcsvc::runs(p) || crate::borrow::is_borrowed(p.key) {
             continue;
         }
+        // The coins family (§15 step 12): a listed record that isn't ours, proved wrong by its own making transaction.
+        for (first, last, l) in reg.catalog().spans(p.key, segment::FAMILY_COINS) {
+            let Some(l) = l else { continue };
+            if CHECKED.lock().unwrap().contains(&l.id) {
+                continue;
+            }
+            let Some((bytes, root)) = crate::arcseg::root_of(node, p, segment::FAMILY_COINS, first, last) else { continue };
+            if (bytes, root) == (l.entry.bytes, l.entry.root) {
+                CHECKED.lock().unwrap().insert(l.id);
+                continue;
+            }
+            eprintln!("arc: the listed {} coins segment {first}..={last} isn't the one this arcade makes: looking for the proof", p.name);
+            let mut holders: Vec<String> = reg.all_replicas().iter().filter(|r| r.1 == l.id).map(|r| hex::encode(r.2)).collect();
+            let poster = hex::encode(l.entry.poster);
+            if !holders.contains(&poster) {
+                holders.push(poster);
+            }
+            for peer in holders {
+                if let Some(proof) = investigate_coins(node, p, &l.entry, &l.id, &peer) {
+                    eprintln!("arc: {} coins record of block {} is wrong (entry {}): fraud proof posted", p.name, proof.height, proof.entry);
+                    crate::arcseg::add(Item::BadCoins(Box::new(proof)));
+                    CHECKED.lock().unwrap().insert(l.id);
+                    break;
+                }
+            }
+        }
         for (first, last, l) in reg.catalog().spans(p.key, segment::FAMILY_BLOCKS) {
             let Some(l) = l else { continue };
             if CHECKED.lock().unwrap().contains(&l.id) {
@@ -230,6 +256,104 @@ fn watch(node: &Node) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The entries of a coins record, each with its end (from the record's start): (entry, bytes from the start to its end).
+fn coins_entries(rec: &[u8]) -> Option<Vec<(arcade_arc::registry::CoinsEntry, u64)>> {
+    let run = Run::of_bytes(rec);
+    let n = u32::from_le_bytes(rec.get(..4)?.try_into().ok()?);
+    let mut out = Vec::new();
+    let mut at = 4u64;
+    for k in 0..n {
+        let e = arcade_arc::registry::coins_entry(&run, 0, k)?;
+        at += 53 + e.script.len() as u64;
+        out.push((e, at));
+    }
+    Some(out)
+}
+
+/// From one holder: the proof that a coins record in the segment is wrong, if one is (§15 step 12). The first leaf
+/// that differs from ours, the record holding it, its first entry unlike ours, and that coin's making transaction
+/// with its block's header and Merkle path, from this arcade's own copy of the chain.
+fn investigate_coins(node: &Node, p: &arcade_chain::params::ChainParams, e: &block::CatalogEntry, seg: &Hash, peer: &str) -> Option<block::BadCoins> {
+    let n = e.bytes.div_ceil(DATA_LEAF as u64);
+    let mut theirs: Vec<Hash> = Vec::with_capacity(n as usize);
+    while (theirs.len() as u64) < n {
+        let (_, blob) = ask(peer, json!({"seg": hex::encode(seg), "kind": "h", "first": theirs.len(), "count": HASHES_PER_PAGE}))?;
+        if blob.is_empty() || blob.len() % 32 != 0 {
+            return None;
+        }
+        theirs.extend(blob.chunks_exact(32).map(|c| <Hash>::try_from(c).expect("32 bytes")));
+    }
+    if merkle::root(&theirs).ok()? != e.root {
+        return None;
+    }
+    let mut data = Vec::new();
+    let mut sizes = Vec::new();
+    let mut ours_by_h = Vec::new();
+    for h in e.first..=e.last {
+        let u = crate::arcseg::unit_bytes(node, p, segment::FAMILY_COINS, h as u32)?;
+        sizes.push(u.len() as u64);
+        data.extend_from_slice(&u);
+        ours_by_h.push(u);
+    }
+    data.extend(segment::table(&sizes));
+    let at = first_difference(&leaf_hashes(&data), &theirs)? * DATA_LEAF as u64;
+    let data_bytes = e.bytes.checked_sub(segment::table_bytes(e.last - e.first + 1))?;
+    let row = |h: u64| bytes_from(peer, seg, &e.root, e.bytes, segment::row_at(data_bytes, e.first, h), segment::ROW).and_then(|r| r.row(segment::row_at(data_bytes, e.first, h)));
+    let height = if at >= data_bytes { (e.first + (at - data_bytes) / segment::ROW).min(e.last) } else { height_holding(e.first, e.last, at, row)? };
+    let rows_at = segment::row_at(data_bytes, e.first, height);
+    let row_run = bytes_from(peer, seg, &e.root, e.bytes, rows_at, if height == e.last { segment::ROW } else { 2 * segment::ROW })?;
+    let start = row_run.row(rows_at)?;
+    let end = if height == e.last { data_bytes } else { row_run.row(rows_at + segment::ROW)? };
+    let most = (block::MAX_COINS_PROOF_LEAVES as u64 - 2) * DATA_LEAF as u64;
+    let take = (end - start).min(most);
+    let rec_run = bytes_from(peer, seg, &e.root, e.bytes, start, take)?;
+    let theirs_rec = rec_run.bytes(start, take)?;
+    let ours = coins_entries(&ours_by_h[(height - e.first) as usize])?;
+    // Their entries as far as the run reaches, each against ours.
+    let mut k = 0u32;
+    let mut entry_end = None;
+    let their_n = u32::from_le_bytes(theirs_rec.get(..4)?.try_into().ok()?);
+    let mut pos = 4u64;
+    while k < their_n {
+        let Some(t) = arcade_arc::registry::coins_entry(&Run::of_bytes(&theirs_rec), 0, k) else { break };
+        pos += 53 + t.script.len() as u64;
+        if ours.get(k as usize).map(|o| &o.0) != Some(&t) {
+            entry_end = Some((t, pos));
+            break;
+        }
+        k += 1;
+    }
+    let Some((t, len)) = entry_end else {
+        eprintln!("arc: {} coins record of block {height} differs only past what a proof can carry, or in its count: left to reveal demands", p.name);
+        return None;
+    };
+    // The coin's making transaction, from our own copy of the chain.
+    let txid = Hash256(t.txid);
+    let Some((raw, bh)) = node.chain.tx_raw(p, &txid).ok().flatten() else {
+        eprintln!("arc: {} coins record of block {height} names transaction {} that this arcade doesn't have: left to reveal demands", p.name, txid.to_hex());
+        return None;
+    };
+    let made_at = node.chain.block_height_of(p.chain_no, bh).ok()??;
+    let bid = node.chain.hash_at(p.chain_no, made_at).ok()??;
+    let braw = node.chain.block_raw(p.chain_no, &bid).ok()??;
+    let blk = arcade_chain::Block::parse_with(&braw, &p.format).ok()?;
+    let ids: Vec<Hash256> = blk.txs.iter().map(|x| x.txid).collect();
+    let index = ids.iter().position(|x| *x == txid)?;
+    let record = bytes_from(peer, seg, &e.root, e.bytes, start, len)?;
+    Some(block::BadCoins {
+        segment: *seg,
+        height,
+        row: row_run,
+        record,
+        entry: k,
+        at: made_at as u64,
+        header: braw[..80].to_vec(),
+        tx: raw,
+        index: index as u64,
+        path: merkle_path(&ids, index),
+    })
 }
 
 /// From one holder: the proof that the segment holds a header that isn't the source chain's, if it does.

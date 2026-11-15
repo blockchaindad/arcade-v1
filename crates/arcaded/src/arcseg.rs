@@ -105,7 +105,7 @@ pub fn on_items(net: &Net, blob: &[u8]) -> usize {
             // Only a real proof of two blocks signed on one parent.
             Item::Equivocation(e) => e.proves(net),
             // Checked by the chain against its own source headers (§2.4).
-            Item::BadHeader(_) => true,
+            Item::BadHeader(_) | Item::BadCoins(_) => true,
             Item::TxChallenge(c) => block::verify(&c.challenger, &c.message(net), &c.sig),
             Item::TxAnswer(_) => true,
             Item::RevealDemand(d) => block::verify(&d.demander, &d.message(net), &d.sig),

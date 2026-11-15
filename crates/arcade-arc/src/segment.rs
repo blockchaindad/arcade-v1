@@ -183,6 +183,16 @@ impl Run {
     }
 
     /// Are these the leaves at this place of the segment with this root and size?
+    /// Bytes as a run from offset 0 with no path: for reading a record with the same code that reads proofs.
+    pub fn of_bytes(bytes: &[u8]) -> Run {
+        let leaves = bytes.chunks(crate::sloth::DATA_LEAF).map(|c| {
+            let mut l = [0u8; crate::sloth::DATA_LEAF];
+            l[..c.len()].copy_from_slice(c);
+            l
+        }).collect();
+        Run { first: 0, leaves, path: Vec::new() }
+    }
+
     pub fn proves(&self, root: &Hash, segment_bytes: u64) -> bool {
         let hashes: Vec<Hash> = self.leaves.iter().map(|l| merkle::leaf_hash(l)).collect();
         merkle::verify_run(root, segment_bytes.div_ceil(DATA_LEAF as u64), self.first, &hashes, &self.path)

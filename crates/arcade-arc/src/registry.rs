@@ -34,7 +34,7 @@
 //!
 //! Everything here is rebuilt from the blocks (the block log is replayed at start).
 
-use crate::block::{self, AuditCommit, AuditOpening, BadHeader, Block, BlockError, CatalogEntry, Equivocation, Item, Key, Payout, Reaudit, RegCommit, RegProof, RevealAnswer, RevealDemand, TxAnswer, TxChallenge, Verdict};
+use crate::block::{self, AuditCommit, AuditOpening, BadCoins, BadHeader, Block, BlockError, CatalogEntry, Equivocation, Item, Key, Payout, Reaudit, RegCommit, RegProof, RevealAnswer, RevealDemand, TxAnswer, TxChallenge, Verdict};
 use crate::catalog::{self, Catalog};
 use crate::chain::{Applied, Storage};
 use crate::draw;
@@ -55,6 +55,47 @@ pub trait Sources: Send + Sync {
     fn tip(&self, chain: &str) -> Option<u64>;
     /// The block id at `height` on this arcade's best header branch.
     fn hash_at(&self, chain: &str, height: u64) -> Option<Hash256>;
+}
+
+/// One entry of a coins record (crates/arcaded arcseg::coins_record): the coin an input spends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoinsEntry {
+    pub txid: [u8; 32],
+    pub vout: u32,
+    pub value: u64,
+    pub made_at: u32,
+    pub coinbase: bool,
+    pub script: Vec<u8>,
+}
+
+/// Entry `k` of the coins record starting at segment byte `start`, read from `run` (which must hold every byte from the
+/// record's start through that entry): count (u32), then per entry txid (32) ‖ vout (u32) ‖ value (u64) ‖ height made
+/// (u32) ‖ coinbase (1) ‖ script length (u32) ‖ script, little-endian.
+pub fn coins_entry(run: &crate::segment::Run, start: u64, k: u32) -> Option<CoinsEntry> {
+    let count = u32::from_le_bytes(run.bytes(start, 4)?.try_into().ok()?);
+    if k >= count {
+        return None;
+    }
+    let mut at = start + 4;
+    for i in 0..=k {
+        let fixed = run.bytes(at, 53)?;
+        let slen = u32::from_le_bytes(fixed[49..53].try_into().ok()?) as u64;
+        if slen > 10_000 {
+            return None;
+        }
+        if i == k {
+            return Some(CoinsEntry {
+                txid: fixed[..32].try_into().ok()?,
+                vout: u32::from_le_bytes(fixed[32..36].try_into().ok()?),
+                value: u64::from_le_bytes(fixed[36..44].try_into().ok()?),
+                made_at: u32::from_le_bytes(fixed[44..48].try_into().ok()?),
+                coinbase: fixed[48] == 1,
+                script: run.bytes(at + 53, slen)?,
+            });
+        }
+        at += 53 + slen;
+    }
+    None
 }
 
 /// How deep a source block must be before a fraud proof about it is judged.
@@ -896,6 +937,7 @@ impl Registry {
                 Item::Equivocation(e) => self.equivocation_item(e, &mut ops),
                 Item::Reaudit(q) => self.reaudit_item(q, height, &mut ops),
                 Item::BadHeader(f) => self.bad_header_item(f, &mut cu, &mut ops),
+                Item::BadCoins(f) => self.bad_coins_item(f, &mut cu, &mut ops),
                 Item::TxChallenge(c) => self.tx_challenge_item(c, height, &mut ops),
                 Item::TxAnswer(a) => self.tx_answer_item(a, height, &mut ops),
                 Item::RevealDemand(d) => self.demand_item(d, height, &mut ops),
@@ -1206,6 +1248,58 @@ impl Registry {
         let ours = src.hash_at(&e.chain, f.height).ok_or(BlockError::Waiting("this arcade doesn't have that source header yet"))?;
         if ours == theirs {
             return Err(no("fraud proof: that header is the source chain's"));
+        }
+        self.catalog.remove(&f.segment, cu);
+        let gone: Vec<Hash> = self.replicas.iter().filter(|(_, r)| r.segment == f.segment).map(|(id, _)| *id).collect();
+        for id in gone {
+            self.put(Op::Replica(id, None), ops);
+        }
+        Ok(())
+    }
+
+    /// A coins record proved wrong (§15 step 12): its entry names a coin its own making transaction contradicts.
+    fn bad_coins_item(&mut self, f: &BadCoins, cu: &mut catalog::Undo, ops: &mut Vec<Op>) -> Result<(), BlockError> {
+        let e = self.catalog.get(&f.segment).ok_or(no("coins proof: that segment isn't listed"))?.entry.clone();
+        if e.family != crate::segment::FAMILY_COINS || f.height < e.first || f.height > e.last {
+            return Err(no("coins proof: not a height of that segment of coins"));
+        }
+        let table = crate::segment::table_bytes(e.last - e.first + 1);
+        let data_bytes = e.bytes.checked_sub(table).ok_or(no("coins proof: the segment is shorter than its table"))?;
+        if !f.row.proves(&e.root, e.bytes) || !f.record.proves(&e.root, e.bytes) {
+            return Err(no("coins proof: its leaves aren't in the segment"));
+        }
+        let start = f.row.row(crate::segment::row_at(data_bytes, e.first, f.height)).ok_or(no("coins proof: the run doesn't hold that table row"))?;
+        let entry = coins_entry(&f.record, start, f.entry).ok_or(no("coins proof: the run doesn't hold that entry from the record's start"))?;
+        // The making transaction, in a block the source chain has.
+        let p = arcade_chain::params::by_key(&e.chain).ok_or(no("coins proof: not a chain this arcade knows"))?;
+        let tx = arcade_chain::Tx::parse_with(&f.tx, &p.format).map_err(|_| no("coins proof: not one whole transaction"))?;
+        if tx.txid.0 != entry.txid {
+            return Err(no("coins proof: that isn't the transaction the entry names"));
+        }
+        if f.header.len() != 80 {
+            return Err(no("coins proof: a header is 80 bytes"));
+        }
+        let path: Vec<Hash256> = f.path.iter().map(|h| Hash256(*h)).collect();
+        let root: [u8; 32] = f.header[36..68].try_into().expect("80 bytes");
+        let index = u32::try_from(f.index).map_err(|_| no("coins proof: no such position"))?;
+        if arcade_chain::hash::merkle_branch_root(tx.txid, &path, index).0 != root {
+            return Err(no("coins proof: the transaction isn't in that block"));
+        }
+        let src = self.sources.0.clone().ok_or(BlockError::Waiting("this arcade doesn't follow the source chain's headers"))?;
+        let tip = src.tip(&e.chain).ok_or(BlockError::Waiting("this arcade doesn't follow that source chain"))?;
+        if tip < f.at.max(f.height) + FRAUD_DEPTH {
+            return Err(BlockError::Waiting("this arcade's source headers aren't that deep yet"));
+        }
+        let ours = src.hash_at(&e.chain, f.at).ok_or(BlockError::Waiting("this arcade doesn't have that source header yet"))?;
+        if ours != arcade_chain::hash::sha256d(&f.header) {
+            return Err(no("coins proof: that header isn't the source chain's"));
+        }
+        let out = tx.outputs.get(entry.vout as usize);
+        let right = f.at == entry.made_at as u64
+            && (f.index == 0) == entry.coinbase
+            && out.is_some_and(|o| o.value == entry.value && o.script_pubkey == entry.script);
+        if right {
+            return Err(no("coins proof: that entry is right"));
         }
         self.catalog.remove(&f.segment, cu);
         let gone: Vec<Hash> = self.replicas.iter().filter(|(_, r)| r.segment == f.segment).map(|(id, _)| *id).collect();
@@ -2174,6 +2268,73 @@ mod tests {
         let proof = BadHeader { segment: seg, height: h, row, header: run(start, 80) };
         r.set_sources(std::sync::Arc::new(Src { chain: "peptest", tip: h + 500, at: h, hash: Hash256([1; 32]) }));
         r.items(&[Item::BadHeader(Box::new(proof))], 5 + catalog::CHALLENGE_WINDOW / 2).unwrap();
+        assert!(r.catalog.get(&seg).is_none() && r.catalog.was_removed(&seg));
+    }
+
+    #[test]
+    fn a_coins_record_that_its_own_transaction_contradicts_is_taken_out() {
+        use crate::segment::{row_at, leaves_of, table, Rooter, Run};
+        let (s1, k1) = key(1);
+        let mut r = Registry::new(&NET, &[(k1, 1 << 30, pay(1))], 1).unwrap();
+        // The making transaction: a plain one, alone in its block at height 40 (its txid is the block's root).
+        let raw = plain_tx(3);
+        let p = arcade_chain::params::by_key("peptest").unwrap();
+        let tx = arcade_chain::Tx::parse_with(&raw, &p.format).unwrap();
+        let mut header = vec![0u8; 80];
+        header[36..68].copy_from_slice(&tx.txid.0);
+        let entry = |value: u64, made_at: u32| -> Vec<u8> {
+            let mut b = tx.txid.0.to_vec();
+            b.extend_from_slice(&0u32.to_le_bytes());
+            b.extend_from_slice(&value.to_le_bytes());
+            b.extend_from_slice(&made_at.to_le_bytes());
+            b.push(1); // the coinbase flag: it is the block's first transaction
+            b.extend_from_slice(&(tx.outputs[0].script_pubkey.len() as u32).to_le_bytes());
+            b.extend_from_slice(&tx.outputs[0].script_pubkey);
+            b
+        };
+        // Coins records for a range of heights: block 4,000's says the coin is worth one more than it is.
+        let records: Vec<Vec<u8>> = (0..RANGE).map(|h| {
+            let mut rec = if h == 4_000 { 2u32 } else { 0u32 }.to_le_bytes().to_vec();
+            if h == 4_000 {
+                rec.extend(entry(tx.outputs[0].value, 40));
+                rec.extend(entry(tx.outputs[0].value + 1, 40));
+            }
+            rec
+        }).collect();
+        let mut data: Vec<u8> = records.concat();
+        let data_bytes = data.len() as u64;
+        data.extend(table(&records.iter().map(|b| b.len() as u64).collect::<Vec<_>>()));
+        let mut root = Rooter::new();
+        root.push(&data);
+        let (root, bytes) = root.finish().unwrap();
+        let mut e = CatalogEntry { chain: "peptest".into(), family: crate::segment::FAMILY_COINS, first: 0, last: RANGE - 1, bytes, manifest: [0; 32], root, poster: k1, sig: [0; 64] };
+        e.sig = block::sign(&s1, &e.message(&NET));
+        r.items(&[Item::CatalogEntry(e.clone())], 1).unwrap();
+        let seg = e.segment(&NET);
+        let h = 4_000u64;
+        let run = |at: u64, len: u64| { let (first, n) = leaves_of(at, len); Run::of(&data, first, n).unwrap() };
+        let row = run(row_at(data_bytes, 0, h), 8);
+        let start = row.row(row_at(data_bytes, 0, h)).unwrap();
+        let rec_len = records[h as usize].len() as u64;
+        let proof = |k: u32| BadCoins { segment: seg, height: h, row: row.clone(), record: run(start, rec_len), entry: k, at: 40, header: header.clone(), tx: raw.clone(), index: 0, path: vec![] };
+        let sources = |hash| std::sync::Arc::new(Src { chain: "peptest", tip: h + 500, at: 40, hash });
+        // Waits without the source headers; a header the source chain doesn't have is refused.
+        assert!(matches!(r.items(&[Item::BadCoins(Box::new(proof(1)))], 2), Err(BlockError::Waiting(_))));
+        r.set_sources(sources(Hash256([9; 32])));
+        assert!(matches!(r.items(&[Item::BadCoins(Box::new(proof(1)))], 2), Err(BlockError::Invalid(_))));
+        r.set_sources(sources(arcade_chain::hash::sha256d(&header)));
+        // Entry 0 is right: no fraud. A forged leaf: refused. Entry 1 is one too much: the segment goes.
+        assert!(matches!(r.items(&[Item::BadCoins(Box::new(proof(0)))], 2), Err(BlockError::Invalid(_))));
+        let mut forged = proof(1);
+        forged.record.leaves[0][3] ^= 1;
+        assert!(matches!(r.items(&[Item::BadCoins(Box::new(forged))], 2), Err(BlockError::Invalid(_))));
+        assert!(matches!(r.items(&[Item::BadCoins(Box::new(proof(2)))], 2), Err(BlockError::Invalid(_))));
+        // On the wire and back.
+        let item = Item::BadCoins(Box::new(proof(1)));
+        let mut bytes = Vec::new();
+        item.encode(&mut bytes);
+        assert_eq!(Item::decode(&mut arcade_chain::Reader::new(&bytes)).unwrap(), item);
+        r.items(&[item], 3).unwrap();
         assert!(r.catalog.get(&seg).is_none() && r.catalog.was_removed(&seg));
     }
 
