@@ -508,13 +508,18 @@ fn retry_waiting(node: &Node, svc: &Svc) {
 struct NodeSources(Arc<Node>);
 
 impl arcade_arc::registry::Sources for NodeSources {
+    // A chain kept whole answers from its blocks; one followed by headers only (Bitcoin on every arcade, §15 step 15)
+    // from its best header branch.
     fn tip(&self, chain: &str) -> Option<u64> {
         let p = crate::chains::find(chain)?;
-        self.0.chain.tip(p.chain_no).ok().flatten().map(|t| t.height as u64)
+        let blocks = self.0.chain.tip(p.chain_no).ok().flatten().map(|t| t.height as u64);
+        let headers = self.0.chain.best_header(p.chain_no).ok().flatten().and_then(|b| self.0.chain.header(p.chain_no, &b).ok().flatten()).map(|r| r.height as u64);
+        blocks.max(headers)
     }
     fn hash_at(&self, chain: &str, height: u64) -> Option<Hash256> {
         let p = crate::chains::find(chain)?;
-        self.0.chain.hash_at(p.chain_no, u32::try_from(height).ok()?).ok().flatten()
+        let h = u32::try_from(height).ok()?;
+        self.0.chain.hash_at(p.chain_no, h).ok().flatten().or_else(|| self.0.chain.header_hash_at(p, h).ok().flatten())
     }
     fn ord_claim(&self, value: &[u8]) -> Option<arcade_arc::registry::OrdClaim> {
         ord_claim(value)
@@ -748,14 +753,16 @@ fn run_writer_on(node: Arc<Node>, svc: Arc<Svc>, wrote: &mut VecDeque<Hash256>, 
                 });
             }
             let Some((t, seed, likely)) = &ticket else { continue };
-            // Never far alone: with no arcade of this chain linked and others holding weight, a branch written here
-            // could outrun the reorg limit and never join theirs (a 3-arcade test net split so while its links came up
-            // under load). At most half the limit in a row by this arcade alone, then it waits for a link.
-            if (t.weight as u128) < st.chain.storage().total_weight() && linked_peers().is_empty() {
+            // Never far alone: while others hold weight, a branch only this arcade writes could outrun the reorg limit
+            // and never join theirs (3-arcade test nets split so: first while their links came up under load, then
+            // with links up but no blocks getting through). No block from anyone else in the last half of the limit
+            // means this arcade isn't hearing the network (on a healthy one an arcade with a third of the weight
+            // writes 50 in a row once in 3^50 tries): it waits until another's block comes.
+            if (t.weight as u128) < st.chain.storage().total_weight() {
                 let me = node.identity.verifying_key().to_bytes();
                 if alone_streak(&st.chain, &me, params::REORG_LIMIT / 2) >= params::REORG_LIMIT / 2 {
                     if alone_said.is_none_or(|t: Instant| t.elapsed() > Duration::from_secs(60)) {
-                        eprintln!("arc: not writing: the last {} blocks are this arcade's alone and no arcade of the chain is linked", params::REORG_LIMIT / 2);
+                        eprintln!("arc: not writing: the last {} blocks are this arcade's alone ({} arcades linked); waiting for another's block", params::REORG_LIMIT / 2, linked_peers().len());
                         alone_said = Some(Instant::now());
                     }
                     continue;
@@ -854,8 +861,12 @@ pub const TESTNET_SETTINGS: &str = include_str!("../arctest.json");
 /// Read the settings of the chain this arcade can install, and start it if it is installed.
 pub fn define(node: &Arc<Node>, settings: &std::path::Path) -> Result<(), String> {
     let text = std::fs::read_to_string(settings).map_err(|e| format!("{}: {e}", settings.display()))?;
+    LOCAL.store(true, Ordering::Relaxed);
     define_text(node, &text)
 }
+
+/// The chain came from `--arc-local` settings (a closed test network).
+static LOCAL: AtomicBool = AtomicBool::new(false);
 
 /// [`define`] from the settings' text (the built-in testnet's, or a file's).
 pub fn define_text(node: &Arc<Node>, text: &str) -> Result<(), String> {
@@ -1007,6 +1018,21 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
                 }
             })
             .map_err(|e| e.to_string())?;
+    }
+    // Every arcade follows Bitcoin's headers (§15 step 15: beacons, fraud proofs about Bitcoin segments): added in
+    // light mode (headers only, about 70 MB) unless Bitcoin is kept here already. Not on local test chains.
+    if !LOCAL.load(Ordering::Relaxed) {
+        let n = node.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(20));
+            if n.extra.lock().unwrap().contains_key("btc") {
+                return;
+            }
+            match crate::chains::add(&n, "btc", "light", Vec::new()) {
+                Ok(_) => eprintln!("arc: following Bitcoin's headers (light)"),
+                Err(e) => eprintln!("arc: Bitcoin's headers: {e}"),
+            }
+        });
     }
     if old_log.exists() {
         // The store now holds every block of the branch whole: the old copy goes.
@@ -1283,6 +1309,7 @@ fn on_answer(node: &Node, svc: &Svc, link: &mut Link, f: &Frame) -> Result<(), L
         let Some((next, bytes)) = p.parts.as_mut() else { return Ok(()) };
         if f.head["seq"].as_u64() != Some(*next) || bytes.len() + f.blob.len() > ANSWER_BYTES + (ANSWER_BLOCKS * 4) {
             // Out of order or too long: not an answer we can use. Asked again later.
+            eprintln!("arc: an answer from {} dropped: frame {:?} where {} was next, {} bytes so far", &link.peer_id[..link.peer_id.len().min(12)], f.head["seq"].as_u64(), *next, bytes.len());
             p.parts = None;
             return Ok(());
         }
@@ -1296,11 +1323,13 @@ fn on_answer(node: &Node, svc: &Svc, link: &mut Link, f: &Frame) -> Result<(), L
     let mut gained = false;
     for raw in split_blocks(&data).unwrap_or_default() {
         let Ok(block) = Block::decode(&raw) else { break };
+        let (bh, nblobs, missing) = (block.header.height, block.blob_ids.len().max(block.blobs.len()), block.blobs.iter().filter(|b| b.is_empty()).count());
         match take(node, svc, block) {
             Ok(Accepted::Known) => {}
             Ok(_) => gained = true,
             Err(e) => {
-                eprintln!("arc: a block from {} wasn't taken: {e}", &link.peer_id[..link.peer_id.len().min(12)]);
+                let tip = svc.st.lock().unwrap().chain.tip().height;
+                eprintln!("arc: a block from {} wasn't taken: {e} (its height {bh}, our tip {tip}, {nblobs} blobs, {missing} without bytes)", &link.peer_id[..link.peer_id.len().min(12)]);
                 if broke_rules(&e) {
                     strike(svc, &link.peer_id);
                 }
