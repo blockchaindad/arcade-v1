@@ -34,6 +34,27 @@ fn handle(node: Arc<Node>, s: UnixStream) {
     }
 }
 
+/// Make this arcade's wallet: new words, or restored from `phrase` (with its @handle, when the
+/// chain already shows it). New and restored wallets alike ask the mesh for a test coin.
+pub fn create_wallet(node: &Node, phrase: Option<&str>) -> Result<Value, String> {
+    let p = node.params;
+    let restored = phrase.is_some();
+    let words = node.app.create_wallet(phrase).map_err(|e| e.to_string())?;
+    // A restored wallet's @handle, found on chain right away (else after a later sync round).
+    let tag = if restored { crate::claims::find_own_tag(node, true) } else { None };
+    // Test coins for the first handle come by themselves: asked for now, so they are
+    // usually here by the time a handle is picked (a restored wallet may have some).
+    if tag.is_none() {
+        if let Ok((k, _)) = node.app.tag_key(p, 0) {
+            let script = arcade_wallet::keys::p2pkh_script_for(&arcade_wallet::secp256k1::PublicKey::from_slice(&hex::decode(&k.pubkey).unwrap()).unwrap());
+            if crate::claims::coins(node, &script).is_empty() {
+                let _ = crate::faucet::ask_if_needed(node, &k.address, "");
+            }
+        }
+    }
+    Ok(json!({"phrase": if restored { Value::Null } else { json!(words) }, "restored": restored, "tag": tag}))
+}
+
 pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
     let s = |k: &str| req[k].as_str().map(String::from);
     let p = node.params;
@@ -71,23 +92,7 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             crate::udpsvc::set(node, req)
         }
         "peers" => Ok(json!(node.links.lock().unwrap().values().map(|l| json!({"addr": l.addr, "node_id": l.node_id, "since": l.since})).collect::<Vec<_>>())),
-        "wallet.create" => {
-            let phrase = node.app.create_wallet(s("phrase").as_deref()).map_err(|e| e.to_string())?;
-            let restored = s("phrase").is_some();
-            // A restored wallet's @handle, found on chain right away (else after a later sync round).
-            let tag = if restored { crate::claims::find_own_tag(node, true) } else { None };
-            // Test coins for the first handle come by themselves: asked for now, so they are
-            // usually here by the time a handle is picked (a restored wallet may have some).
-            if tag.is_none() {
-                if let Ok((k, _)) = node.app.tag_key(p, 0) {
-                    let script = arcade_wallet::keys::p2pkh_script_for(&arcade_wallet::secp256k1::PublicKey::from_slice(&hex::decode(&k.pubkey).unwrap()).unwrap());
-                    if crate::claims::coins(node, &script).is_empty() {
-                        let _ = crate::faucet::ask_if_needed(node, &k.address, "");
-                    }
-                }
-            }
-            Ok(json!({"phrase": if restored { Value::Null } else { json!(phrase) }, "restored": restored, "tag": tag}))
-        }
+        "wallet.create" => create_wallet(node, s("phrase").as_deref()),
         "wallet.phrase" => Ok(json!({"phrase": node.app.phrase().map_err(|e| e.to_string())?})),
         "wallet.keys" => {
             // Any chain: the same 12 words derive each chain's own addresses (its BIP44 coin type).
@@ -130,6 +135,7 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         "wallet.link" => crate::links::link(node, &s("chain").ok_or("chain required")?, &s("wif").ok_or("wif required")?, &s("tag").ok_or("tag required")?),
         "wallet.unlink" => crate::links::unlink(node, &s("chain").ok_or("chain required")?, &s("address").ok_or("address required")?, &s("tag").ok_or("tag required")?),
         "account.signin" => crate::accountsvc::sign_in(node, &s("tag").ok_or("tag required")?, &s("password").ok_or("password required")?, s("from").as_deref().filter(|f| !f.is_empty())),
+        "account.add" => crate::accountsvc::add_words(node, &s("phrase").ok_or("phrase required")?),
         "account.list" => Ok(crate::accountsvc::list(node)),
         "account.switch" => crate::accountsvc::switch(node, &s("id").unwrap_or_default()),
         "account.signout" => crate::accountsvc::sign_out(node, &s("id").ok_or("id required")?),
