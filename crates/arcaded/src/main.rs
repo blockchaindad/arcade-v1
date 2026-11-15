@@ -24,6 +24,7 @@ mod arcserve;
 mod arcseg;
 mod arcblob;
 mod arcgit;
+mod reposvc;
 mod arcledger;
 mod arccode;
 mod arcgenesis;

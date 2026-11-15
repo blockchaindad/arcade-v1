@@ -611,6 +611,14 @@
       catch (e) { await card("This request can't be sent", [e.message], "Refuse", "Close"); await api("wallet.deny", { id: r.id }); return; }
       const who = pv.page_card || {};
       const from = `${who.app || appName}${who.creator_tag ? " by @" + who.creator_tag : ""}`;
+      if (pv.kind === "repo") {
+        // A repository write (reposvc.rs): signed by this wallet's @tag on the ARCADE chain.
+        const arc = (u) => `${(u / 1e8).toLocaleString(undefined, { maximumFractionDigits: 8 })} ARCADE`;
+        const lines = [`${from} asks to ${pv.what}.`, "It is signed by your @tag on the ARCADE chain and public there for good.", `Network fee: about ${arc(pv.fee)}`];
+        const yes = await card("Approve this repository change?", lines, "Approve", "Refuse");
+        await api(yes ? "wallet.approve" : "wallet.deny", { id: r.id });
+        return;
+      }
       const outs = document.createElement("ul"); outs.className = "outs";
       for (const o of pv.outputs) { const li = document.createElement("li"); li.textContent = o.data ? "data (the arcade record)" : `${pep(o.value)} → ${o.address}${o.mine ? " (back to you)" : ""}`; outs.append(li); }
       const lines = [`${from} asks to send ${pv.what} to ${pv.to_tag ? "@" + pv.to_tag + " " : ""}${pv.to}.`];
