@@ -1016,6 +1016,11 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
     // The ledger on ARCADE (§15 step 7): tags, profiles and every arcade record, indexed in the same commit as each block
     // the store takes; an arcade that stored blocks before it had them walks those once, below.
     arcade_ledger::tags::set_expiry(p.chain_no, Some(s.tag_expiry));
+    let ledger: [Arc<dyn arcade_chaindb::Indexer>; 2] = [Arc::new(arcade_ledger::engine::LedgerIndexer), Arc::new(arcade_ledger::index::ProfileIndexer)];
+    let ledger_names: Vec<&'static str> = ledger.iter().map(|ix| ix.name()).collect();
+    for ix in ledger {
+        node.chain.add_indexer(p.chain_no, ix).map_err(db_err)?;
+    }
     // The home chain's ledger, carried in (§15 step 19): once, before block 1, when block 0 names a snapshot.
     if let Some(want) = s.genesis.ledger {
         let done = node.app.store.read(|r| r.get(arcade_app::META, b"arc_ledger_snapshot")).ok().flatten().is_some();
@@ -1029,11 +1034,6 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
             node.app.store.write(|w| w.put(arcade_app::META, b"arc_ledger_snapshot", &want)).map_err(|e| e.to_string())?;
             eprintln!("arc: the ledger snapshot of {} at block {} carried in: {} tags, {} tokens, {} balances", snap["chain"], snap["height"], n.tags, n.tokens, n.balances);
         }
-    }
-    let ledger: [Arc<dyn arcade_chaindb::Indexer>; 2] = [Arc::new(arcade_ledger::engine::LedgerIndexer), Arc::new(arcade_ledger::index::ProfileIndexer)];
-    let ledger_names: Vec<&'static str> = ledger.iter().map(|ix| ix.name()).collect();
-    for ix in ledger {
-        node.chain.add_indexer(p.chain_no, ix).map_err(db_err)?;
     }
     reconcile(&node.chain, p, &chain)?;
     {
