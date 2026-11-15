@@ -35,12 +35,13 @@ pub fn of_referer(referer: &str) -> Option<&'static ChainParams> {
     if txid.len() != 64 || !txid.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    arcade_chain::params::by_key(chain)
+    // The ARCADE chain too: apps are inscribed there as on any coin.
+    crate::chains::find(chain)
 }
 
 /// Whether this arcade keeps chain `p`'s arcade ledger itself (else its reads come from the mesh).
 pub fn keeps_ledger(node: &Node, p: &ChainParams) -> bool {
-    if p.chain_no == node.params.chain_no {
+    if p.chain_no == node.params.chain_no || crate::arcsvc::runs(p) {
         return true;
     }
     node.extra.lock().unwrap().get(p.key).is_some_and(|r| r.indexes.iter().any(|i| i == "ledger")) && !crate::borrow::is_borrowed(p.key)

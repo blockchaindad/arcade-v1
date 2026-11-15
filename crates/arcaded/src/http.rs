@@ -313,7 +313,7 @@ fn page_of(node: &Node, r: &Req) -> Option<(&'static arcade_chain::params::Chain
     let pass = r.headers.get("x-arcade-page")?.as_str()?;
     let mut parts = pass.trim().splitn(3, ':');
     let (chain, txid, mac) = (parts.next()?, parts.next()?, parts.next()?);
-    let cp = arcade_chain::params::by_key(chain)?;
+    let cp = crate::chains::find(chain)?;
     if !crate::udpsvc::is_hex(txid, 64) || txid.bytes().any(|b| b.is_ascii_uppercase()) {
         return None;
     }
@@ -494,7 +494,7 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
     // an opaque origin with scripts, fetching only from this arcade.
     if let Some(rest) = path.strip_prefix("/app/") {
         let (chain, id) = rest.split_once('/').unwrap_or(("", ""));
-        let Some(cp) = arcade_chain::params::by_key(chain) else { return respond(&mut s, "404 Not Found", "text/plain", &[], b"unknown chain\n") };
+        let Some(cp) = crate::chains::find(chain) else { return respond(&mut s, "404 Not Found", "text/plain", &[], b"unknown chain\n") };
         let me = format!("http://127.0.0.1:{}", node.http_port.get().copied().unwrap_or(8420));
         let csp = format!("sandbox allow-scripts allow-pointer-lock; default-src 'self' {me} data: blob:; script-src 'self' {me} 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'self' {me} 'unsafe-inline' data:; img-src 'self' {me} data: blob:; media-src 'self' {me} data: blob:; font-src 'self' {me} data:; connect-src 'self' {me} data: blob:; frame-src 'self' {me}; object-src 'none'; base-uri 'none'; form-action 'none'; {}", frame_ancestors(node));
         // From this arcade's ledger of that chain, or (a chain it only borrows) from an arcade on
@@ -525,7 +525,7 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
     // from here, one request each). Images only: anything else is for the inscription's page.
     if let Some(rest) = path.strip_prefix("/ord/") {
         let (chain, id) = rest.split_once('/').unwrap_or(("", ""));
-        let Some(cp) = arcade_chain::params::by_key(chain) else { return respond(&mut s, "404 Not Found", "text/plain", &[], b"unknown chain\n") };
+        let Some(cp) = crate::chains::find(chain) else { return respond(&mut s, "404 Not Found", "text/plain", &[], b"unknown chain\n") };
         return match arcade_ledger::ord::content(&node.chain, cp, id) {
             Ok((ct, bytes)) if ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase().starts_with("image/") => respond(
                 &mut s,
@@ -606,7 +606,7 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
         // that chain, as an app page's pass makes them (any chain a pass may name: kept, borrowed, or asked of
         // the mesh). Reads only (a program's requests are GET/HEAD).
         let program_chain = if program {
-            r.headers.get("x-arcade-chain").and_then(|v| v.as_str()).and_then(|k| arcade_chain::params::by_key(k.trim()))
+            r.headers.get("x-arcade-chain").and_then(|v| v.as_str()).and_then(|k| crate::chains::find(k.trim()))
         } else {
             None
         };
