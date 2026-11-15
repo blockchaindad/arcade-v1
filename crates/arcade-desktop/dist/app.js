@@ -238,7 +238,7 @@ async function drawAccounts(tb = $("w-accs"), m = $("w-msg"), force = true) {
   tb.dataset.sig = sig;
   tb.replaceChildren(...accs.map((a) => {
     const tr = document.createElement("tr");
-    const name = (a.tag ? "@" + a.tag : (a.own ? "This arcade's wallet" : a.id)) + (a.active ? " (in use)" : "");
+    const name = (a.tag ? "@" + a.tag : (a.own ? "This arcade's wallet" : "Another account")) + (a.active ? " (in use)" : "");
     for (const t of [name, a.address || (a.own ? "this PC" : ""), a.own ? "" : (a.from || "")]) {
       const td = document.createElement("td"); td.textContent = t; tr.append(td);
     }
