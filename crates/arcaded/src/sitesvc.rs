@@ -27,7 +27,8 @@ pub const MAX_ADDRESSES: usize = 500;
 /// Largest transaction tx.broadcast takes (bytes).
 pub const MAX_TX: usize = 400_000;
 
-fn chain(node: &Node, req: &Value) -> Result<&'static ChainParams, String> {
+/// The chain a request names (`chain`; the ARCADE chain too), else the home chain; refused when it isn't installed here.
+pub(crate) fn chain(node: &Node, req: &Value) -> Result<&'static ChainParams, String> {
     let p: &'static ChainParams = match req["chain"].as_str().filter(|k| !k.is_empty()) {
         // The ARCADE chain too (crate::arcsvc), as the wallet finds it.
         Some(k) => crate::chains::find(k).ok_or_else(|| format!("unknown chain {k}"))?,
