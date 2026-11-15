@@ -34,7 +34,7 @@
 //!
 //! Everything here is rebuilt from the blocks (the block log is replayed at start).
 
-use crate::block::{self, AuditCommit, AuditOpening, BadCoins, BadHeader, Block, BlockError, CatalogEntry, Equivocation, Item, Key, Payout, Reaudit, RegCommit, RegProof, RevealAnswer, RevealDemand, TxAnswer, TxChallenge, Verdict};
+use crate::block::{self, AuditCommit, AuditOpening, BadCoins, BadHeader, BadOrd, Block, BlockError, CatalogEntry, Equivocation, Item, Key, Payout, Reaudit, RegCommit, RegProof, RevealAnswer, RevealDemand, TxAnswer, TxChallenge, Verdict};
 use crate::catalog::{self, Catalog};
 use crate::chain::{Applied, Storage};
 use crate::draw;
@@ -55,6 +55,60 @@ pub trait Sources: Send + Sync {
     fn tip(&self, chain: &str) -> Option<u64>;
     /// The block id at `height` on this arcade's best header branch.
     fn hash_at(&self, chain: &str, height: u64) -> Option<Hash256>;
+    /// What an ord inscription row (`ord.v1.insc`'s value) says (§15 step 13), if it is a one-piece inscription's.
+    fn ord_claim(&self, _value: &[u8]) -> Option<OrdClaim> {
+        None
+    }
+    /// Envelope `e` of a raw transaction of `chain`, as the ord index reads it: (content type, body length); Some(None)
+    /// when it has no such envelope; None when this arcade can't tell (the proof waits).
+    fn envelope(&self, _chain: &str, _tx: &[u8], _e: u32) -> Option<Option<(Vec<u8>, u64)>> {
+        None
+    }
+}
+
+/// An ord row's claim about its inscription: made by `txid` at `height`, envelope `e`, content type and size.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrdClaim {
+    pub txid: [u8; 32],
+    pub height: u64,
+    pub e: u32,
+    pub content_type: Vec<u8>,
+    pub size: u64,
+}
+
+/// Row `k` of the journal record starting at segment byte `start` (arcade_chaindb::journal): count (u32), then per row
+/// table (u8 length ‖ name), key (u32 length ‖ bytes), 0 (gone) or 1 ‖ value (u32 length ‖ bytes).
+pub fn journal_row(run: &crate::segment::Run, start: u64, k: u32) -> Option<(String, Vec<u8>, Option<Vec<u8>>)> {
+    let count = u32::from_le_bytes(run.bytes(start, 4)?.try_into().ok()?);
+    if k >= count {
+        return None;
+    }
+    let mut at = start + 4;
+    for i in 0..=k {
+        let tl = run.bytes(at, 1)?[0] as u64;
+        let table = String::from_utf8(run.bytes(at + 1, tl)?).ok()?;
+        at += 1 + tl;
+        let kl = u32::from_le_bytes(run.bytes(at, 4)?.try_into().ok()?) as u64;
+        let key = run.bytes(at + 4, kl)?;
+        at += 4 + kl;
+        let flag = run.bytes(at, 1)?[0];
+        at += 1;
+        let val = if flag == 1 {
+            let vl = u32::from_le_bytes(run.bytes(at, 4)?.try_into().ok()?) as u64;
+            if vl > 1 << 20 {
+                return None;
+            }
+            let v = run.bytes(at + 4, vl)?;
+            at += 4 + vl;
+            Some(v)
+        } else {
+            None
+        };
+        if i == k {
+            return Some((table, key, val));
+        }
+    }
+    None
 }
 
 /// One entry of a coins record (crates/arcaded arcseg::coins_record): the coin an input spends.
@@ -938,6 +992,7 @@ impl Registry {
                 Item::Reaudit(q) => self.reaudit_item(q, height, &mut ops),
                 Item::BadHeader(f) => self.bad_header_item(f, &mut cu, &mut ops),
                 Item::BadCoins(f) => self.bad_coins_item(f, &mut cu, &mut ops),
+                Item::BadOrd(f) => self.bad_ord_item(f, &mut cu, &mut ops),
                 Item::TxChallenge(c) => self.tx_challenge_item(c, height, &mut ops),
                 Item::TxAnswer(a) => self.tx_answer_item(a, height, &mut ops),
                 Item::RevealDemand(d) => self.demand_item(d, height, &mut ops),
@@ -1248,6 +1303,57 @@ impl Registry {
         let ours = src.hash_at(&e.chain, f.height).ok_or(BlockError::Waiting("this arcade doesn't have that source header yet"))?;
         if ours == theirs {
             return Err(no("fraud proof: that header is the source chain's"));
+        }
+        self.catalog.remove(&f.segment, cu);
+        let gone: Vec<Hash> = self.replicas.iter().filter(|(_, r)| r.segment == f.segment).map(|(id, _)| *id).collect();
+        for id in gone {
+            self.put(Op::Replica(id, None), ops);
+        }
+        Ok(())
+    }
+
+    /// An ord journal row proved wrong (§15 step 13): its inscription's own transaction contradicts it.
+    fn bad_ord_item(&mut self, f: &BadOrd, cu: &mut catalog::Undo, ops: &mut Vec<Op>) -> Result<(), BlockError> {
+        let e = self.catalog.get(&f.segment).ok_or(no("ord proof: that segment isn't listed"))?.entry.clone();
+        if e.family != crate::segment::FAMILY_ORD || f.height < e.first || f.height > e.last {
+            return Err(no("ord proof: not a height of that segment of the ord journal"));
+        }
+        let table = crate::segment::table_bytes(e.last - e.first + 1);
+        let data_bytes = e.bytes.checked_sub(table).ok_or(no("ord proof: the segment is shorter than its table"))?;
+        if !f.row.proves(&e.root, e.bytes) || !f.record.proves(&e.root, e.bytes) {
+            return Err(no("ord proof: its leaves aren't in the segment"));
+        }
+        let start = f.row.row(crate::segment::row_at(data_bytes, e.first, f.height)).ok_or(no("ord proof: the run doesn't hold that table row"))?;
+        let (tname, _key, val) = journal_row(&f.record, start, f.entry).ok_or(no("ord proof: the run doesn't hold that row from the record's start"))?;
+        if tname != "ord.v1.insc" {
+            return Err(no("ord proof: not an inscription's row"));
+        }
+        let val = val.ok_or(no("ord proof: that row is a removal"))?;
+        let src = self.sources.0.clone().ok_or(BlockError::Waiting("this arcade doesn't follow the source chain's headers"))?;
+        let claim = src.ord_claim(&val).ok_or(no("ord proof: not a one-piece inscription's row"))?;
+        let p = arcade_chain::params::by_key(&e.chain).ok_or(no("ord proof: not a chain this arcade knows"))?;
+        let tx = arcade_chain::Tx::parse_with(&f.tx, &p.format).map_err(|_| no("ord proof: not one whole transaction"))?;
+        if tx.txid.0 != claim.txid || f.header.len() != 80 {
+            return Err(no("ord proof: that isn't the inscription's transaction, or not a header"));
+        }
+        let path: Vec<Hash256> = f.path.iter().map(|h| Hash256(*h)).collect();
+        let root: [u8; 32] = f.header[36..68].try_into().expect("80 bytes");
+        let index = u32::try_from(f.index).map_err(|_| no("ord proof: no such position"))?;
+        if arcade_chain::hash::merkle_branch_root(tx.txid, &path, index).0 != root {
+            return Err(no("ord proof: the transaction isn't in that block"));
+        }
+        let tip = src.tip(&e.chain).ok_or(BlockError::Waiting("this arcade doesn't follow that source chain"))?;
+        if tip < f.at.max(f.height) + FRAUD_DEPTH {
+            return Err(BlockError::Waiting("this arcade's source headers aren't that deep yet"));
+        }
+        let ours = src.hash_at(&e.chain, f.at).ok_or(BlockError::Waiting("this arcade doesn't have that source header yet"))?;
+        if ours != arcade_chain::hash::sha256d(&f.header) {
+            return Err(no("ord proof: that header isn't the source chain's"));
+        }
+        let env = src.envelope(&e.chain, &f.tx, claim.e).ok_or(BlockError::Waiting("this arcade can't read that chain's envelopes"))?;
+        let right = f.at == claim.height && env == Some((claim.content_type.clone(), claim.size));
+        if right {
+            return Err(no("ord proof: that row is right"));
         }
         self.catalog.remove(&f.segment, cu);
         let gone: Vec<Hash> = self.replicas.iter().filter(|(_, r)| r.segment == f.segment).map(|(id, _)| *id).collect();
@@ -2331,6 +2437,91 @@ mod tests {
         assert!(matches!(r.items(&[Item::BadCoins(Box::new(proof(2)))], 2), Err(BlockError::Invalid(_))));
         // On the wire and back.
         let item = Item::BadCoins(Box::new(proof(1)));
+        let mut bytes = Vec::new();
+        item.encode(&mut bytes);
+        assert_eq!(Item::decode(&mut arcade_chain::Reader::new(&bytes)).unwrap(), item);
+        r.items(&[item], 3).unwrap();
+        assert!(r.catalog.get(&seg).is_none() && r.catalog.was_removed(&seg));
+    }
+
+    /// Source headers that also read ord rows and envelopes (as the arcade does): a row says "right" or "wrong", and
+    /// envelope 0 is text/plain of 5 bytes.
+    struct OrdSrc(Src, [u8; 32]);
+
+    impl Sources for OrdSrc {
+        fn tip(&self, chain: &str) -> Option<u64> {
+            self.0.tip(chain)
+        }
+        fn hash_at(&self, chain: &str, height: u64) -> Option<Hash256> {
+            self.0.hash_at(chain, height)
+        }
+        fn ord_claim(&self, value: &[u8]) -> Option<OrdClaim> {
+            let size = match value {
+                b"right" => 5,
+                b"wrong" => 6,
+                _ => return None,
+            };
+            Some(OrdClaim { txid: self.1, height: 40, e: 0, content_type: b"text/plain".to_vec(), size })
+        }
+        fn envelope(&self, _chain: &str, _tx: &[u8], e: u32) -> Option<Option<(Vec<u8>, u64)>> {
+            Some((e == 0).then(|| (b"text/plain".to_vec(), 5)))
+        }
+    }
+
+    #[test]
+    fn an_ord_row_its_own_transaction_contradicts_is_taken_out() {
+        use crate::segment::{row_at, leaves_of, table, Rooter, Run};
+        let (s1, k1) = key(1);
+        let mut r = Registry::new(&NET, &[(k1, 1 << 30, pay(1))], 1).unwrap();
+        let raw = plain_tx(4);
+        let p = arcade_chain::params::by_key("peptest").unwrap();
+        let tx = arcade_chain::Tx::parse_with(&raw, &p.format).unwrap();
+        let mut header = vec![0u8; 80];
+        header[36..68].copy_from_slice(&tx.txid.0);
+        // Journal records: block 3,000's holds two inscription rows, one right and one with a size off by one.
+        let row = |val: &[u8]| -> Vec<u8> {
+            let mut b = vec![b"ord.v1.insc".len() as u8];
+            b.extend_from_slice(b"ord.v1.insc");
+            b.extend_from_slice(&38u32.to_le_bytes());
+            b.extend_from_slice(&[0u8; 38]);
+            b.push(1);
+            b.extend_from_slice(&(val.len() as u32).to_le_bytes());
+            b.extend_from_slice(val);
+            b
+        };
+        let records: Vec<Vec<u8>> = (0..RANGE).map(|h| {
+            if h == 3_000 {
+                let mut rec = 2u32.to_le_bytes().to_vec();
+                rec.extend(row(b"right"));
+                rec.extend(row(b"wrong"));
+                rec
+            } else {
+                vec![0; 4]
+            }
+        }).collect();
+        let mut data: Vec<u8> = records.concat();
+        let data_bytes = data.len() as u64;
+        data.extend(table(&records.iter().map(|b| b.len() as u64).collect::<Vec<_>>()));
+        let mut root = Rooter::new();
+        root.push(&data);
+        let (root, bytes) = root.finish().unwrap();
+        let mut e = CatalogEntry { chain: "peptest".into(), family: crate::segment::FAMILY_ORD, first: 0, last: RANGE - 1, bytes, manifest: [0; 32], root, poster: k1, sig: [0; 64] };
+        e.sig = block::sign(&s1, &e.message(&NET));
+        // An index family needs more than half: arcade 1 holds it all.
+        r.items(&[Item::CatalogEntry(e.clone())], 1).unwrap();
+        let seg = e.segment(&NET);
+        let h = 3_000u64;
+        let run = |at: u64, len: u64| { let (first, n) = leaves_of(at, len); Run::of(&data, first, n).unwrap() };
+        let trow = run(row_at(data_bytes, 0, h), 8);
+        let start = trow.row(row_at(data_bytes, 0, h)).unwrap();
+        let rec_len = records[h as usize].len() as u64;
+        let proof = |k: u32| Item::BadOrd(Box::new(BadOrd { segment: seg, height: h, row: trow.clone(), record: run(start, rec_len), entry: k, at: 40, header: header.clone(), tx: raw.clone(), index: 0, path: vec![] }));
+        let src = Src { chain: "peptest", tip: h + 500, at: 40, hash: arcade_chain::hash::sha256d(&header) };
+        r.set_sources(std::sync::Arc::new(OrdSrc(src, tx.txid.0)));
+        assert_eq!(journal_row(&run(start, rec_len), start, 1).unwrap().0, "ord.v1.insc");
+        // The right row isn't fraud; the wrong one takes the segment out (after the wire).
+        assert!(matches!(r.items(&[proof(0)], 2), Err(BlockError::Invalid(_))));
+        let item = proof(1);
         let mut bytes = Vec::new();
         item.encode(&mut bytes);
         assert_eq!(Item::decode(&mut arcade_chain::Reader::new(&bytes)).unwrap(), item);

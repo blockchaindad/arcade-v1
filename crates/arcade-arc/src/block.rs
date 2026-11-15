@@ -568,6 +568,7 @@ pub enum Item {
     Equivocation(Box<Equivocation>),
     BadHeader(Box<BadHeader>),
     BadCoins(Box<BadCoins>),
+    BadOrd(Box<BadOrd>),
     TxChallenge(Box<TxChallenge>),
     TxAnswer(TxAnswer),
     RevealDemand(RevealDemand),
@@ -679,6 +680,26 @@ pub struct BadCoins {
     pub path: Vec<Hash>,
 }
 
+/// A fraud proof for the ord journal (§15 step 13): row `entry` of block `height`'s ord record in a listed ord segment
+/// is an inscription's row (`ord.v1.insc`) saying it was made by one transaction at some height with some content type
+/// and size. `tx` is that transaction, in the block whose `header` the source chain has at `at` (`index`, `path` as in
+/// [`BadCoins`]). When it wasn't made at that height, or its envelope's content type or size differ, the segment goes.
+/// Only rows of inscriptions in one transaction's witness (one piece) are provable so; pieced ones (Doginals over
+/// several transactions) rest on more than half the weight.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BadOrd {
+    pub segment: Hash,
+    pub height: u64,
+    pub row: crate::segment::Run,
+    pub record: crate::segment::Run,
+    pub entry: u32,
+    pub at: u64,
+    pub header: Vec<u8>,
+    pub tx: Vec<u8>,
+    pub index: u64,
+    pub path: Vec<Hash>,
+}
+
 /// Most leaves of a coins proof's record run (about 64 kB): an entry deeper in a bigger record is demanded instead.
 pub const MAX_COINS_PROOF_LEAVES: usize = 520;
 /// Most bytes of the transaction in a coins proof.
@@ -722,6 +743,7 @@ pub const TAG_TX_ANSWER: u8 = 0x11;
 pub const TAG_REVEAL_ANSWER: u8 = 0x12;
 pub const TAG_REVEAL_DEMAND: u8 = 0x65;
 pub const TAG_BAD_COINS: u8 = 0x66;
+pub const TAG_BAD_ORD: u8 = 0x67;
 
 impl Item {
     pub fn tag(&self) -> u8 {
@@ -737,6 +759,7 @@ impl Item {
             Item::Equivocation(_) => TAG_EQUIVOCATION,
             Item::BadHeader(_) => TAG_BAD_HEADER,
             Item::BadCoins(_) => TAG_BAD_COINS,
+            Item::BadOrd(_) => TAG_BAD_ORD,
             Item::TxChallenge(_) => TAG_TX_CHALLENGE,
             Item::TxAnswer(_) => TAG_TX_ANSWER,
             Item::RevealDemand(_) => TAG_REVEAL_DEMAND,
@@ -847,6 +870,18 @@ impl Item {
                 o.extend_from_slice(&x.height.to_le_bytes());
                 put_run(&mut o, &x.row);
                 put_run(&mut o, &x.header);
+            }
+            Item::BadOrd(x) => {
+                o.extend_from_slice(&x.segment);
+                o.extend_from_slice(&x.height.to_le_bytes());
+                put_run(&mut o, &x.row);
+                put_run(&mut o, &x.record);
+                o.extend_from_slice(&x.entry.to_le_bytes());
+                o.extend_from_slice(&x.at.to_le_bytes());
+                put_bytes(&mut o, &x.header);
+                put_bytes(&mut o, &x.tx);
+                o.extend_from_slice(&x.index.to_le_bytes());
+                put_path(&mut o, &x.path);
             }
             Item::BadCoins(x) => {
                 o.extend_from_slice(&x.segment);
@@ -971,6 +1006,18 @@ impl Item {
             TAG_REVEAL_ANSWER => Item::RevealAnswer(RevealAnswer { demand: p.array()?, run: get_run_of(p, MAX_TX_LEAVES)? }),
             TAG_TX_ANSWER => Item::TxAnswer(TxAnswer { challenge: p.array()?, at: p.u64()?, len: p.u64()?, tx: get_run_of(p, MAX_TX_LEAVES)?, index: p.u64()?, path: get_path(p)? }),
             TAG_BAD_HEADER => Item::BadHeader(Box::new(BadHeader { segment: p.array()?, height: p.u64()?, row: get_run(p)?, header: get_run(p)? })),
+            TAG_BAD_ORD => Item::BadOrd(Box::new(BadOrd {
+                segment: p.array()?,
+                height: p.u64()?,
+                row: get_run(p)?,
+                record: get_run_of(p, MAX_COINS_PROOF_LEAVES)?,
+                entry: p.u32()?,
+                at: p.u64()?,
+                header: get_bytes(p, 80, "an ord proof's header is 80 bytes")?,
+                tx: get_bytes(p, MAX_COINS_PROOF_TX, "an ord proof's transaction is too long")?,
+                index: p.u64()?,
+                path: get_path(p)?,
+            })),
             TAG_BAD_COINS => Item::BadCoins(Box::new(BadCoins {
                 segment: p.array()?,
                 height: p.u64()?,

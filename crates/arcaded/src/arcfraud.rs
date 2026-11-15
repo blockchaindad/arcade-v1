@@ -216,6 +216,32 @@ fn watch(node: &Node) -> Result<(), String> {
                 }
             }
         }
+        // The ord journal (§15 step 13): a listed record that isn't ours, proved wrong where its row is a one-piece
+        // inscription's.
+        for (first, last, l) in reg.catalog().spans(p.key, segment::FAMILY_ORD) {
+            let Some(l) = l else { continue };
+            if CHECKED.lock().unwrap().contains(&l.id) {
+                continue;
+            }
+            let Some((bytes, root)) = crate::arcseg::root_of(node, p, segment::FAMILY_ORD, first, last) else { continue };
+            CHECKED.lock().unwrap().insert(l.id);
+            if (bytes, root) == (l.entry.bytes, l.entry.root) {
+                continue;
+            }
+            eprintln!("arc: the listed {} ord segment {first}..={last} isn't the one this arcade makes: looking for the proof", p.name);
+            let mut holders: Vec<String> = reg.all_replicas().iter().filter(|r| r.1 == l.id).map(|r| hex::encode(r.2)).collect();
+            let poster = hex::encode(l.entry.poster);
+            if !holders.contains(&poster) {
+                holders.push(poster);
+            }
+            for peer in holders {
+                if let Some(proof) = investigate_ord(node, p, &l.entry, &l.id, &peer) {
+                    eprintln!("arc: {} ord record of block {} is wrong (row {}): fraud proof posted", p.name, proof.height, proof.entry);
+                    crate::arcseg::add(Item::BadOrd(Box::new(proof)));
+                    break;
+                }
+            }
+        }
         for (first, last, l) in reg.catalog().spans(p.key, segment::FAMILY_BLOCKS) {
             let Some(l) = l else { continue };
             if CHECKED.lock().unwrap().contains(&l.id) {
@@ -275,7 +301,17 @@ fn coins_entries(rec: &[u8]) -> Option<Vec<(arcade_arc::registry::CoinsEntry, u6
 /// From one holder: the proof that a coins record in the segment is wrong, if one is (§15 step 12). The first leaf
 /// that differs from ours, the record holding it, its first entry unlike ours, and that coin's making transaction
 /// with its block's header and Merkle path, from this arcade's own copy of the chain.
-fn investigate_coins(node: &Node, p: &arcade_chain::params::ChainParams, e: &block::CatalogEntry, seg: &Hash, peer: &str) -> Option<block::BadCoins> {
+/// A listed segment of a record family (coins, a journal) whose root isn't ours: from `peer`, the first height whose
+/// record differs, with its table row run, the record's start, their record (as far as a proof can carry) and ours.
+struct Differing {
+    height: u64,
+    row_run: Run,
+    start: u64,
+    theirs: Vec<u8>,
+    ours: Vec<u8>,
+}
+
+fn differing_record(node: &Node, p: &arcade_chain::params::ChainParams, e: &block::CatalogEntry, seg: &Hash, peer: &str, family: u8) -> Option<Differing> {
     let n = e.bytes.div_ceil(DATA_LEAF as u64);
     let mut theirs: Vec<Hash> = Vec::with_capacity(n as usize);
     while (theirs.len() as u64) < n {
@@ -292,7 +328,7 @@ fn investigate_coins(node: &Node, p: &arcade_chain::params::ChainParams, e: &blo
     let mut sizes = Vec::new();
     let mut ours_by_h = Vec::new();
     for h in e.first..=e.last {
-        let u = crate::arcseg::unit_bytes(node, p, segment::FAMILY_COINS, h as u32)?;
+        let u = crate::arcseg::unit_bytes(node, p, family, h as u32)?;
         sizes.push(u.len() as u64);
         data.extend_from_slice(&u);
         ours_by_h.push(u);
@@ -310,7 +346,54 @@ fn investigate_coins(node: &Node, p: &arcade_chain::params::ChainParams, e: &blo
     let take = (end - start).min(most);
     let rec_run = bytes_from(peer, seg, &e.root, e.bytes, start, take)?;
     let theirs_rec = rec_run.bytes(start, take)?;
-    let ours = coins_entries(&ours_by_h[(height - e.first) as usize])?;
+    Some(Differing { height, row_run, start, theirs: theirs_rec, ours: ours_by_h[(height - e.first) as usize].clone() })
+}
+
+/// The making transaction of `txid` from this arcade's copy of the chain: (raw, height, its block's header, index,
+/// Merkle path).
+fn made_by(node: &Node, p: &arcade_chain::params::ChainParams, txid: &Hash256) -> Option<(Vec<u8>, u32, Vec<u8>, usize, Vec<Hash>)> {
+    let (raw, bh) = node.chain.tx_raw(p, txid).ok().flatten()?;
+    let made_at = node.chain.block_height_of(p.chain_no, bh).ok()??;
+    let bid = node.chain.hash_at(p.chain_no, made_at).ok()??;
+    let braw = node.chain.block_raw(p.chain_no, &bid).ok()??;
+    let blk = arcade_chain::Block::parse_with(&braw, &p.format).ok()?;
+    let ids: Vec<Hash256> = blk.txs.iter().map(|x| x.txid).collect();
+    let index = ids.iter().position(|x| x == txid)?;
+    Some((raw, made_at, braw[..80].to_vec(), index, merkle_path(&ids, index)))
+}
+
+/// From one holder: the proof that an ord journal row in the segment is wrong, if one is provable (§15 step 13): the
+/// first row of the first differing record that isn't ours, when it is a one-piece inscription's row.
+fn investigate_ord(node: &Node, p: &arcade_chain::params::ChainParams, e: &block::CatalogEntry, seg: &Hash, peer: &str) -> Option<block::BadOrd> {
+    let d = differing_record(node, p, e, seg, peer, segment::FAMILY_ORD)?;
+    let (theirs, ours) = (Run::of_bytes(&d.theirs), Run::of_bytes(&d.ours));
+    let n = u32::from_le_bytes(d.theirs.get(..4)?.try_into().ok()?);
+    let mut at = 4u64;
+    for k in 0..n {
+        let Some(t) = arcade_arc::registry::journal_row(&theirs, 0, k) else { break };
+        at += 1 + t.0.len() as u64 + 4 + t.1.len() as u64 + 1 + t.2.as_ref().map_or(0, |v| 4 + v.len() as u64);
+        if arcade_arc::registry::journal_row(&ours, 0, k).as_ref() == Some(&t) {
+            continue;
+        }
+        let claim = (t.0 == "ord.v1.insc").then(|| t.2.as_deref().and_then(crate::arcsvc::ord_claim)).flatten();
+        let Some(claim) = claim else {
+            eprintln!("arc: {} ord record of block {} differs at a row no proof reaches yet: left to the weight behind it", p.name, d.height);
+            return None;
+        };
+        let Some((raw, made_at, header, index, path)) = made_by(node, p, &Hash256(claim.txid)) else {
+            eprintln!("arc: {} ord record of block {} names transaction {} that this arcade doesn't have", p.name, d.height, Hash256(claim.txid).to_hex());
+            return None;
+        };
+        let record = bytes_from(peer, seg, &e.root, e.bytes, d.start, at)?;
+        return Some(block::BadOrd { segment: *seg, height: d.height, row: d.row_run, record, entry: k, at: made_at as u64, header, tx: raw, index: index as u64, path });
+    }
+    None
+}
+
+fn investigate_coins(node: &Node, p: &arcade_chain::params::ChainParams, e: &block::CatalogEntry, seg: &Hash, peer: &str) -> Option<block::BadCoins> {
+    let d = differing_record(node, p, e, seg, peer, segment::FAMILY_COINS)?;
+    let (height, row_run, start, theirs_rec) = (d.height, d.row_run, d.start, d.theirs);
+    let ours = coins_entries(&d.ours)?;
     // Their entries as far as the run reaches, each against ours.
     let mut k = 0u32;
     let mut entry_end = None;
@@ -331,16 +414,10 @@ fn investigate_coins(node: &Node, p: &arcade_chain::params::ChainParams, e: &blo
     };
     // The coin's making transaction, from our own copy of the chain.
     let txid = Hash256(t.txid);
-    let Some((raw, bh)) = node.chain.tx_raw(p, &txid).ok().flatten() else {
+    let Some((raw, made_at, header, index, path)) = made_by(node, p, &txid) else {
         eprintln!("arc: {} coins record of block {height} names transaction {} that this arcade doesn't have: left to reveal demands", p.name, txid.to_hex());
         return None;
     };
-    let made_at = node.chain.block_height_of(p.chain_no, bh).ok()??;
-    let bid = node.chain.hash_at(p.chain_no, made_at).ok()??;
-    let braw = node.chain.block_raw(p.chain_no, &bid).ok()??;
-    let blk = arcade_chain::Block::parse_with(&braw, &p.format).ok()?;
-    let ids: Vec<Hash256> = blk.txs.iter().map(|x| x.txid).collect();
-    let index = ids.iter().position(|x| *x == txid)?;
     let record = bytes_from(peer, seg, &e.root, e.bytes, start, len)?;
     Some(block::BadCoins {
         segment: *seg,
@@ -349,10 +426,10 @@ fn investigate_coins(node: &Node, p: &arcade_chain::params::ChainParams, e: &blo
         record,
         entry: k,
         at: made_at as u64,
-        header: braw[..80].to_vec(),
+        header,
         tx: raw,
         index: index as u64,
-        path: merkle_path(&ids, index),
+        path,
     })
 }
 

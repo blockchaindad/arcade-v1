@@ -516,6 +516,29 @@ impl arcade_arc::registry::Sources for NodeSources {
         let p = crate::chains::find(chain)?;
         self.0.chain.hash_at(p.chain_no, u32::try_from(height).ok()?).ok().flatten()
     }
+    fn ord_claim(&self, value: &[u8]) -> Option<arcade_arc::registry::OrdClaim> {
+        ord_claim(value)
+    }
+    fn envelope(&self, chain: &str, raw: &[u8], e: u32) -> Option<Option<(Vec<u8>, u64)>> {
+        let p = crate::chains::find(chain)?;
+        let tx = arcade_chain::Tx::parse_with(raw, &p.format).ok()?;
+        Some(arcade_ledger::ordwit::envelopes(&tx).get(e as usize).map(|x| (String::from_utf8_lossy(x.content_type.as_deref().unwrap_or_default()).into_owned().into_bytes(), x.body.as_ref().map_or(0, |b| b.len() as u64))))
+    }
+}
+
+/// What an ord inscription row says about its making (§15 step 13): one-piece inscriptions only.
+pub fn ord_claim(value: &[u8]) -> Option<arcade_arc::registry::OrdClaim> {
+    let v: Value = serde_json::from_slice(value).ok()?;
+    if v["pieces"].as_u64() != Some(1) || v["txs"].as_array()?.len() != 1 {
+        return None;
+    }
+    Some(arcade_arc::registry::OrdClaim {
+        txid: Hash256::from_hex(v["txs"][0].as_str()?).ok()?.0,
+        height: v["h"].as_u64()?,
+        e: v["e"].as_u64()? as u32,
+        content_type: v["ct"].as_str()?.as_bytes().to_vec(),
+        size: v["size"].as_u64()?,
+    })
 }
 
 /// A transaction from this arcade or from a peer: into the pool if it may wait there. Its fee.
@@ -692,6 +715,7 @@ fn run_writer_on(node: Arc<Node>, svc: Arc<Svc>, wrote: &mut VecDeque<Hash256>, 
     let mut on: Option<Hash256> = None;
     // The draw for the tip, its draw seed's proof, and whether it could be the height's best (crate::arckeep).
     let mut ticket: Option<(Ticket, Option<TimeProof>, bool)> = None;
+    let mut alone_said: Option<Instant> = None;
     let mut written: Option<Block> = None;
     // The VDF's proof of time for this tip's ticket, made in the background: (tip, its proof when done).
     let proving: Arc<Mutex<Option<(Hash256, Option<TimeProof>)>>> = Arc::new(Mutex::new(None));
@@ -724,6 +748,19 @@ fn run_writer_on(node: Arc<Node>, svc: Arc<Svc>, wrote: &mut VecDeque<Hash256>, 
                 });
             }
             let Some((t, seed, likely)) = &ticket else { continue };
+            // Never far alone: with no arcade of this chain linked and others holding weight, a branch written here
+            // could outrun the reorg limit and never join theirs (a 3-arcade test net split so while its links came up
+            // under load). At most half the limit in a row by this arcade alone, then it waits for a link.
+            if (t.weight as u128) < st.chain.storage().total_weight() && linked_peers().is_empty() {
+                let me = node.identity.verifying_key().to_bytes();
+                if alone_streak(&st.chain, &me, params::REORG_LIMIT / 2) >= params::REORG_LIMIT / 2 {
+                    if alone_said.is_none_or(|t: Instant| t.elapsed() > Duration::from_secs(60)) {
+                        eprintln!("arc: not writing: the last {} blocks are this arcade's alone and no arcade of the chain is linked", params::REORG_LIMIT / 2);
+                        alone_said = Some(Instant::now());
+                    }
+                    continue;
+                }
+            }
             let pot = match *st.chain.proofs() {
                 // The stand-in: wait as long as the steps would take.
                 Clock::StandIn => {
@@ -1690,6 +1727,19 @@ pub fn blob(req: &Value) -> Result<Value, String> {
 /// Whether a coin is unspent on the running ARCADE chain's best branch.
 pub fn unspent(op: &OutPoint) -> bool {
     svc().is_some_and(|s| s.st.lock().unwrap().chain.coins().contains_key(op))
+}
+
+/// How many blocks in a row up to the tip `me` wrote (at most `max`).
+fn alone_streak<T: arcade_arc::time::TimeProofs, S: arcade_arc::chain::Storage>(chain: &Chain<T, S>, me: &[u8; 32], max: u64) -> u64 {
+    let tip = chain.tip().height;
+    let mut n = 0;
+    while n < max && n < tip {
+        match chain.id_at(tip - n).and_then(|id| chain.block(&id)) {
+            Some(b) if b.header.writer == *me => n += 1,
+            _ => break,
+        }
+    }
+    n
 }
 
 /// Whether transaction `txid` waits in the ARCADE chain's pool.

@@ -224,6 +224,7 @@ pub fn forget_stale(reg: &Registry, tip: u64) {
             Item::RevealAnswer(a) => !reg.demand_open(&a.demand),
             Item::BadHeader(f) => reg.catalog().get(&f.segment).is_none(),
             Item::BadCoins(f) => reg.catalog().get(&f.segment).is_none(),
+            Item::BadOrd(f) => reg.catalog().get(&f.segment).is_none(),
             _ => false,
         })
         .collect();
