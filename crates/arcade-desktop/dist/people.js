@@ -5,6 +5,9 @@
   const ARC = (sats) => (sats / 1e8).toLocaleString(undefined, { maximumFractionDigits: 8 }) + " ARCADE";
   const CHAINS = [["pep", "Pepecoin"], ["doge", "Dogecoin"], ["ltc", "Litecoin"], ["dgb", "DigiByte"], ["btc", "Bitcoin"]];
   const NAMES = { pep: "Pepecoin", peptest: "Pepecoin testnet", doge: "Dogecoin", ltc: "Litecoin", ltctest: "Litecoin testnet", dgb: "DigiByte", dgbtest: "DigiByte testnet", btc: "Bitcoin", flop: "Flopcoin", wjk: "Wojakcoin", kot: "Kotia", jkc: "Junkcoin", shic: "Shibacoin", lky: "Luckycoin" };
+  // Where a name was published: ARCADE, another chain's arcade ledger, or DogeFeed on Dogecoin.
+  const homePill = (home) => !home ? "" : h("span", { class: "pill pp-home" + (home.key === "arctest" || home.key === "arc" ? " ok" : ""), title: `Published ${home.via === "DogeFeed" ? "as a DogeFeed name" : home.via === "A://" ? "as an A:// profile" : home.via === "profile" ? "as a profile" : "as an @tag"} on ${home.chain}` },
+    home.via === "DogeFeed" ? "DogeFeed · Dogecoin" : home.chain);
   const label = (k) => { const [c, n] = k.split("-"); return (NAMES[c] || c) + (n ? " " + n : ""); };
   const note = (t, bad) => say("pp-msg", t, bad);
   let view = "profile", me = null, picture = null, dirty = false, contacts = [];
@@ -39,6 +42,7 @@
     const pr = p.profile || {};
     return [
       h("div", { class: "pp-prof" }, avatar(p), h("div", {}, h("div", { class: "name" }, pr.n || (p.tag ? "@" + p.tag : "No name yet")), h("div", { class: "pp-tag" }, p.tag ? "@" + p.tag : p.address))),
+      h("div", { class: "row", style: "margin:8px 0 0" }, h("span", { class: "s" }, "Home chain"), homePill(p.from_home ? { chain: p.from_home.chain, key: "", via: "profile" } : { chain: "ARCADE", key: "arctest", via: "A://" })),
       pr.b ? h("p", { class: "s" }, pr.b) : "",
       pr.u ? h("p", { class: "s" }, pr.u) : "",
       h("div", { class: "pp-stats" },
@@ -103,13 +107,14 @@
 
   async function drawFollows() {
     const f = await api("a.follows");
+    followed = new Set(f.following.flatMap((p) => [p.tag, p.follow_key]).filter(Boolean));
     $("pp-nfollowing").textContent = String(f.following.length);
     $("pp-nfollowers").textContent = String(f.followers.length);
     const row = (p, action) => h("div", { class: "pp-person" }, avatar(p, true),
-      h("div", { style: "min-width:0" }, h("b", {}, p.profile?.n || (p.tag ? "@" + p.tag : p.address.slice(0, 12) + "…")), h("div", { class: "s" }, p.tag ? h("span", { class: "pp-tag" }, "@" + p.tag) : "", ` · since block ${p.since}`)), action);
+      h("div", { style: "min-width:0" }, h("div", { class: "row", style: "margin:0;gap:6px" }, h("b", {}, p.profile?.n || (p.tag ? "@" + p.tag : p.address.slice(0, 12) + "…")), homePill(p.home)), h("div", { class: "s" }, p.tag ? h("span", { class: "pp-tag" }, "@" + p.tag) : "", ` · since block ${p.since}`)), action);
     const btn = (label, fn, primary) => { const b = h("button", { class: primary ? "primary" : "" }, label); b.onclick = fn; return b; };
-    $("pp-following").replaceChildren(...(f.following.length ? f.following.map((p) => row(p, btn("Unfollow", () => follow(p.tag, false)))) : [h("p", { class: "s" }, "Nobody yet. Follow an @tag above.")]));
-    $("pp-followers").replaceChildren(...(f.followers.length ? f.followers.map((p) => row(p, p.you_follow ? h("span", { class: "pill ok" }, "You follow") : (p.tag ? btn("Follow back", () => follow(p.tag, true), true) : ""))) : [h("p", { class: "s" }, "No followers yet.")]));
+    $("pp-following").replaceChildren(...(f.following.length ? f.following.map((p) => row(p, btn("Unfollow", () => follow((p.follow_key || p.tag).replace(/^#/, ""), false)))) : [h("p", { class: "s" }, "Nobody yet. Follow an @tag above.")]));
+    $("pp-followers").replaceChildren(...(f.followers.length ? f.followers.map((p) => row(p, p.you_follow ? h("span", { class: "pill ok" }, "You follow") : btn("Follow back", () => follow(p.tag || p.key, true), true))) : [h("p", { class: "s" }, "No followers yet.")]));
   }
   async function follow(tag, on) {
     try { const r = await api(on ? "a.follow" : "a.unfollow", { tag }); note(`${on ? "Following" : "Unfollowed"} @${r.tag} (fee ${ARC(r.fee)}); it counts once it's in a block.`); setTimeout(draw, 4000); }
@@ -118,37 +123,22 @@
 
   async function drawContacts() {
     contacts = (await api("a.contacts")).contacts;
-    const q = $("pp-search").value.trim().toLowerCase();
-    const shown = contacts.filter((c) => !q || JSON.stringify(c).toLowerCase().includes(q));
+    inBook = new Set(contacts.flatMap((c) => [c.addresses?.arcade, c.tag ? "@" + c.tag : null]).filter(Boolean));
+    const shown = contacts;
     $("pp-cempty").hidden = contacts.length > 0;
     $("pp-crows").replaceChildren(...shown.map((c) => {
-      const edit = h("button", {}, "Edit"); edit.onclick = () => openForm(c);
       const send = h("button", {}, "Send"); send.onclick = () => { const to = c.tag ? "@" + c.tag : Object.values(c.addresses || {})[0]; goTab("wallet"); if ($("w-to") && to) $("w-to").value = to; };
       const del = h("button", {}, "Delete");
       del.onclick = async () => {
         if (!del.dataset.sure) { del.dataset.sure = 1; del.textContent = "Delete: sure?"; return; }
         try { const r = await api("a.contact_delete", { id: c.id }); note(`Deleting ${c.name} (fee ${ARC(r.fee)}); gone once it's in a block.`); setTimeout(draw, 4000); } catch (e) { note(e.message, true); }
       };
-      return h("tr", {}, h("td", {}, h("b", {}, c.name)), h("td", { class: "pp-tag" }, c.tag ? "@" + c.tag : ""),
+      return h("tr", {}, h("td", {}, h("b", {}, c.name), h("div", {}, homePill(c.home))), h("td", { class: "pp-tag" }, c.tag ? "@" + c.tag : ""),
         h("td", {}, ...Object.entries(c.addresses || {}).map(([k, v]) => h("div", { class: "mono" }, `${k} ${v}`))),
-        h("td", { class: "s" }, c.note || ""), h("td", {}, h("div", { class: "row", style: "margin:0" }, send, edit, del)));
+        h("td", { class: "s" }, c.note || ""), h("td", {}, h("div", { class: "row", style: "margin:0" }, send, del)));
     }));
   }
-  function openForm(c) {
-    $("pp-form").hidden = false;
-    $("pp-cid").value = c?.id || ""; $("pp-cname").value = c?.name || ""; $("pp-ctag").value = c?.tag || ""; $("pp-cnote").value = c?.note || "";
-    addrInputs($("pp-caddrs"), c?.addresses);
-    $("pp-cname").focus();
-  }
-  $("pp-add").onclick = () => openForm(null);
-  $("pp-ccancel").onclick = () => { $("pp-form").hidden = true; };
-  $("pp-csave").onclick = async () => {
-    try {
-      const r = await api("a.contact_save", { id: $("pp-cid").value || undefined, name: $("pp-cname").value, tag: $("pp-ctag").value, note: $("pp-cnote").value, addresses: addrValues($("pp-caddrs")) });
-      $("pp-form").hidden = true; note(`Saved (fee ${ARC(r.fee)}); it shows once it's in a block.`); setTimeout(draw, 4000);
-    } catch (e) { note(e.message, true); }
-  };
-  $("pp-search").oninput = () => drawContacts().catch(() => {});
+
 
   ["pp-name", "pp-bio", "pp-url"].forEach((id) => { $(id).oninput = () => { dirty = true; cost(); }; });
   $("pp-pic").onchange = (e) => {
@@ -170,7 +160,43 @@
     try { const r = await api("a.profile_set", formProfile()); dirty = false; note(`Profile sent (${r.bytes} bytes, fee ${ARC(r.fee)}); every arcade shows it once it's in a block.`); setTimeout(draw, 4000); }
     catch (e) { note(e.message, true); }
   };
-  $("pp-follow").onclick = () => { const t = $("pp-followtag").value.trim(); if (t) follow(t, true); };
+  // One search for both: published profiles and @tags, each with its button (Martin: "a simple search and click").
+  let followed = new Set(), inBook = new Set(), timer = null;
+  function search(input, results, mode) {
+    input.oninput = () => {
+      clearTimeout(timer);
+      timer = setTimeout(async () => {
+        const q = input.value.trim();
+        if (q.replace(/^@/, "").length < 2) { results.replaceChildren(); return; }
+        try {
+          const r = await api("a.search", { q });
+          const hits = r.results.filter((p) => !(me && p.address === me.address));
+          results.replaceChildren(...(hits.length ? hits.map((p) => hit(p, mode)) : [h("p", { class: "s" }, `Nobody published under "${q}" yet.`)]));
+        } catch (e) { note(e.message, true); }
+      }, 250);
+    };
+  }
+  function hit(p, mode) {
+    const pr = p.profile || {};
+    let b;
+    if (mode === "follow") {
+      const target = p.tag || p.key;
+      b = followed.has(p.tag) || followed.has("#" + p.key) ? h("span", { class: "pill ok" }, "Following") : h("button", { class: "primary" }, "Follow");
+      if (b.tagName === "BUTTON") b.onclick = () => { b.disabled = true; follow(target, true); };
+    } else {
+      b = inBook.has(p.address) || (p.tag && inBook.has("@" + p.tag)) ? h("span", { class: "pill ok" }, "In your book") : h("button", { class: "primary" }, "Add");
+      if (b.tagName === "BUTTON") b.onclick = async () => {
+        b.disabled = true;
+        try { const r = await api("a.contact_add", { key: p.key }); note(`Adding ${pr.n || "@" + p.tag} (fee ${ARC(r.fee)}); it shows once it's in a block.`); setTimeout(draw, 4000); }
+        catch (e) { b.disabled = false; note(e.message, true); }
+      };
+    }
+    return h("div", { class: "pp-hit" }, avatar(p, true),
+      h("div", { style: "min-width:0" }, h("div", { class: "row", style: "margin:0;gap:6px" }, h("b", {}, pr.n || "@" + p.tag), homePill(p.home)),
+        h("div", { class: "s" }, p.tag ? h("span", { class: "pp-tag" }, "@" + p.tag) : (p.other_tag ? "@" + p.other_tag : ""), pr.b ? " · " + pr.b : "", ` · ${p.followers} followers`)), b);
+  }
+  search($("pp-fsearch"), $("pp-fresults"), "follow");
+  search($("pp-search"), $("pp-cresults"), "add");
 
   async function draw() {
     try {
