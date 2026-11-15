@@ -374,7 +374,17 @@ fn main() {
         let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
     }
     // One arcaded per home: a second one would fight over the databases and the socket.
-    let _lock = match lock_home(&home) {
+    // Started by an update (Windows: crate::updater::exec_self): the old arcaded may still be leaving; wait for its lock.
+    let restarted = std::env::var_os(updater::RESTARTED).is_some();
+    let mut lock = lock_home(&home);
+    if restarted {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        while lock.is_err() && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            lock = lock_home(&home);
+        }
+    }
+    let _lock = match lock {
         Ok(f) => f,
         Err(e) => {
             eprintln!("arcaded: {e}");
