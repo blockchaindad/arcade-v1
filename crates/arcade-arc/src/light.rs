@@ -230,7 +230,8 @@ mod tests {
     use crate::block::BlockError;
     use crate::chain::tests::{chain, grow, grow_to, second_best_block, TestChain, LATE};
     use crate::chain::Storage;
-    use crate::params::TESTNET;
+    // The chain tests' network (the testnet's schedule before its 2026-11-15 restart).
+    const TESTNET: crate::params::Net = crate::params::Net { rules: &[(1, 0), (2, 1_065)], ..crate::params::TESTNET };
     use crate::time::StandIn;
 
     fn genesis(c: &TestChain) -> Genesis {

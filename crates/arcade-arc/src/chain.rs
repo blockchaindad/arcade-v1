@@ -1022,7 +1022,8 @@ pub(crate) mod tests {
 
     pub(crate) type TestChain = Chain<StandIn, FixedHolders>;
 
-    const NET: Net = TESTNET;
+    // The testnet as it ran before its 2026-11-15 restart (rules 1, then 2 from 1,065): what these tests were written for.
+    const NET: Net = Net { rules: &[(1, 0), (2, 1_065)], ..TESTNET };
     const START: u64 = 1_797_000_000;
     const GIB: u64 = 1 << 30;
     /// Three arcades holding 1, 2 and 3 GiB.

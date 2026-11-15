@@ -375,7 +375,8 @@ pub(crate) mod tests {
     use crate::params::{MAINNET, RANGE, TESTNET};
     use ed25519_dalek::SigningKey;
 
-    const NET: Net = TESTNET;
+    // The testnet as it ran before its 2026-11-15 restart (rules 1, then 2 from 1,065): what these tests were written for.
+    const NET: Net = Net { rules: &[(1, 0), (2, 1_065)], ..TESTNET };
     const FULL: u64 = 1_000;
 
     struct Held(Vec<(Key, u64)>);

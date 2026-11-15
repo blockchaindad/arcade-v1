@@ -1000,6 +1000,15 @@ mainnet. Marked *(default)* where Martin has not said yes.
 | 24 | todo |
 | 25 | running (waits for block 1,165) |
 
+### 15.5 The testnet's third start (2026-11-15, v0.1.73)
+
+Martin 2026-11-14: restart the testnet with block 0 naming the latest build and the ledger carried in; test coins
+start over; at mainnet the testnet's data (not its coins) is carried by snapshot. Block 0 names release v0.1.72
+(`0d4fdc79…`; a block 0 can't name the release that holds it, so the restart is the release after) and the Pepecoin
+testnet ledger at its block 1,569,097 (322 tags, 121 tokens, 462 balances; `crates/arcaded/arctest-ledger.json`, hash
+`4b25079a…`). Rules version 3 from block 0. Genesis writers: the GX10 and the JB20B. First difficulty: the old chain's
+after its block-1,100 retarget.
+
 ### 15.4 As built: steps 5 to 11 (2026-11-14)
 
 - **Blobs as pages (5):** `/content/<blob id>` answers with the same policy as ord inscriptions (inline scripts, loads

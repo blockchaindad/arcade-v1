@@ -1,13 +1,15 @@
 {
  "net": "arctest",
- "_note": "The ARCADE testnet built into V1.0. Restarted 2026-11-12 with: the real proof of time (Chia's VDF), 16 MiB segments sealed block by block, the coins family, batch registration, per-owner serving checks, pay at each owner's turn, storage audits with re-audits, a 200-block draw wait after the first passed audit, the double-signing penalty, fraud proofs (bad headers, transaction challenges), reveal demands, and rules versions. Genesis writers: the GX10 and the JB20B.",
+ "_note": "The ARCADE testnet built into V1.0. Restarted 2026-11-15 (third start) with rules version 3 from block 0: blobs (files, games, git), the ledger on ARCADE (tags, profiles, tag expiry, @tag repos, pull requests), the tenth with its challenge window and the coins and ord fraud proofs, on top of the real proof of time, time keepers and the writer's share. Block 0 names the code release it started from (v0.1.72) and carries Pepecoin testnet's ledger (tags, tokens, balances at its block 1,569,097). Genesis writers: the GX10 and the JB20B. Test coins started over.",
  "genesis": {
-  "time": 1794514211,
-  "closed_list": "9d2129f082fcbf9dc431d0f924d6643d68f906abf140459456f8327913006c5c",
-  "final_list": "65f88bb715c6baa4efdfcc4fdd106c087ea1475bdff9301c417a53bca1d45e0d",
-  "beacon_1": "61f17a562dd36624d26654276663e2b79b7f7e060bb77081ff92f44d5f8f3245",
-  "beacon_2": "71c8f77c955ad45664d9fd176c9d3a2bc71f454f51ad517eaa3737e22f84c7b0",
-  "difficulty": "55819391973383240"
+  "time": 1794719880,
+  "closed_list": "f495a3889b58ecc9054b6f9f06a3ddd40c77edd400c9f93a1b5923a4456281b7",
+  "final_list": "c70a5a0fc56e8e0757f59d466292460fb2fda118f3d448807771f324b4d56a8c",
+  "beacon_1": "261fbf07c77cd9c60eaf1fe9f1f839f1c80c8bde8ec38f606fde4e584d104234",
+  "beacon_2": "40c3ca4bb3342aed783f46e384b340327c6496f9c3dd19897fed46050585f2de",
+  "difficulty": "16672005803844171",
+  "ledger": "4b25079ab769d807b47dbedbaf770b0d377dd9a2490ef789db3b0182d0990fa3",
+  "code": "0d4fdc79b3e67f76089b7239cbe1188fb12fb3f686fcc0fb1eb44e255d3d3ec8"
  },
  "holders": [
   {
@@ -26,11 +28,6 @@
  "steps_per_second": 250000,
  "segment_bytes": 16777216,
  "time": "vdf",
- "checkpoints": [
-  [
-   1000,
-   "68edf4355fafff5acace91b5f82b56c508e8ae47e863c32dce9334b0ae2816f1"
-  ]
- ],
- "_checkpoints": "Release checkpoints (§15 step 18): each release adds the newest settled block, so a new or long-offline arcade takes only the branch through them."
+ "_checkpoints": "Release checkpoints (§15 step 18): each release adds the newest settled block of this chain.",
+ "checkpoints": []
 }
