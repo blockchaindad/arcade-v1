@@ -687,6 +687,27 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
             };
         }
     }
+    // A blob of the ARCADE chain by its id (§15 step 5: apps and games load their parts from here), when the chain holds a
+    // blob of that id: fetched from linked arcades if it isn't here, and kept in the viewer cache.
+    if let ["content", id] = seg.as_slice() {
+        if let Some(bid) = (id.len() == 64).then(|| hex::decode(id).ok()).flatten().and_then(|b| <[u8; 32]>::try_from(b).ok()).filter(crate::arcsvc::holds_blob) {
+            return match crate::arcblob::view(&bid) {
+                Some(bytes) => respond(
+                    &mut s,
+                    "200 OK",
+                    &crate::arcblob::kind_of(&bid).filter(|k| !k.is_empty()).unwrap_or_else(|| "application/octet-stream".into()),
+                    &[
+                        ("ETag", format!("\"{id}\"")),
+                        ("Cache-Control", "public, max-age=31536000, immutable".into()),
+                        ("Content-Security-Policy", CONTENT_CSP.into()),
+                        ("Access-Control-Allow-Origin", "*".into()),
+                    ],
+                    if r.method == "HEAD" { &[] } else { &bytes },
+                ),
+                None => respond(&mut s, "404 Not Found", "text/plain", &[], b"that blob is on the ARCADE chain, but no arcade linked to this one has it\n"),
+            };
+        }
+    }
     match seg.as_slice() {
         // An ord inscription by its id (the pictures and pages a site names; the arcade ledger's
         // own content is asked by txid or number below).

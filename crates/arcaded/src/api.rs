@@ -609,6 +609,18 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             let (files, bytes) = crate::arcblob::cache_use();
             Ok(serde_json::json!({"mb": crate::arcblob::cache_limit() >> 20, "on": crate::arcblob::cache_limit() > 0, "files": files, "bytes": bytes}))
         }
+        // Several blobs in one transaction: `files` [{path, type, class?, gzip?}], `send`.
+        "arc.blob_publish_many" => {
+            let mut items = Vec::new();
+            for f in req["files"].as_array().ok_or("files required")? {
+                let path = f["path"].as_str().ok_or("each file needs its path")?;
+                let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+                let class = arcade_arc::blob::Class::from_u8(f["class"].as_u64().unwrap_or(0) as u8).ok_or("class is 0 to 3")?;
+                let enc = if f["gzip"] == true { arcade_arc::blob::Encoding::Gzip } else { arcade_arc::blob::Encoding::Plain };
+                items.push((bytes, f["type"].as_str().unwrap_or("application/octet-stream").to_string(), class, enc));
+            }
+            crate::coinsend::publish_blobs(node, &items, req["send"] == true)
+        }
         // Keep every blob's plain copy (an archive node), or let the classes drop them (§15 step 3).
         "arc.archive" => {
             if let Some(on) = req["on"].as_bool() {

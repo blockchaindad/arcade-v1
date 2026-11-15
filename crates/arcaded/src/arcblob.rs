@@ -205,9 +205,12 @@ pub fn view(id: &Hash) -> Option<Vec<u8>> {
     }
     let net = crate::arcsvc::svc_net()?;
     for peer in crate::arcsvc::linked_peers() {
-        if let Ok(b) = fetch_from(&peer, id) {
+        if let Ok((b, kind)) = fetch_from(&peer, id) {
             if arcade_arc::blob::id_of_bytes(&net, &b) == *id {
                 cache_put(id, &b);
+                if !kind.is_empty() {
+                    let _ = std::fs::write(cache_dir().join(format!("{}.kind", hex::encode(id))), &kind);
+                }
                 return Some(b);
             }
         }
@@ -215,12 +218,17 @@ pub fn view(id: &Hash) -> Option<Vec<u8>> {
     None
 }
 
+/// A blob's content type: from its record (the store's meta), else what the arcade it was fetched from said.
+pub fn kind_of(id: &Hash) -> Option<String> {
+    meta(id).map(|m| m.kind).or_else(|| std::fs::read_to_string(cache_dir().join(format!("{}.kind", hex::encode(id)))).ok())
+}
+
 /// Bytes of a blob per answer piece (a mesh frame is 64 KiB at most, head and blob).
 const PIECE: u64 = 48_000;
 /// Pieces asked for at once.
 const WINDOW: usize = 16;
 
-fn fetch_from(peer: &str, id: &Hash) -> Result<Vec<u8>, String> {
+fn fetch_from(peer: &str, id: &Hash) -> Result<(Vec<u8>, String), String> {
     use crate::crsource::Pipe;
     use arcade_mesh::link::Frame;
     use std::time::{Duration, Instant};
@@ -243,6 +251,7 @@ fn fetch_from(peer: &str, id: &Hash) -> Result<Vec<u8>, String> {
             return Err(e.to_string());
         }
         let len = f.head["len"].as_u64().ok_or("no length")?;
+        let kind = f.head["kind"].as_str().unwrap_or("").chars().take(arcade_arc::blob::MAX_TYPE).collect::<String>();
         if len as usize > arcade_arc::blob::MAX_BLOB_BYTES {
             return Err("too big".into());
         }
@@ -253,7 +262,7 @@ fn fetch_from(peer: &str, id: &Hash) -> Result<Vec<u8>, String> {
         out.extend_from_slice(&f.blob);
         if out.len() as u64 >= len {
             out.truncate(len as usize);
-            return Ok(out);
+            return Ok((out, kind));
         }
     }
     Err("no answer".into())
@@ -264,10 +273,12 @@ pub fn serve_piece(link: &mut arcade_mesh::link::Link, head: &serde_json::Value)
     let id_n = head["id"].as_u64().unwrap_or(0);
     let at = head["at"].as_u64().unwrap_or(0);
     let bytes = head["b"].as_str().and_then(|s| hex::decode(s).ok()).and_then(|b| <Hash>::try_from(b).ok()).and_then(|id| get(&id).or_else(|| cached(&id)));
+    let kind = head["b"].as_str().and_then(|s| hex::decode(s).ok()).and_then(|b| <Hash>::try_from(b).ok()).and_then(|id| kind_of(&id));
     let mut f = crate::arcsvc::keeper_frame("a", serde_json::json!({"id": id_n}));
     match bytes {
         Some(b) => {
             f.head["len"] = serde_json::json!(b.len());
+            f.head["kind"] = serde_json::json!(kind.unwrap_or_default());
             let from = (at as usize).min(b.len());
             f.blob = b[from..(from + PIECE as usize).min(b.len())].to_vec();
         }
