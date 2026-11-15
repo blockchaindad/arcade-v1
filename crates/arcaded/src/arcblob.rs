@@ -449,3 +449,62 @@ pub fn on_piece(net: &Net, peer: &str, head: &serde_json::Value, blob: &[u8]) {
         }
     }
 }
+
+// ---------------- files bigger than a block (Martin 2026-11-14: a full-length movie) ----------------
+
+/// The type of a file manifest: a blob naming a file's parts in order (`scripts/file-publish.py` makes it).
+pub const FILE_MANIFEST: &str = "application/vnd.arcade.file+json";
+/// Most bytes of one file (Martin 2026-11-14: up to 1 GB, for whoever pays its blobs).
+pub const MAX_FILE_BYTES: u64 = 1 << 30;
+
+/// A file made of blobs: `{"arcade": "file", "type", "size", "sha256", "parts": [[blob id, length], ...]}`.
+pub struct FileManifest {
+    pub kind: String,
+    pub size: u64,
+    pub parts: Vec<(Hash, u64)>,
+}
+
+/// The file manifest blob `id` is, if it is one (its parts add up to its size, each a blob the chain holds).
+pub fn file_manifest(id: &Hash) -> Option<FileManifest> {
+    if kind_of(id).as_deref() != Some(FILE_MANIFEST) {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&view(id)?).ok()?;
+    if v["arcade"] != "file" {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for p in v["parts"].as_array()? {
+        let h: Hash = hex::decode(p[0].as_str()?).ok()?.try_into().ok()?;
+        parts.push((h, p[1].as_u64()?));
+    }
+    let size = v["size"].as_u64()?;
+    if size > MAX_FILE_BYTES || parts.iter().map(|p| p.1).sum::<u64>() != size || !parts.iter().all(|p| crate::arcsvc::holds_blob(&p.0)) {
+        return None;
+    }
+    Some(FileManifest { kind: v["type"].as_str().unwrap_or("application/octet-stream").chars().take(arcade_arc::blob::MAX_TYPE).collect(), size, parts })
+}
+
+/// Bytes `from..=to` of a file, part by part, each handed to `out` as it is read (fetched from linked arcades when it
+/// isn't here, and kept in the viewer cache, so a film many watch spreads as any blob does). False when a part can't
+/// be had.
+pub fn file_range(f: &FileManifest, from: u64, to: u64, mut out: impl FnMut(&[u8]) -> bool) -> bool {
+    let mut at = 0u64;
+    for (id, len) in &f.parts {
+        let (start, end) = (at, at + len);
+        at = end;
+        if end <= from || start > to {
+            continue;
+        }
+        let Some(b) = view(id) else { return false };
+        if b.len() as u64 != *len {
+            return false;
+        }
+        let a = from.saturating_sub(start) as usize;
+        let z = ((to + 1).min(end) - start) as usize;
+        if !out(&b[a..z]) {
+            return false;
+        }
+    }
+    true
+}
