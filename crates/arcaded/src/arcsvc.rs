@@ -434,6 +434,9 @@ pub fn reconcile<T: TimeProofs, S: Storage>(db: &ChainDb, p: &ChainParams, chain
 /// Hand a block to the chain; a new tip goes to the store (the chain's one copy on disk: a side
 /// block is kept in memory only, and comes again from other arcades after a restart).
 fn take(node: &Node, svc: &Svc, block: Block) -> Result<Accepted, ChainError> {
+    // A block from a peer comes decoded without its blob ids (they follow from its bytes and the network): made here,
+    // so its blobs' bytes are kept below as well as checked by the chain.
+    let block = block.with_blob_ids(&svc.net);
     let mut st = svc.st.lock().unwrap();
     if svc.stop.load(Ordering::Relaxed) {
         return Ok(Accepted::Known);
@@ -882,6 +885,10 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
     let dir = node.home.join("arc").join(net.key);
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     crate::arcblob::init(dir.join("blobs"));
+    crate::arcblob::set_boost_secs(s.blob_temporary);
+    if let Some(mb) = node.app.store.read(|r| r.get(arcade_app::META, b"arc_cache_mb")).ok().flatten().and_then(|v| String::from_utf8(v).ok()?.parse::<u64>().ok()) {
+        crate::arcblob::set_cache_limit(mb << 20);
+    }
     {
         // A dropped plain copy is read back from this arcade's sealed replica of the blob family.
         let (n, net2) = (Arc::downgrade(node), net);
@@ -1284,6 +1291,8 @@ pub fn on_frame(node: &Node, link: &mut Link, f: &Frame) -> Result<(), LinkError
         "txs" => on_txs(svc, link, f)?,
         // A waiting blob ahead of the transactions that bring it (crate::arcblob).
         "bl" => crate::arcblob::on_piece(&svc.net, &link.peer_id, &f.head, &f.blob),
+        // A blob piece asked of this arcade (a viewer's arcade fetching it, crate::arcblob::view).
+        "bq" => crate::arcblob::serve_piece(link, &f.head)?,
         "it" => {
             crate::arcseg::on_items(&svc.net, &f.blob);
         }
@@ -1613,6 +1622,13 @@ pub fn spender(at: &OutPoint) -> Option<Hash256> {
 }
 
 /// A wallet's signed transaction: into the pool, from where it goes to the other arcades.
+/// The arcades linked now that speak the ARCADE chain (seen lately, with a mesh link up), to ask for a blob.
+pub fn linked_peers() -> Vec<String> {
+    let Some(svc) = svc() else { return Vec::new() };
+    let peers = svc.peers.lock().unwrap();
+    peers.iter().filter(|(id, p)| p.seen.is_some_and(|t| t.elapsed() < LINKED) && crate::crvia::linked(id)).map(|(id, _)| id.clone()).collect()
+}
+
 /// The running ARCADE chain's network.
 pub fn svc_net() -> Option<Net> {
     svc().map(|s| s.net)
@@ -1626,7 +1642,8 @@ pub fn holds_blob(id: &arcade_arc::merkle::Hash) -> bool {
 /// `arc.blob {id}`: a blob's bytes (hex) and whether the chain holds it.
 pub fn blob(req: &Value) -> Result<Value, String> {
     let id: arcade_arc::merkle::Hash = req["id"].as_str().and_then(|s| hex::decode(s).ok()).and_then(|b| b.try_into().ok()).ok_or("id required (64 hex)")?;
-    let bytes = crate::arcblob::get(&id).ok_or("no such blob here")?;
+    // Fetched from the arcades this one is linked to when it isn't here (kept in the viewer cache).
+    let bytes = crate::arcblob::view(&id).ok_or("no such blob here, nor at the arcades linked to this one")?;
     Ok(json!({"id": hex::encode(id), "bytes": bytes.len(), "on_chain": holds_blob(&id), "hex": hex::encode(&bytes)}))
 }
 
@@ -1686,9 +1703,13 @@ pub fn blobs_unit_at(h: u64) -> Option<Vec<u8>> {
             // Temporary blobs aren't kept by the storage network (§15 step 3): not in the family.
             let id = st.chain.id_at(h)?;
             let b = st.chain.block(&id)?;
-            let temporary: std::collections::HashSet<arcade_arc::merkle::Hash> = b.txs.iter().flat_map(arcade_arc::blob::records)
-                .filter(|r| r.class == arcade_arc::blob::Class::Temporary).map(|r| r.id(&svc.net)).collect();
-            b.blob_ids.iter().filter(|i| !temporary.contains(*i)).copied().collect()
+            // A blob's class is the first record's that names it in the block.
+            let mut class: HashMap<arcade_arc::merkle::Hash, arcade_arc::blob::Class> = HashMap::new();
+            for r in b.txs.iter().skip(1).flat_map(arcade_arc::blob::records) {
+                class.entry(r.id(&svc.net)).or_insert(r.class);
+            }
+            use arcade_arc::blob::Class;
+            b.blob_ids.iter().filter(|i| !matches!(class.get(*i), Some(Class::Temporary | Class::Boost))).copied().collect()
         }
     };
     let mut out = Vec::new();
@@ -1745,8 +1766,12 @@ fn prune_blobs(node: &Node, svc: &Svc, temporary: u64) {
     }
     let (mut dropped, mut freed) = (0, 0u64);
     for (id, m) in known {
-        if m.class == Class::Temporary as u8 {
-            if m.time.saturating_add(temporary) <= now {
+        // Boosted (§15 step 4): kept plain until the boost runs out, whatever the class.
+        if m.boosted_until > now {
+            continue;
+        }
+        if m.class == Class::Temporary as u8 || m.class == Class::Boost as u8 {
+            if m.time.saturating_add(temporary).max(m.boosted_until) <= now {
                 freed += crate::arcblob::forget(&id);
                 dropped += 1;
             }

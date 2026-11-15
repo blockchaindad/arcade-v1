@@ -600,6 +600,15 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         "arc.keeper" => crate::arckeep::api(node, req),
         "arc.genesis" => crate::arcgenesis::status(node),
         "arc.blob" => crate::arcsvc::blob(req),
+        // The viewer cache (§15 step 4): its size in MB (0: off; on by default at 2,048) and what it holds.
+        "arc.cache" => {
+            if let Some(mb) = req["mb"].as_u64() {
+                node.app.store.write(|w| w.put(arcade_app::META, b"arc_cache_mb", mb.to_string().as_bytes())).map_err(|e| e.to_string())?;
+                crate::arcblob::set_cache_limit(mb << 20);
+            }
+            let (files, bytes) = crate::arcblob::cache_use();
+            Ok(serde_json::json!({"mb": crate::arcblob::cache_limit() >> 20, "on": crate::arcblob::cache_limit() > 0, "files": files, "bytes": bytes}))
+        }
         // Keep every blob's plain copy (an archive node), or let the classes drop them (§15 step 3).
         "arc.archive" => {
             if let Some(on) = req["on"].as_bool() {

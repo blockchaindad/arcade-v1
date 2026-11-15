@@ -35,6 +35,9 @@ pub enum Class {
     Release = 1,
     /// Kept a set time (90 days).
     Temporary = 2,
+    /// A boost (§15 step 4): paying again for a blob, at its full blob fee whether or not the chain holds it, so full
+    /// nodes keep it plain 90 more days. A blob a boost brings first is kept as a Temporary one.
+    Boost = 3,
 }
 
 impl Class {
@@ -43,6 +46,7 @@ impl Class {
             0 => Some(Class::Permanent),
             1 => Some(Class::Release),
             2 => Some(Class::Temporary),
+            3 => Some(Class::Boost),
             _ => None,
         }
     }
@@ -199,7 +203,7 @@ mod tests {
         let mut trailing = s.clone();
         trailing.push(0);
         assert!(Record::parse(&trailing).is_none());
-        assert!(Class::from_u8(3).is_none() && Encoding::from_u8(2).is_none());
+        assert!(Class::from_u8(4).is_none() && Encoding::from_u8(2).is_none());
         // The fee: 0.01 ARCADE a started kB.
         assert_eq!(fee_for(1), BLOB_FEE_PER_KB);
         assert_eq!(fee_for(1_000), BLOB_FEE_PER_KB);

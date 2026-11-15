@@ -776,8 +776,12 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
             let mut bytes = 0u64;
             for r in crate::blob::records(tx) {
                 let id = r.id(&self.net);
-                if !self.blobs.contains(&id) && here.insert(id) {
+                let brings = !self.blobs.contains(&id) && here.insert(id);
+                if brings {
                     want.push(id);
+                }
+                // A boost pays the full blob fee whether it brings the bytes or not (§15 step 4).
+                if brings || r.class == crate::blob::Class::Boost {
                     bytes += r.len;
                 }
             }

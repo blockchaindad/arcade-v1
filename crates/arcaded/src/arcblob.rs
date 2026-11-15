@@ -78,6 +78,16 @@ pub struct Meta {
     pub height: u64,
     pub time: u64,
     pub line: String,
+    /// Kept plain until then, whatever the class: boosts (class 3 records) push it 90 days past their block.
+    #[serde(default)]
+    pub boosted_until: u64,
+}
+
+/// How long a boost keeps a blob plain (the Temporary time: 90 days; local test chains less).
+static BOOST_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(90 * 24 * 3600);
+
+pub fn set_boost_secs(s: u64) {
+    BOOST_SECS.store(s, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn meta_path(id: &Hash) -> PathBuf {
@@ -119,6 +129,151 @@ pub fn split_unit(unit: &[u8]) -> Vec<Vec<u8>> {
         out.push(b.to_vec());
     }
     out
+}
+
+// ---------------- the viewer cache (§15 step 4) ----------------
+
+/// The cache's size limit in bytes (Options; 0: off). On by default at 2 GB (Martin 2026-11-14).
+static CACHE_LIMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(2 << 30);
+
+pub fn set_cache_limit(bytes: u64) {
+    CACHE_LIMIT.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn cache_limit() -> u64 {
+    CACHE_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn cache_dir() -> PathBuf {
+    dir().join("cache")
+}
+
+/// A blob from the cache (touched, so the cache drops what isn't viewed first).
+fn cached(id: &Hash) -> Option<Vec<u8>> {
+    let p = cache_dir().join(hex::encode(id));
+    let b = std::fs::read(&p).ok()?;
+    if let Ok(f) = std::fs::File::options().append(true).open(&p) {
+        let _ = f.set_modified(std::time::SystemTime::now());
+    }
+    Some(b)
+}
+
+/// The cache's (files, bytes).
+pub fn cache_use() -> (u64, u64) {
+    let Ok(rd) = std::fs::read_dir(cache_dir()) else { return (0, 0) };
+    rd.flatten().filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).fold((0, 0), |(n, b), m| (n + 1, b + m.len()))
+}
+
+/// Keep a fetched blob in the cache, then drop the least recently viewed while over the limit.
+fn cache_put(id: &Hash, bytes: &[u8]) {
+    let limit = cache_limit();
+    if limit == 0 || bytes.len() as u64 > limit {
+        return;
+    }
+    let d = cache_dir();
+    let _ = std::fs::create_dir_all(&d);
+    let p = d.join(hex::encode(id));
+    if std::fs::write(p.with_extension("in"), bytes).and_then(|_| std::fs::rename(p.with_extension("in"), &p)).is_err() {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(&d) else { return };
+    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = rd.flatten()
+        .filter_map(|e| {
+            let m = e.metadata().ok()?;
+            if !m.is_file() {
+                return None;
+            }
+            Some((m.modified().ok()?, m.len(), e.path()))
+        })
+        .collect();
+    let mut total: u64 = files.iter().map(|f| f.1).sum();
+    files.sort_by_key(|f| f.0);
+    for (_, len, path) in files {
+        if total <= limit {
+            break;
+        }
+        let _ = std::fs::remove_file(path);
+        total -= len;
+    }
+}
+
+/// A blob for a viewer: here (stored, waiting, sealed, cached), else fetched from the arcades this one is linked to and
+/// kept in the cache, so a blob many view spreads to many arcades and leaves them when nobody views it any more.
+pub fn view(id: &Hash) -> Option<Vec<u8>> {
+    if let Some(b) = get(id).or_else(|| cached(id)) {
+        return Some(b);
+    }
+    let net = crate::arcsvc::svc_net()?;
+    for peer in crate::arcsvc::linked_peers() {
+        if let Ok(b) = fetch_from(&peer, id) {
+            if arcade_arc::blob::id_of_bytes(&net, &b) == *id {
+                cache_put(id, &b);
+                return Some(b);
+            }
+        }
+    }
+    None
+}
+
+/// Bytes of a blob per answer piece (a mesh frame is 64 KiB at most, head and blob).
+const PIECE: u64 = 48_000;
+/// Pieces asked for at once.
+const WINDOW: usize = 16;
+
+fn fetch_from(peer: &str, id: &Hash) -> Result<Vec<u8>, String> {
+    use crate::crsource::Pipe;
+    use arcade_mesh::link::Frame;
+    use std::time::{Duration, Instant};
+    let mut out: Vec<u8> = Vec::new();
+    let mut asked: std::collections::VecDeque<(u64, crate::crvia::Via)> = std::collections::VecDeque::new();
+    let (mut next, mut total) = (0u64, None::<u64>);
+    loop {
+        while asked.len() < WINDOW && total.is_none_or(|t| next < t) {
+            let mut via = crate::crvia::Via::open(peer)?;
+            via.send(&crate::arcsvc::keeper_frame("bq", serde_json::json!({"id": via.id, "b": hex::encode(id), "at": next})))?;
+            asked.push_back((next, via));
+            next += PIECE;
+            if total.is_none() {
+                break; // the first answer says how big it is
+            }
+        }
+        let Some((at, mut via)) = asked.pop_front() else { break };
+        let f: Frame = via.recv(Instant::now() + Duration::from_secs(20))?;
+        if let Some(e) = f.head["err"].as_str() {
+            return Err(e.to_string());
+        }
+        let len = f.head["len"].as_u64().ok_or("no length")?;
+        if len as usize > arcade_arc::blob::MAX_BLOB_BYTES {
+            return Err("too big".into());
+        }
+        total.get_or_insert(len);
+        if at != out.len() as u64 || f.blob.len() as u64 > PIECE {
+            return Err("pieces out of order".into());
+        }
+        out.extend_from_slice(&f.blob);
+        if out.len() as u64 >= len {
+            out.truncate(len as usize);
+            return Ok(out);
+        }
+    }
+    Err("no answer".into())
+}
+
+/// A `bq` frame: a piece of a blob this arcade has (stored, sealed or cached), answered `a` over the same link.
+pub fn serve_piece(link: &mut arcade_mesh::link::Link, head: &serde_json::Value) -> Result<(), arcade_mesh::link::LinkError> {
+    let id_n = head["id"].as_u64().unwrap_or(0);
+    let at = head["at"].as_u64().unwrap_or(0);
+    let bytes = head["b"].as_str().and_then(|s| hex::decode(s).ok()).and_then(|b| <Hash>::try_from(b).ok()).and_then(|id| get(&id).or_else(|| cached(&id)));
+    let mut f = crate::arcsvc::keeper_frame("a", serde_json::json!({"id": id_n}));
+    match bytes {
+        Some(b) => {
+            f.head["len"] = serde_json::json!(b.len());
+            let from = (at as usize).min(b.len());
+            f.blob = b[from..(from + PIECE as usize).min(b.len())].to_vec();
+        }
+        None => f.head["err"] = serde_json::json!("not here"),
+    }
+    link.send(&f)
 }
 
 /// Whether a blob's plain copy is here (not only sealed).
@@ -171,11 +326,25 @@ pub fn keep_block(net: &Net, block: &Block) {
             recs.entry(r.id(net)).or_insert((r, publisher.clone()));
         }
     }
+    // Boosts in this block push the blobs they name past their time (their meta, made below for a blob a boost brings).
+    let boost_until = block.header.time + BOOST_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    for tx in block.txs.iter().skip(1) {
+        for r in arcade_arc::blob::records(tx).into_iter().filter(|r| r.class == arcade_arc::blob::Class::Boost) {
+            let id = r.id(net);
+            if let Some(mut m) = meta(&id) {
+                if m.boosted_until < boost_until {
+                    m.boosted_until = boost_until;
+                    let _ = std::fs::write(meta_path(&id), serde_json::to_vec(&m).unwrap_or_default());
+                }
+            }
+        }
+    }
     for (id, (r, publisher)) in &recs {
         if block.blob_ids.contains(id) && !meta_path(id).exists() {
             use sha2::Digest;
             let line = hex::encode(&sha2::Sha256::digest([r.kind.as_bytes(), b"\0", publisher].concat())[..16]);
-            let m = Meta { class: r.class as u8, kind: r.kind.clone(), encoding: r.encoding as u8, height: block.header.height, time: block.header.time, line };
+            let boosted_until = if r.class == arcade_arc::blob::Class::Boost { boost_until } else { 0 };
+            let m = Meta { class: r.class as u8, kind: r.kind.clone(), encoding: r.encoding as u8, height: block.header.height, time: block.header.time, line, boosted_until };
             let _ = std::fs::write(meta_path(id), serde_json::to_vec(&m).unwrap_or_default());
         }
     }

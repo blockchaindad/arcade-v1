@@ -189,13 +189,16 @@ impl Pool {
         let fee = coins::check_spend(&tx, height, &View { base: coins, pool: self, height }, &mut checks)?;
         let bytes = tx.raw.len();
         let mut blobs: Vec<(crate::merkle::Hash, u64)> = Vec::new();
+        let mut boosted = 0u64;
         for r in crate::blob::records(&tx) {
             let id = r.id(net);
             if !held(&id) && !blobs.iter().any(|b| b.0 == id) {
                 blobs.push((id, r.len));
+            } else if r.class == crate::blob::Class::Boost {
+                boosted += r.len;
             }
         }
-        let blob_fee = crate::blob::fee_for(blobs.iter().map(|b| b.1).sum());
+        let blob_fee = crate::blob::fee_for(blobs.iter().map(|b| b.1).sum::<u64>() + boosted);
         if fee < blob_fee {
             return Err(PoolError::LowBlobFee);
         }
