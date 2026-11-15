@@ -4,12 +4,15 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; iex ((New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/martinseeger2002/arcade-v1/main/scripts/uninstall.ps1'))"
 #
 # It asks you to type DELETE first. Without a way to ask, it removes nothing unless
-# ARCADE_UNINSTALL_YES=1 is set. ARCADE_HOME, when set, is the data folder; otherwise the
+# ARCADE_UNINSTALL_YES=1 is set. --keep-data removes only the programs, the login task and the
+# shortcuts, asks nothing, and leaves the data folder (wallet, 12 words, chains) where it is: the
+# Setup.exe's uninstaller (Settings > Apps) runs it that way. ARCADE_HOME, when set, is the data folder; otherwise the
 # folder recorded at install time (%LOCALAPPDATA%\Programs\Arcade\home.txt), otherwise
 # %LOCALAPPDATA%\arcade.
 
 $ErrorActionPreference = 'Stop'
 $TaskName = 'Arcade V1.0'
+$KeepData = (@($args) -contains '--keep-data')
 
 function Say([string]$Msg) { Write-Host $Msg -ForegroundColor Cyan }
 
@@ -53,17 +56,20 @@ function Test-SafeToDelete([string]$Path) {
     return $true
 }
 
-if (-not (Test-SafeToDelete $DataDir)) {
+if (-not $KeepData -and -not (Test-SafeToDelete $DataDir)) {
     Write-Host "Refusing: the data folder would be $DataDir."
     exit 1
 }
 
 $size = ''
-if (Test-Path -LiteralPath $DataDir) {
+if ($KeepData) {
+    Say "Removing the Arcade V1.0 programs. Your data stays in ${DataDir}."
+} elseif (Test-Path -LiteralPath $DataDir) {
     $sum = (Get-ChildItem -LiteralPath $DataDir -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
     if ($sum) { $size = (' ({0:N0} MB)' -f ($sum / 1MB)) }
 }
 
+if (-not $KeepData) {
 Say "This removes Arcade V1.0 completely from this computer:"
 Write-Host "  - the programs, the Start menu shortcut, and the login task"
 Write-Host "  - your data in ${DataDir}${size}:"
@@ -77,8 +83,10 @@ if (Test-Path (Join-Path $DataDir 'arcade.mdbx')) {
     Write-Host ""
 }
 
+}
+
 $answer = ''
-if ($env:ARCADE_UNINSTALL_YES -eq '1') {
+if ($KeepData -or $env:ARCADE_UNINSTALL_YES -eq '1') {
     $answer = 'DELETE'
 } else {
     try {
@@ -109,7 +117,8 @@ Get-Process -Name 'arcaded','arcade-desktop' -ErrorAction SilentlyContinue | Sto
 
 $startup = Join-Path ([Environment]::GetFolderPath('Startup')) 'Arcade V1.0.lnk'
 $menu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Arcade V1.0.lnk'
-Remove-Item -LiteralPath $startup, $menu -Force -ErrorAction SilentlyContinue
+$desktop = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Arcade V1.0.lnk'
+Remove-Item -LiteralPath $startup, $menu, $desktop -Force -ErrorAction SilentlyContinue
 
 $cur = [Environment]::GetEnvironmentVariable('Path', 'User')
 if ($cur) {
@@ -122,6 +131,10 @@ if ($cur) {
 }
 
 if (Test-Path -LiteralPath $bin) { Remove-Item -LiteralPath $bin -Recurse -Force }
+if ($KeepData) {
+    Say "Arcade V1.0's programs are removed. Your wallet, its 12 words and your chains are still in ${DataDir}: installing again picks them up."
+    exit 0
+}
 if (Test-Path -LiteralPath $DataDir) { Remove-Item -LiteralPath $DataDir -Recurse -Force }
 foreach ($extra in @('arcade-v1-src', 'arcade-v1-cache')) {
     $p = Join-Path $local $extra

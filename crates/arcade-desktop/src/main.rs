@@ -16,7 +16,13 @@ fn api(req: Value) -> Value {
     let sock = arcade_local::socket_path(&home());
     let mut s = match UnixStream::connect(&sock) {
         Ok(s) => s,
-        Err(e) => return json!({"ok": false, "error": format!("the arcade service is not running ({}: {e})", sock.display())}),
+        Err(e) => {
+            #[cfg(windows)]
+            if start_service() {
+                return json!({"ok": false, "error": "starting the arcade service", "starting": true});
+            }
+            return json!({"ok": false, "error": format!("the arcade service is not running ({}: {e})", sock.display())});
+        }
     };
     if writeln!(s, "{req}").is_err() {
         return json!({"ok": false, "error": "could not talk to the arcade service"});
@@ -24,6 +30,56 @@ fn api(req: Value) -> Value {
     let mut line = String::new();
     let _ = BufReader::new(s).read_line(&mut line);
     serde_json::from_str(&line).unwrap_or(json!({"ok": false, "error": "bad reply from the arcade service"}))
+}
+
+/// Windows: the window opened but arcaded isn't running (stopped, not started yet after login,
+/// or the app was opened straight from the unzipped download). Start it, at most once a minute:
+/// the installer's login task first, then its hidden starter, then arcaded.exe beside this
+/// program with the app's own data folder. True while a start is under way (90 s), so the window
+/// says "starting" instead of "not running".
+#[cfg(windows)]
+fn start_service() -> bool {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(t) = *last {
+        if t.elapsed() < Duration::from_secs(60) {
+            return t.elapsed() < Duration::from_secs(90);
+        }
+    }
+    let quiet = |c: &mut Command| {
+        c.creation_flags(CREATE_NO_WINDOW).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    };
+    let mut task = Command::new("schtasks");
+    task.args(["/Run", "/TN", "Arcade V1.0"]);
+    quiet(&mut task);
+    let started = task.status().is_ok_and(|s| s.success()) || {
+        let dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        let windir = std::env::var_os("SystemRoot").map(std::path::PathBuf::from).unwrap_or_else(|| "C:\\Windows".into());
+        match dir {
+            Some(d) if d.join("arcaded-hidden.vbs").exists() => {
+                let mut c = Command::new(windir.join("System32").join("wscript.exe"));
+                c.arg("//B").arg(d.join("arcaded-hidden.vbs"));
+                quiet(&mut c);
+                c.spawn().is_ok()
+            }
+            Some(d) if d.join("arcaded.exe").exists() => {
+                let home = home();
+                let _ = std::fs::create_dir_all(&home);
+                let mut c = Command::new(d.join("arcaded.exe"));
+                c.arg("--home").arg(&home).current_dir(&home);
+                quiet(&mut c);
+                c.spawn().is_ok()
+            }
+            _ => false,
+        }
+    };
+    *last = Some(Instant::now());
+    started
 }
 
 fn pct(s: &str) -> String {
