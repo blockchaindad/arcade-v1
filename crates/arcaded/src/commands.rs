@@ -153,6 +153,18 @@ cmds! {
     "ledger.announce" Wallet "" "Publish this wallet's profile (messaging key under its @tag) on the ARCADE chain.";
     "ledger.profile" Read "address | tag" "A profile and @tag as the ARCADE chain's ledger holds them.";
     "ledger.send" Wallet "hex" "Send one arcade record (the whole payload after the marker) on the ARCADE chain.";
+    "arc.blob" Read "id" "A blob of the ARCADE chain (hex), fetched from linked arcades when it isn't here.";
+    "arc.blob_publish" Wallet "path | hex, type, class?, gzip?, send?" "Put a file on the ARCADE chain as a blob (0.01 ARCADE a kB).";
+    "a.profile" Read "tag? | address?" "A profile card on the ARCADE chain (yours when neither), with follower counts.";
+    "a.profile_set" Wallet "name?, bio?, url?, picture?, addresses?" "Publish your profile on the ARCADE chain (A://).";
+    "a.follow" Wallet "tag" "Follow an @tag on the ARCADE chain.";
+    "a.unfollow" Wallet "tag" "Stop following an @tag.";
+    "a.follows" Read "tag? | address?" "Who it follows and who follows it (yours when neither).";
+    "a.contacts" Wallet "" "Your address book, opened with your key.";
+    "a.contact_save" Wallet "id?, name, tag?, addresses, note?" "Save an address book entry (encrypted to your own key).";
+    "a.contact_delete" Wallet "id" "Remove an address book entry.";
+    "a.post" Wallet "text" "Post to your followers on the ARCADE chain.";
+    "a.posts" Read "tag? | address? | following?, limit?" "Posts, newest first.";
     "ledger.balances" Read "address" "An address's arcade token balances on the ARCADE chain (free, reserved, offered, accepted).";
     "ledger.tag_commit" Wallet "tag" "Commit ahead to claiming a released @tag on the ARCADE chain.";
     "ledger.tag_checkin" Wallet "" "Keep this wallet's @tag on the ARCADE chain with a check-in (0.1 ARCADE into the pot).";

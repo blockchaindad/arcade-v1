@@ -3,6 +3,7 @@
 
 pub mod address;
 pub mod amount;
+pub mod aproto;
 pub mod collections;
 pub mod collreg;
 pub mod cards;

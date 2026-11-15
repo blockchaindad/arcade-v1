@@ -541,3 +541,32 @@ button.linkish { border: 0; background: none; padding: 0; font-size: 11px; color
 .ap-rate .ap-dist .bar { height: 0.55em; background: var(--line); border-radius: 99px; overflow: hidden; }
 .ap-rate .ap-dist .bar > i { display: block; height: 100%; background: #d9a300; }
 .ap-rate .row { gap: 0.4em; flex-wrap: wrap; align-items: center; margin-top: 0.5em; }
+
+/* People (A://) */
+.pp-sub { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+.pp-sub button { border-radius: 999px; padding: 6px 12px; color: var(--muted); }
+.pp-sub button.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+.pp-two { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 14px; align-items: start; }
+@media (max-width: 720px) { .pp-two { grid-template-columns: 1fr; } }
+#people label.k { display: block; margin: 12px 0 4px; }
+#people input:not([type=file]):not([type=checkbox]), #people textarea { width: 100%; }
+.pp-addrs { display: grid; gap: 6px; }
+.pp-addr { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: 8px; align-items: center; }
+.pp-fee { display: flex; justify-content: space-between; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+.pp-banner { background: var(--warn-bg); border: 1px solid var(--warn-line); border-radius: 10px; padding: 10px 12px; margin: 10px 0 14px; }
+.pp-lock { border: 1px solid var(--accent); border-radius: 10px; padding: 10px 12px; margin: 10px 0 14px; }
+.pp-av { width: 56px; height: 56px; border-radius: 14px; flex: none; display: grid; place-items: center; font-weight: 700; font-size: 20px; color: #fff; background: var(--accent); object-fit: cover; }
+.pp-av.sm { width: 36px; height: 36px; border-radius: 10px; font-size: 14px; }
+.pp-prof { display: flex; gap: 14px; align-items: center; }
+.pp-prof .name { font-size: 18px; font-weight: 650; overflow-wrap: anywhere; }
+.pp-tag { color: var(--accent); }
+.pp-stats { display: flex; gap: 18px; margin-top: 12px; }
+.pp-stats b { display: block; font-size: 17px; font-variant-numeric: tabular-nums; }
+.pp-person { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.pp-person:last-child { border-bottom: 0; }
+.pp-h2 { margin-top: 0; }
+.pp-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.pp-table th { text-align: left; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; padding: 8px; border-bottom: 1px solid var(--line); }
+.pp-table td { padding: 8px; border-bottom: 1px solid var(--line); vertical-align: top; overflow-wrap: anywhere; }
+.tablewrap { overflow-x: auto; }
+#people .row > input:not([type=file]) { flex: 1; width: auto; min-width: 12em; }

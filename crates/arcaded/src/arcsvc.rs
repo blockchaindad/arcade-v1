@@ -2281,7 +2281,8 @@ pub fn earn(node: &Node, req: &Value) -> Result<Value, String> {
         crate::arcseg::set_earn(node, key, on)?;
         let _ = node.app.event("chains", &format!("Earn ARCADE {} for {}", if on { "on" } else { "off" }, p.name));
     }
-    let on = crate::arcseg::earn_on(node, key);
+    // On by default for a coin kept in full; a coin kept otherwise can't be sealed, so it shows off.
+    let on = crate::arcseg::earn_on(node, key) && node.mode_of(key).as_deref() == Some("full");
     let Some(svc) = svc() else { return Ok(json!({"chain": key, "on": on, "running": false})) };
     let (sealed, of) = crate::arcseg::earn_progress(node, &svc.net, p);
     let me = node.identity.verifying_key().to_bytes();

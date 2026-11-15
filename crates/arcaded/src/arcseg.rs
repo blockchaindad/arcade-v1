@@ -403,9 +403,10 @@ fn earn_key(chain: &str) -> Vec<u8> {
     format!("arc_earn:{chain}").into_bytes()
 }
 
-/// Whether the operator switched Earn ARCADE on for this coin.
+/// Whether Earn ARCADE is on for this coin: on by default for every coin kept here in full (Martin 2026-11-15: "make
+/// earn on by default for every chain we keep"); off only when the operator switched it off.
 pub fn earn_on(node: &Node, chain: &str) -> bool {
-    node.app.store.read(|r| r.get(arcade_app::META, &earn_key(chain))).ok().flatten().is_some_and(|v| v == b"1")
+    node.app.store.read(|r| r.get(arcade_app::META, &earn_key(chain))).ok().flatten().is_none_or(|v| v == b"1")
 }
 
 pub fn set_earn(node: &Node, chain: &str, on: bool) -> Result<(), String> {

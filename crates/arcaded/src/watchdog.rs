@@ -228,6 +228,10 @@ pub fn spawn(node: Arc<Node>, run: Arc<ChainRun>) {
 
 fn watch(node: Arc<Node>, run: Arc<ChainRun>) {
     let p = run.params;
+    // Headers only (light, §15 step 15): no blocks to stall on; its loop dials another peer itself when one fails.
+    if run.mode == "light" {
+        return;
+    }
     // A flag left by an older version (Addresses removed mid-build) holds every index walk.
     if node.chain.repair_txs_pending(p.chain_no).unwrap_or(false) {
         let _ = node.app.event("chains", &format!("{}: watchdog cleared a stale txs_pending flag (no address build waiting, log empty): index walks go on", p.key));
