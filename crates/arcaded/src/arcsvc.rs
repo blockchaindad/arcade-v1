@@ -323,6 +323,9 @@ struct Peer {
     /// When its link last ticked.
     seen: Option<Instant>,
     asked: Option<Instant>,
+    /// When the last frame of the answer to our ask came: an answer still coming in is never asked over (a catch-up
+    /// with megabytes of blobs takes longer than ASK_AGAIN under load, and asking again threw its frames away, for good).
+    answer_at: Option<Instant>,
     ask_id: u64,
     /// The answer being put together: next frame number, bytes so far.
     parts: Option<(u64, Vec<u8>)>,
@@ -1280,6 +1283,7 @@ fn ask(svc: &Svc, link: &mut Link) -> Result<(), LinkError> {
         let p = peers.entry(link.peer_id.clone()).or_default();
         p.ask_id += 1;
         p.asked = Some(Instant::now());
+        p.answer_at = None;
         p.parts = Some((0, Vec::new()));
         p.ask_id
     };
@@ -1352,6 +1356,7 @@ fn on_answer(node: &Node, svc: &Svc, link: &mut Link, f: &Frame) -> Result<(), L
         }
         *next += 1;
         bytes.extend_from_slice(&f.blob);
+        p.answer_at = Some(Instant::now());
         if f.head["end"] != true {
             return Ok(());
         }
@@ -1417,7 +1422,9 @@ pub fn on_frame(node: &Node, link: &mut Link, f: &Frame) -> Result<(), LinkError
                 p.heard = true;
                 p.wants = (!have).then_some(id);
                 // While an ask is out, its answer decides whether to ask again.
-                !have && p.asked.is_none_or(|t| t.elapsed() > ASK_AGAIN)
+                // An answer still arriving is waited for: only one that stalled is asked over.
+                let streaming = p.parts.is_some() && p.answer_at.is_some_and(|t| t.elapsed() <= ASK_AGAIN);
+                !have && !streaming && p.asked.is_none_or(|t| t.elapsed() > ASK_AGAIN)
             };
             if ask_now {
                 ask(svc, link)?;
@@ -1618,7 +1625,8 @@ pub fn tick(_node: &Node, link: &mut Link) -> Result<(), LinkError> {
         p.said = Some(id);
         let first = say && !p.greeted;
         p.greeted |= say;
-        (say, first, p.wants.is_some() && p.asked.is_none_or(|t| t.elapsed() > ASK_AGAIN))
+        let streaming = p.parts.is_some() && p.answer_at.is_some_and(|t| t.elapsed() <= ASK_AGAIN);
+        (say, first, p.wants.is_some() && !streaming && p.asked.is_none_or(|t| t.elapsed() > ASK_AGAIN))
     };
     if say {
         link.send(&frame(svc, "tip", json!({"id": id.to_hex(), "h": height, "w": total, "new": first})))?;

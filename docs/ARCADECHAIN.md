@@ -977,7 +977,7 @@ mainnet. Marked *(default)* where Martin has not said yes.
 | Step | Status |
 |---|---|
 | 1 | built: chain unit test and local three-arcade net pass (blobnet: publish, hold byte for byte, relay, named again free, refused without bytes, restart); live testnet with the rules version 3 release |
-| 2 | built; the long local storage run (blob segments sealed, registered, audited) under way |
+| 2 | built; stornet passes: the blob family's segment listed, every arcade's replica registered, audits passing for three periods, pay accruing to all three owners (and paid at their turns) |
 | 3 | built; prunenet passes: Temporary dropped, Permanent and the newest Releases kept, the archive keeps all, a late arcade gets the Permanent blob and not the expired one |
 | 4 | built (viewer cache on by default, its size in Options; boosts) |
 | 5 | built; ashnet passes: ASHVALE's 128 modules in one transaction (39.2 ARCADE), its launcher a blob, booted to character creation from blobs only on an arcade that published nothing |
