@@ -971,7 +971,46 @@ mainnet. Marked *(default)* where Martin has not said yes.
 | Step | Status |
 |---|---|
 | 1 | built: chain unit test and local three-arcade net pass (blobnet: publish, hold byte for byte, relay, named again free, refused without bytes, restart); live testnet with the rules version 3 release |
-| 2–22 | todo |
+| 2 | built; the long local storage run (blob segments sealed, registered, audited) under way |
+| 3 | built; prunenet passes: Temporary dropped, Permanent and the newest Releases kept, the archive keeps all, a late arcade gets the Permanent blob and not the expired one |
+| 4 | built (viewer cache on by default, its size in Options; boosts) |
+| 5 | built; ashnet passes: ASHVALE's 128 modules in one transaction (39.2 ARCADE), its launcher a blob, booted to character creation from blobs only on an arcade that published nothing |
+| 6 | built; gitnet passes: arcade-v1's 577-commit history pushed as 3 packs (about 90 ARCADE), cloned from another arcade with the same head and tree, fsck clean; an incremental push adds one pack |
+| 7 | built; ledgernet passes: a tag claimed and a profile published on ARCADE read back by all three arcades and after a restart, the home chain untouched, a 600-byte record in one output |
+| 8 | built; tagnet: release after idle + grace, check-ins keep a tag, the send warning pass; the commit-rule check is being rerun after two fixes |
+| 9 | built; reponet passes: push, clone from another arcade, fork, fork push, a non-maintainer refused (and invalid on chain), a maintainer's push, history |
+| 10 | built; prnet (pull request reviewed and merged, the GitHub history imported) under way |
+| 11 | built (rules version 3): unit tests pass (a quarter of the weight lists, the window, a fraud proof inside it); a network test needs a source chain a closed test net can't sync |
+| 12–22 | todo |
 | 23 | Martin |
 | 24 | todo |
 | 25 | running (waits for block 1,165) |
+
+### 15.4 As built: steps 5 to 11 (2026-11-14)
+
+- **Blobs as pages (5):** `/content/<blob id>` answers with the same policy as ord inscriptions (inline scripts, loads
+  from this arcade), so a launcher runs; a gzip blob goes out with `Content-Encoding: gzip`, and a blob fetched from
+  another arcade keeps its encoding. ASHVALE's own account calls (`/r/inscriptions`, storage) need the arcade's app
+  frame, as on the home chain.
+- **Git (6), differs from 15.2 in two ways:** objects are stored as **packs** (git `pack-objects` under 3 MB, one
+  block's blobs each) rather than one blob per object: a blob record costs about 110 bytes and its fee rounds up to a
+  kB, so 5,000 objects as blobs would cost more in records than in data; a fork reuses its source's packs, so nothing
+  is stored twice where it matters. And the arcade speaks git's **dumb HTTP protocol** (static files from a manifest
+  blob), which every git client clones and fetches from with nothing running but the arcade; pushes are
+  `scripts/git-publish.py`, not `git push`. `/git/<manifest>` or `/git/@owner/name`.
+- **Ledger on ARCADE (7):** the same engine and records as the home chain, indexed in the same commit as each block;
+  claims follow the chain they record; ARCADE's coins come from the chain's own coin set. Records up to 1 kB are one
+  OP_RETURN. On the testnet the home chain's ledger runs beside it unchanged.
+- **Tag expiry (8)**, ARCADE only: activity = any record from the owner's address; check-in (INSC kind 20) pays at
+  least 0.1 ARCADE; released `idle + grace` after the last activity (by block time, swept each block); then for
+  `reveal_blocks` (a day) a claim needs a commitment `sha256("arcade tag commit"‖tag‖address‖salt)` (kind 21) from an
+  earlier block, and the earliest commitment wins at the window's end; sends warn for 90 days after a released tag
+  changes hands. Local settings: `tag_idle`, `tag_grace`, `tag_reveal_blocks`, `tag_warn`.
+- **Repositories (9) and their items (10):** `REPO` records (push, maintainer, fork, open, comment/review, state) in
+  the ledger; texts are blobs. Reviews and merges are the owner's and maintainers'; authors close their own; a merge
+  moves the repository to the merged manifest. `scripts/github-import.py` brings a GitHub repository's issues, pull
+  requests, comments and reviews, each keeping its GitHub number, author and time.
+- **Light confirmation (11)**, rules version 3: block and coins segments list with more than a tenth of the draw
+  weight (the first offer of an arcade over 10% lists it) and replicas of them register only after
+  `CHALLENGE_WINDOW` = 100 blocks; fraud proofs and reveal demands reach them meanwhile (the watcher asks the poster
+  too, since no replica is registered yet). Index families still need more than half.
