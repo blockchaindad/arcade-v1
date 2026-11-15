@@ -653,9 +653,14 @@ pub fn content(node: &Node, id: &str, ask: bool) -> Option<(String, Vec<u8>)> {
         let seen = SEEN.lock().unwrap().as_ref().and_then(|m| m.get(&id).copied());
         let mut list: Vec<&'static ChainParams> = seen.into_iter().collect();
         if seen.is_none() {
+            // Chains whose names can be read, and those an arcade on the mesh keeps (a borrowed chain's inscriptions
+            // are asked of whoever keeps it, as the Explorer does; Dogecoin's come without its names).
             list = chains(node);
+            let ords: Vec<&'static ChainParams> = ALL_CHAINS.iter().copied().filter(|p| !list.iter().any(|l| l.chain_no == p.chain_no) && !crate::shares::index_holders(node, p.net, "").is_empty()).collect();
+            list.extend(ords);
         }
-        list.retain(|p| !here.iter().any(|h| h.chain_no == p.chain_no));
+        // A chain said to keep the ord index here can still miss it (a borrowed chain's index, still being read):
+        // its local lookup just failed, so it is asked of the mesh too, as the Explorer does.
         let answers: Vec<(&'static ChainParams, Value)> = each(&list, |p| crate::explorer::handle(node, "explorer.inscription", &json!({"chain": p.key, "id": id})))
             .into_iter()
             .filter_map(|(p, r)| Some((p, r.ok()?)))
