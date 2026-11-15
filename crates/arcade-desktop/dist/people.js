@@ -4,6 +4,8 @@
 (() => {
   const ARC = (sats) => (sats / 1e8).toLocaleString(undefined, { maximumFractionDigits: 8 }) + " ARCADE";
   const CHAINS = [["pep", "Pepecoin"], ["doge", "Dogecoin"], ["ltc", "Litecoin"], ["dgb", "DigiByte"], ["btc", "Bitcoin"]];
+  const NAMES = { pep: "Pepecoin", peptest: "Pepecoin testnet", doge: "Dogecoin", ltc: "Litecoin", ltctest: "Litecoin testnet", dgb: "DigiByte", dgbtest: "DigiByte testnet", btc: "Bitcoin", flop: "Flopcoin", wjk: "Wojakcoin", kot: "Kotia", jkc: "Junkcoin", shic: "Shibacoin", lky: "Luckycoin" };
+  const label = (k) => { const [c, n] = k.split("-"); return (NAMES[c] || c) + (n ? " " + n : ""); };
   const note = (t, bad) => say("pp-msg", t, bad);
   let view = "profile", me = null, picture = null, dirty = false, contacts = [];
 
@@ -49,6 +51,15 @@
     ];
   }
 
+  // The profile's rows: every address the wallet has (its own on each coin here, imported wallets), kept editable.
+  function profileAddrInputs(holder, values) {
+    holder.replaceChildren(...Object.entries(values).map(([k, v]) => {
+      const i = h("input", { "data-chain": k, value: v, placeholder: `${label(k)} address` });
+      i.oninput = () => { dirty = true; cost(); };
+      return h("div", { class: "pp-addr" }, h("span", { class: "k" }, label(k)), i);
+    }));
+    if (!Object.keys(values).length) holder.replaceChildren(h("span", { class: "s" }, "No addresses in this wallet yet."));
+  }
   function addrInputs(holder, values) {
     holder.replaceChildren(...CHAINS.map(([k, name]) => {
       const i = h("input", { "data-chain": k, value: values?.[k] || "", placeholder: `${name} address` });
@@ -74,7 +85,8 @@
       const pr = me.profile || {};
       $("pp-name").value = pr.n || ""; $("pp-bio").value = pr.b || ""; $("pp-url").value = pr.u || "";
       picture = pr.p || null;
-      addrInputs($("pp-addrs"), pr.a);
+      // The wallet's addresses as they are now, plus any the published card shows that the wallet doesn't hold.
+      profileAddrInputs($("pp-addrs"), { ...(pr.a || {}), ...(me.wallet_addresses || {}) });
       cost();
     }
     const ban = $("pp-republish");

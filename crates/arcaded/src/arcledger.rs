@@ -430,6 +430,7 @@ pub fn a_profile(node: &Node, req: &Value) -> Result<Value, String> {
         }
     }
     if mine {
+        v["wallet_addresses"] = json!(wallet_addresses(node));
         // What publishing costs and whether the wallet can pay it (test ARCADE, e.g. from the faucet).
         let (_, _, sk) = sender(node, p)?;
         let pk = arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
@@ -589,4 +590,45 @@ pub fn a_posts(node: &Node, req: &Value) -> Result<Value, String> {
     posts.sort_by_key(|p| std::cmp::Reverse(p["height"].as_u64().unwrap_or(0)));
     posts.truncate(req["limit"].as_u64().unwrap_or(100) as usize);
     Ok(json!({"posts": posts}))
+}
+
+/// Every address this wallet has to show on a profile (Martin 2026-11-15: "automatically get all your addresses from
+/// your vault including imported wallets"): its own on each coin installed here, then each imported wallet's (a second
+/// one on a coin as `doge-2` ...). At most 12, as a profile holds.
+pub fn wallet_addresses(node: &Node) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    if !node.app.has_wallet().unwrap_or(false) {
+        return out;
+    }
+    let mut chains: Vec<&'static ChainParams> = vec![node.params];
+    let extra: Vec<String> = node.extra.lock().unwrap().keys().map(|k| k.to_string()).collect();
+    chains.extend(extra.iter().filter_map(|k| crate::chains::find(k)));
+    for cp in chains {
+        if crate::arcsvc::runs(cp) || out.contains_key(cp.key) {
+            continue;
+        }
+        let key = node.app.tag_keys(cp.chain_no).ok().and_then(|ks| ks.into_iter().find(|k| k.tag.is_some()).or_else(|| node.app.tag_keys(cp.chain_no).ok()?.into_iter().next()))
+            .or_else(|| node.app.tag_key(cp, 0).ok().map(|x| x.0));
+        let Some(k) = key else { continue };
+        let Some(pk) = hex::decode(&k.pubkey).ok().and_then(|b| arcade_wallet::secp256k1::PublicKey::from_slice(&b).ok()) else { continue };
+        if let Some((addr, _)) = crate::coinsend::key_scripts(cp, &pk).into_iter().next() {
+            out.insert(cp.key.to_string(), json!(addr));
+        }
+    }
+    for e in crate::importsvc::list_raw(node) {
+        let (Some(chain), Some(addr)) = (e["chain"].as_str(), e["address"].as_str()) else { continue };
+        if out.values().any(|v| v == addr) {
+            continue;
+        }
+        let mut name = chain.to_string();
+        let mut n = 2;
+        while out.contains_key(&name) {
+            name = format!("{chain}-{n}");
+            n += 1;
+        }
+        out.insert(name, json!(addr));
+    }
+    let keep: Vec<String> = out.keys().take(12).cloned().collect();
+    out.retain(|k, _| keep.contains(k));
+    out
 }
