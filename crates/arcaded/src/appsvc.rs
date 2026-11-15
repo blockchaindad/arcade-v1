@@ -58,6 +58,27 @@ fn ledger_chains(node: &Node) -> Vec<&'static ChainParams> {
     out
 }
 
+/// The @tag of an app's creator, from the ledger of the chain the app is on. Tags live where the arcade
+/// ledger does: the home chain, and the ARCADE chain (Martin 2026-11-15: an ARCADE app shows its publisher).
+/// On ARCADE a tag is under the ARCADE address when claimed there, or under the same key's home-chain
+/// address when the testnet's ledger snapshot carried it over; failing both, the home chain's own tag.
+fn creator_tag(node: &Node, p: &ChainParams, creator: &str) -> Option<String> {
+    use arcade_ledger::index::tag_of;
+    let home = node.params;
+    if p.chain_no == home.chain_no {
+        return tag_of(&node.chain, p.chain_no, creator).ok().flatten();
+    }
+    if !crate::arcsvc::runs(p) {
+        return None;
+    }
+    if let Some(t) = tag_of(&node.chain, p.chain_no, creator).ok().flatten() {
+        return Some(t);
+    }
+    let sc = arcade_ledger::address::script_for_address(p, creator).filter(|sc| sc.len() == 25 && sc[..3] == [0x76, 0xa9, 0x14])?;
+    let at_home = arcade_ledger::address::base58check(home.p2pkh_version, &sc[3..23]);
+    tag_of(&node.chain, p.chain_no, &at_home).ok().flatten().or_else(|| tag_of(&node.chain, home.chain_no, &at_home).ok().flatten())
+}
+
 fn app_id(chain: &str, creator: &str, key: &str) -> String {
     format!("{chain}:{creator}:{key}")
 }
@@ -337,7 +358,7 @@ fn entry(node: &Node, a: &App, acts: &[Value], fx: &Fixes, me: &str, flag: Optio
     let age_h = arcade_app::now().saturating_sub(time) as f64 / 3600.0;
     let hot = (1.0 + s["score"].as_f64().unwrap_or(0.0)) / (age_h + 2.0).powf(1.5);
     s["hot"] = json!(hot);
-    let tag = if c == node.params.chain_no { arcade_ledger::index::tag_of(&node.chain, c, &n.creator).ok().flatten() } else { None };
+    let tag = creator_tag(node, a.chain, &n.creator);
     json!({
         "id": id, "chain": a.chain.key, "chain_name": a.chain.name, "txid": n.txid, "number": n.number,
         "creator": n.creator, "creator_tag": tag, "height": n.height, "time": time, "card": n.card.to_json(),
