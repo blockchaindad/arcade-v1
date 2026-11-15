@@ -550,6 +550,27 @@ pub fn file(node: &Node, page: &str, body: &Value) -> (u16, Value) {
     (202, r)
 }
 
+/// File a request another service built (reposvc.rs): `r` has its id, page, kind and words.
+pub(crate) fn file_other(node: &Node, r: Value) -> (u16, Value) {
+    if requests(node, None).as_array().map(|a| a.len()).unwrap_or(0) >= MAX_WAITING {
+        return (400, json!({"error": "more than twenty requests are already waiting"}));
+    }
+    if requests(node, Some(r["page"].as_str().unwrap_or(""))).as_array().map(|a| a.len()).unwrap_or(0) >= MAX_WAITING_PAGE {
+        return (400, json!({"error": "this page already has five requests waiting for an answer"}));
+    }
+    put_req(node, &r);
+    let _ = node.app.event("wallet", &format!("a page asks to {}", r["what"].as_str().unwrap_or("")));
+    (202, r)
+}
+
+pub(crate) fn get_request(node: &Node, id: &str) -> Option<Value> {
+    get_req(node, id)
+}
+
+pub(crate) fn put_request(node: &Node, r: &Value) {
+    put_req(node, r)
+}
+
 /// File a market request (marketsvc.rs): `what` is its terms in words, `to` the maker a take pays.
 pub(crate) fn file_market(node: &Node, page: &str, what: &str, to: Option<String>, market: Value) -> (u16, Value) {
     if requests(node, None).as_array().map(|a| a.len()).unwrap_or(0) >= MAX_WAITING {
@@ -571,6 +592,10 @@ fn build(node: &Node, r: &Value, send: bool) -> Result<(String, u64, Vec<Value>)
     if r["kind"] == "market" {
         // An order, cancel or take (marketsvc.rs): (txid, fee, outputs) as the card shows them.
         return crate::marketsvc::build_request(node, &r["market"], send);
+    }
+    if r["kind"] == "repo" {
+        // A repository write (reposvc.rs): on the ARCADE chain, signed by this wallet's @tag there.
+        return if send { crate::reposvc::start(node, r) } else { crate::reposvc::preview(node, r).map(|(fee, outs)| (String::new(), fee, outs)) };
     }
     let to = r["to"].as_str().unwrap_or("");
     let to_script = arcade_ledger::address::script_for_address(p, to).ok_or("bad address")?;

@@ -368,6 +368,30 @@ pub fn held_programs(name: &str, file: &str) -> Vec<(String, PathBuf, String)> {
         .collect()
 }
 
+/// Every release of `name` with its `file` held here, newest first: (release, the file's path). For crate::relrepo,
+/// which shows the newest bundle as a repository.
+pub fn held_files(name: &str, file: &str) -> Vec<(Release, PathBuf)> {
+    let s = st();
+    let mut v: Vec<(Release, PathBuf)> = s
+        .releases
+        .values()
+        .filter(|r| r.name == name)
+        .filter_map(|r| {
+            let (sha, _) = r.files.get(file)?;
+            s.have.contains(sha).then(|| (r.clone(), file_path(sha)))
+        })
+        .collect();
+    v.sort_by(|a, b| b.0.time.cmp(&a.0.time).then_with(|| b.0.version.cmp(&a.0.version)));
+    v
+}
+
+/// Every release of `name` known here (held or not), newest first.
+pub fn releases_of(name: &str) -> Vec<Release> {
+    let mut v: Vec<Release> = st().releases.values().filter(|r| r.name == name).cloned().collect();
+    v.sort_by(|a, b| b.time.cmp(&a.time));
+    v
+}
+
 // ---------------- the local API ----------------
 
 /// `code.status`: the releases known here and which of their files are held.
