@@ -363,17 +363,23 @@ Items go into the section in this order, so that answers with a deadline are nev
 
 Everything in 1–9 is in the testnet from its first day. At launch the paid data is the **blocks** of every listed chain; index journals and Bitcoin's indexes join by upgrade.
 
-## 13. Open questions for Martin
+## 13. Open questions for Martin, as settled for the build (§15 step 14)
 
-Decided: **genesis stays 2027-01-01** (Martin, 2026-11-11).
+Decided: **genesis stays 2027-01-01** (Martin, 2026-11-11). The rest are written into the rules as below: Martin's
+answers where he gave them, otherwise the defaults of §15.1 (each can still change by a rules version before mainnet).
 
-1. **Pay delay:** coins are released by audits, so pay arrives about 2 days after it is earned. OK?
-2. **Blocks only at launch:** index journals and Bitcoin's indexes added by upgrade?
-3. **Time keepers** aren't paid (as in Chia). OK, or should the block writer's fees be shared with the time keeper whose proof it used?
-4. **Address prefix:** **A...** for mainnet addresses?
-5. **A share of the 50 for the block writer?** *Decided (Martin 2026-11-14): yes, 1 ARCADE per block to its writer, 49 to the storage pot, fees still into the pot* (built from rules version 2: §14.26).
-6. **The wallet's key path:** which BIP44 coin type for ARCADE addresses? The build's stand-in is 3 (Dogecoin's), so a wallet's ARCADE address would have the same key as its Dogecoin one. A number of its own keeps the keys apart; it has to be picked before the first real address is handed out.
-7. **Small fees:** a block whose fees are under 0.001 ARCADE (one small payment pays about 0.00045) can't pay them to its writer, because no output may be that small. Today they are burned. Add them to the storage pot instead?
+1. **Pay delay:** pay is released by passed audits, so it arrives about 2 days after it is earned. *Default: as built.*
+2. **What is stored at launch:** blocks, the coins family and the index journals (ord, ledger, profiles, messages,
+   names, tokens, maps, tags) and blobs, all from genesis; Bitcoin's indexes by upgrade. *Default.* Journals are
+   confirmed by more than half of the draw weight; ord rows of one-piece inscriptions, coins records and block headers
+   and transactions also have fraud proofs (§15.4).
+3. **Time keepers** aren't paid (as in Chia). *Default.*
+4. **Address prefix:** **A…** for mainnet (p2pkh 0x17). *Default, set in params.*
+5. **A share of the 50 for the block writer:** 1 ARCADE per block to its writer, 49 to the storage pot, fees into the
+   pot. *Martin 2026-11-14* (rules version 2, §14.26).
+6. **BIP44 coin type:** the home chain's (1 on test chains, 3 on mainnet), so an @name's ARCADE address is its claim's
+   key hash. *Default, relied on since v0.1.71.*
+7. **Small fees:** moot since §14.18: every fee joins the pot, none is paid out to a writer.
 
 ## 14. The rules as built
 
@@ -981,7 +987,10 @@ mainnet. Marked *(default)* where Martin has not said yes.
 | 9 | built; reponet passes: push, clone from another arcade, fork, fork push, a non-maintainer refused (and invalid on chain), a maintainer's push, history |
 | 10 | built; prnet (pull request reviewed and merged, the GitHub history imported) under way |
 | 11 | built (rules version 3): unit tests pass (a quarter of the weight lists, the window, a fraud proof inside it); a network test needs a source chain a closed test net can't sync |
-| 12–22 | todo |
+| 12 | built: BadCoins; chain unit test passes (inflated entry taken out; right entry, forged leaf, foreign header refused); watcher posts it |
+| 13 | built for ord: BadOrd (one-piece inscription rows); chain unit test passes; watcher posts it; pieced inscriptions and the other journals rest on more than half the weight |
+| 14 | done: §13 written as settled |
+| 15–22 | todo |
 | 23 | Martin |
 | 24 | todo |
 | 25 | running (waits for block 1,165) |

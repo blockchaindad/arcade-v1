@@ -90,7 +90,7 @@ pub fn send(node: &Node, key: Option<&str>, to: &str, amount: u64, from: Option<
     let arc = crate::arcsvc::runs(p);
     let waiting_spend = |op: &arcade_chain::OutPoint| -> Result<bool, String> {
         if arc {
-            return Ok(crate::arcsvc::spender(op).is_some());
+            return Ok(crate::arcsvc::spender(op).is_some() || !crate::arcsvc::unspent(op));
         }
         Ok(node.chain.mempool_spender(p.chain_no, op).map_err(|e| e.to_string())?.is_some())
     };
@@ -242,7 +242,8 @@ pub fn publish_blobs(node: &Node, items: &[(Vec<u8>, String, arcade_arc::blob::C
     let mut coins = Vec::new();
     for (_, sc) in &scripts {
         for (op, value, _h) in node.chain.coins_for_script(p, sc).map_err(|e| e.to_string())? {
-            if crate::arcsvc::spender(&op).is_some() {
+            // Not spent by a waiting transaction, nor on the chain itself (its store copy follows a moment later).
+            if crate::arcsvc::spender(&op).is_some() || !crate::arcsvc::unspent(&op) {
                 continue;
             }
             if let Some(c) = node.chain.coin(p, &op).map_err(|e| e.to_string())? {

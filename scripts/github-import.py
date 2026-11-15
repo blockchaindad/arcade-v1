@@ -31,7 +31,7 @@ def send(sock, req):
         try:
             return call(sock, req)
         except RuntimeError as e:
-            if not any(w in str(e) for w in ("not enough", "could not build", "spent by another")):
+            if not any(w in str(e) for w in ("not enough", "could not build", "spent by another", "doesn't exist or is spent")):
                 raise
             time.sleep(5)
     raise SystemExit("the wallet never had enough ARCADE")
