@@ -712,7 +712,7 @@ impl Open {
 }
 
 /// A unit sealed here, closed or still open (for the readers).
-fn sealed_unit(node: &Node, net: &Net, chain: &str, family: u8, h: u64) -> Option<Vec<u8>> {
+pub(crate) fn sealed_unit(node: &Node, net: &Net, chain: &str, family: u8, h: u64) -> Option<Vec<u8>> {
     let me = node.identity.verifying_key().to_bytes();
     if let Some(r) = replicas(node, net).into_iter().find(|r| r.chain == chain && r.family == family && r.first <= h && h <= r.last) {
         return r.block(&me, h).ok();

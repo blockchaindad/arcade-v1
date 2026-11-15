@@ -55,6 +55,11 @@ pub struct Genesis {
     pub beacon_2: Hash,
     /// `D` for the first epoch.
     pub difficulty: u128,
+    /// The first code release the network starts from (crates/arcaded arccode: its record's id), on mainnet: block 0
+    /// names it, so the code is fixed by the chain itself (§15 step 17). None on the test networks made before.
+    pub code: Option<Hash>,
+    /// The home chain's ledger snapshot the ARCADE ledger starts from (§15 step 19: arcade-ledger snapshot), its SHA-256.
+    pub ledger: Option<Hash>,
 }
 
 impl Genesis {
@@ -63,7 +68,7 @@ impl Genesis {
         Hash256(tagged::hash(
             net,
             "block 0",
-            &[&self.time.to_le_bytes(), &self.closed_list, &self.final_list, &self.beacon_1, &self.beacon_2, &self.difficulty.to_le_bytes()],
+            &[&self.time.to_le_bytes(), &self.closed_list, &self.final_list, &self.beacon_1, &self.beacon_2, &self.difficulty.to_le_bytes(), self.code.as_ref().map_or(&[][..], |c| &c[..]), self.ledger.as_ref().map_or(&[][..], |c| &c[..])],
         ))
     }
 
@@ -279,6 +284,13 @@ pub struct Ticket {
 impl Ticket {
     /// The finished block, signed with the key that drew the ticket.
     pub fn seal(&self, net: &Net, secret: &[u8; 32], time: u64, txs: Vec<Tx>, items: Vec<Item>, pot: TimeProof, draw_seed: Option<TimeProof>) -> Block {
+        self.seal_with_blobs(net, secret, time, txs, items, pot, draw_seed, &HashMap::new())
+    }
+
+    /// The block with the blobs it brings: of `new` (bytes by id, only blobs the chain doesn't hold yet), those its
+    /// transactions' records name, in the order the records come.
+    #[allow(clippy::too_many_arguments)]
+    pub fn seal_with_blobs(&self, net: &Net, secret: &[u8; 32], time: u64, txs: Vec<Tx>, items: Vec<Item>, pot: TimeProof, draw_seed: Option<TimeProof>, new: &HashMap<Hash, Vec<u8>>) -> Block {
         // The transactions after the coinbase in the order the block's seed sets (§14.18).
         let txs = match vrf::output_of_proof(&self.vrf_proof) {
             Some(out) if txs.len() > 2 => {
@@ -290,8 +302,21 @@ impl Ticket {
             }
             _ => txs,
         };
+        let version = net.rules_at(self.height);
+        let (mut blob_ids, mut blobs) = (Vec::new(), Vec::new());
+        if version >= 3 {
+            for tx in txs.iter().skip(1) {
+                for r in crate::blob::records(tx) {
+                    let id = r.id(net);
+                    if let Some(b) = new.get(&id).filter(|_| !blob_ids.contains(&id)) {
+                        blob_ids.push(id);
+                        blobs.push(b.clone());
+                    }
+                }
+            }
+        }
         let mut header = Header {
-            version: net.rules_at(self.height),
+            version,
             height: self.height,
             prev: self.prev,
             time,
@@ -303,10 +328,11 @@ impl Ticket {
             vrf_proof: self.vrf_proof,
             pot,
             draw_seed,
+            blob_root: crate::blob::ids_root(&blob_ids),
             sig: [0; 64],
         };
         header.sign(net, &SigningKey::from_bytes(secret));
-        Block { header, txs, items }
+        Block { header, txs, items, blob_ids, blobs }
     }
 }
 
@@ -448,6 +474,9 @@ pub struct Chain<T: TimeProofs, S: Storage> {
     evidence: Vec<Equivocation>,
     /// A better branch that waited (BlockError::Waiting): its last block, tried again with retry().
     waiting: Option<Hash256>,
+    /// Every blob on the best branch (crate::blob), and per block of it the ones it brought (to take back).
+    blobs: HashSet<Hash>,
+    blob_undo: HashMap<Hash256, Vec<Hash>>,
 }
 
 impl<T: TimeProofs, S: Storage> Chain<T, S> {
@@ -473,6 +502,8 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
             written: HashMap::new(),
             evidence: Vec::new(),
             waiting: None,
+            blobs: HashSet::new(),
+            blob_undo: HashMap::new(),
         }
     }
 
@@ -585,6 +616,7 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
     /// A writer that signs many blocks on one block gets them all taken in here; how many of
     /// them an arcade passes on is the mesh's rule, not the chain's.
     pub fn accept(&mut self, block: Block, now: u64) -> Result<Accepted, ChainError> {
+        let block = block.with_blob_ids(&self.net);
         let id = block.id();
         // The id doesn't cover the signature, and the body is tied to it only through the
         // roots, so a block is called known, or bad for good, only for what its id covers.
@@ -595,6 +627,11 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
             return Ok(Accepted::Known);
         }
         block.check(&self.net)?;
+        // A blob may come without its bytes only in a block older than the window: when it was new, the network had
+        // them and checked them; full nodes may have dropped them since (§15 step 3).
+        if !block.blobs_whole() && block.header.time.saturating_add(self.net.blob_window) > now {
+            return Err(ChainError::Block(BlockError::Blobs("a recent block came without a blob's bytes")));
+        }
         let entry = self.enter(&block.header, now)?;
 
         let mut split = &self.entries[&entry.prev];
@@ -618,7 +655,8 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
 
         let better = entry.beats(self.tip());
         self.entries.insert(id, entry);
-        self.blocks.insert(id, block);
+        // Kept with its blob ids only: the bytes, checked above, are the blob store's (the caller keeps them).
+        self.blocks.insert(id, block.without_blob_bytes());
         if !better {
             return Ok(Accepted::Side);
         }
@@ -695,6 +733,7 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
         }
         let (payouts, writer_paid) = self.payouts_at(entry.height, &block.header.writer);
         let changes = coins::check_block(&block.txs, entry.height, &entry.prev, &self.coins, &payouts)?;
+        let brought = self.blobs_brought(block, &changes)?;
         let undo = self.storage.apply(block, &Applied { height: entry.height, id: *id, seed: entry.seed, fees: changes.fees, writer_paid })?;
         for (at, _) in &changes.spent {
             self.coins.remove(at);
@@ -704,6 +743,10 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
             debug_assert!(before.is_none(), "no two transactions share an id");
         }
         self.undo.insert(*id, (changes, undo));
+        for b in &brought {
+            self.blobs.insert(*b);
+        }
+        self.blob_undo.insert(*id, brought);
         self.best.push(*id);
         Ok(())
     }
@@ -714,6 +757,9 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
         let id = self.best.pop().expect("not empty");
         let (changes, undo) = self.undo.remove(&id).expect("every block of the branch can be taken back");
         self.storage.undo(undo);
+        for b in self.blob_undo.remove(&id).unwrap_or_default() {
+            self.blobs.remove(&b);
+        }
         for (at, _) in &changes.made {
             self.coins.remove(at);
         }
@@ -721,6 +767,48 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
             self.coins.insert(at, coin);
         }
         id
+    }
+
+    /// The blobs a block brings (rules version 3): exactly those its records name that the branch doesn't hold yet, in
+    /// the order the records come, each transaction paying the blob fee for the bytes it brings.
+    fn blobs_brought(&self, block: &Block, changes: &coins::Changes) -> Result<Vec<Hash>, ChainError> {
+        if block.header.version < 3 {
+            return Ok(Vec::new());
+        }
+        let mut want = Vec::new();
+        let mut here: HashSet<Hash> = HashSet::new();
+        for (i, tx) in block.txs.iter().enumerate().skip(1) {
+            let mut bytes = 0u64;
+            for r in crate::blob::records(tx) {
+                let id = r.id(&self.net);
+                let brings = !self.blobs.contains(&id) && here.insert(id);
+                if brings {
+                    want.push(id);
+                }
+                // A boost pays the full blob fee whether it brings the bytes or not (§15 step 4).
+                if brings || r.class == crate::blob::Class::Boost {
+                    bytes += r.len;
+                }
+            }
+            let fee = changes.fees_by_tx.get(i - 1).copied().unwrap_or(0);
+            if fee < crate::blob::fee_for(bytes) {
+                return Err(ChainError::Block(BlockError::Blobs("a transaction doesn't pay the blob fee for the blobs it brings")));
+            }
+        }
+        if block.blob_ids != want {
+            return Err(ChainError::Block(BlockError::Blobs("not the blobs its records bring")));
+        }
+        Ok(want)
+    }
+
+    /// Whether the best branch holds blob `id`.
+    pub fn holds_blob(&self, id: &Hash) -> bool {
+        self.blobs.contains(id)
+    }
+
+    /// The ids of the blobs block `id` brought.
+    pub fn blob_ids(&self, id: &Hash256) -> Vec<Hash> {
+        self.blocks.get(id).map(|b| b.blob_ids.clone()).unwrap_or_default()
     }
 
     /// Mark a block that failed step 3, and everything built on it.
@@ -952,7 +1040,7 @@ pub(crate) mod tests {
     }
 
     fn genesis() -> Genesis {
-        Genesis { time: START, closed_list: [1; 32], final_list: [2; 32], beacon_1: [3; 32], beacon_2: [4; 32], difficulty: 1 << 40 }
+        Genesis { time: START, closed_list: [1; 32], final_list: [2; 32], beacon_1: [3; 32], beacon_2: [4; 32], difficulty: 1 << 40, code: None, ledger: None }
     }
 
     fn holders() -> FixedHolders {
@@ -982,7 +1070,8 @@ pub(crate) mod tests {
         outputs.extend_from_slice(own);
         let mut all = vec![coins::coinbase(ticket.height, &ticket.prev, b"", &outputs)];
         all.extend(txs);
-        ticket.seal(&NET, &secret(who), time, all, Vec::new(), StandIn.prove(&ticket.challenge, ticket.steps), draw_seed)
+        let net = *c.net();
+        ticket.seal(&net, &secret(who), time, all, Vec::new(), StandIn.prove(&ticket.challenge, ticket.steps), draw_seed)
     }
 
     /// The holders in the order of their scores for the next block, best first.
@@ -1339,6 +1428,114 @@ pub(crate) mod tests {
         assert_eq!(a.id_at(6), Some(mine.id()));
     }
 
+    /// A local network on rules version 3 (blobs) from block 2.
+    const NET3: Net = Net { rules: &[(1, 0), (2, 1), (3, 2)], ..TESTNET };
+
+    fn chain3() -> TestChain {
+        let list: Vec<_> = HOLDERS.iter().map(|&who| (vrf::public_key(&secret(who)), who as u64 * GIB, address(who))).collect();
+        Chain::new(NET3, &genesis(), StandIn, FixedHolders::new(&NET3, &list).unwrap(), &[])
+    }
+
+    /// The block `who` writes on the tip with `txs`, bringing those of `new` its records name.
+    fn block3(c: &TestChain, who: u8, txs: Vec<Tx>, new: &HashMap<Hash, Vec<u8>>) -> Block {
+        let draw_seed = seed_proof(c);
+        let ticket = c.ticket(&secret(who), draw_seed.as_ref()).unwrap();
+        let mut all = vec![coins::coinbase(ticket.height, &ticket.prev, b"", &c.payouts_for(&vrf::public_key(&secret(who))))];
+        all.extend(txs);
+        ticket.seal_with_blobs(&NET3, &secret(who), next_time(c), all, Vec::new(), StandIn.prove(&ticket.challenge, ticket.steps), draw_seed, new)
+    }
+
+    fn good_id_time(b: &Block) -> u64 {
+        b.header.time.max(LATE)
+    }
+
+    #[test]
+    fn a_blob_is_brought_once_paid_for_and_named_freely_after() {
+        use crate::blob::{self, Class, Encoding, Record};
+        let mut c = chain3();
+        let blocks = grow_to(&mut c, 150);
+        let (sk, pk) = coin_key(3);
+        let lock = p2pkh(&pk);
+        let paid = &blocks[99].txs[0];
+        let vout = paid.outputs.iter().position(|o| o.script_pubkey == lock).unwrap();
+        let from = OutPoint { txid: paid.txid, vout: vout as u32 };
+        let amount = paid.outputs[vout].value;
+        grow_to(&mut c, 199);
+
+        let bytes: Vec<u8> = (0..5_000u32).map(|i| (i * 31 % 251) as u8).collect();
+        let rec = Record::of(&bytes, Class::Permanent, Encoding::Plain, "text/plain");
+        let id = rec.id(&NET3);
+        let pay = |fee: u64, from: OutPoint, amount: u64| {
+            let t = tx(vec![(from, vec![], u32::MAX)], vec![(0, rec.script()), (amount - fee, lock.clone())], 0);
+            let mut s = Vec::new();
+            push(&mut s, &sign(&t, 0, &lock, &sk, SIGHASH_ALL));
+            push(&mut s, &pk);
+            with_sig(&t, 0, s)
+        };
+        let fee = blob::fee_for(bytes.len() as u64) + COIN / 1_000;
+        let spend = pay(fee, from, amount);
+        let new = HashMap::from([(id, bytes.clone())]);
+        let who = ranked(&c)[0];
+
+        // Without its bytes, with other bytes, or paying too little: refused.
+        let bare = block3(&c, who, vec![spend.clone()], &HashMap::new());
+        assert_eq!(c.accept(bare, LATE), Err(ChainError::Block(BlockError::Blobs("not the blobs its records bring"))));
+        let mut wrong = block3(&c, who, vec![spend.clone()], &new);
+        wrong.blobs[0][7] ^= 1;
+        assert_eq!(c.accept(resigned(wrong, who), LATE), Err(ChainError::Block(BlockError::Blobs("a blob's bytes aren't its id's"))));
+        let cheap = pay(blob::fee_for(bytes.len() as u64) - 1, from, amount);
+        let short = block3(&c, who, vec![cheap], &new);
+        assert_eq!(c.accept(short, LATE), Err(ChainError::Block(BlockError::Blobs("a transaction doesn't pay the blob fee for the blobs it brings"))));
+        assert!(!c.holds_blob(&id));
+
+        // Sent without the blob's bytes (the form an old block travels in once its blobs are dropped): it reads back
+        // with its id, and while the block is recent it is refused.
+        let good = block3(&c, who, vec![spend.clone()], &new);
+        let mut bare_bytes = good.clone();
+        bare_bytes.blobs = vec![Vec::new()];
+        let back = Block::decode(&bare_bytes.encode()).unwrap().with_blob_ids(&NET3);
+        assert_eq!((back.blob_ids.clone(), back.blobs_whole()), (vec![id], false));
+        assert_eq!(c.accept(back, good.header.time + 10), Err(ChainError::Block(BlockError::Blobs("a recent block came without a blob's bytes"))));
+        // Brought and paid for: the chain holds it, keeps its id, and the block it keeps has no bytes.
+        assert_eq!(good.blob_ids, vec![id]);
+        let good_id = good.id();
+        assert!(matches!(c.accept(good, LATE), Ok(Accepted::Tip { .. })));
+        assert!(c.holds_blob(&id));
+        assert_eq!(c.blob_ids(&good_id), vec![id]);
+        assert!(c.block(&good_id).unwrap().blobs.is_empty());
+
+        // Named again later: no bytes, no blob fee.
+        let change = OutPoint { txid: spend.txid, vout: 1 };
+        let again = pay(COIN / 1_000, change, amount - fee);
+        let who = ranked(&c)[0];
+        // Bringing its bytes again is refused (the section holds only blobs new to the chain); the writer leaves out
+        // what the chain holds.
+        let twice = block3(&c, who, vec![again.clone()], &new);
+        assert_eq!(c.accept(twice, LATE), Err(ChainError::Block(BlockError::Blobs("not the blobs its records bring"))));
+        let unheld: HashMap<Hash, Vec<u8>> = new.iter().filter(|(k, _)| !c.holds_blob(k)).map(|(k, v)| (*k, v.clone())).collect();
+        let b2 = block3(&c, who, vec![again.clone()], &unheld);
+        assert!(b2.blob_ids.is_empty(), "a blob the chain holds isn't brought again");
+        assert!(matches!(c.accept(b2, LATE), Ok(Accepted::Tip { .. })));
+
+        // An arcade starting later takes the old block without the blob's bytes (they may be gone everywhere by then).
+        let mut late = chain3();
+        for h in 1..=c.tip().height {
+            let kept = c.block(&c.id_at(h).unwrap()).unwrap().clone();
+            assert!(late.accept(Block::decode(&kept.encode()).unwrap(), good_id_time(&kept) + NET3.blob_window + 1).is_ok(), "height {h}");
+        }
+        assert!(late.holds_blob(&id), "named by the old block, held without its bytes");
+
+        // Taken back by a heavier branch without it: the chain no longer holds it.
+        let mut other = chain3();
+        feed(&mut other, &blocks);
+        grow_to(&mut other, 203);
+        for b in (200..=203).map(|h| other.block(&other.id_at(h).unwrap()).unwrap().clone()) {
+            let _ = c.accept(b, LATE);
+        }
+        assert_eq!(c.tip().id, other.tip().id);
+        assert!(!c.holds_blob(&id));
+    }
+
     #[test]
     fn coins_are_spent_on_the_chain_and_come_back_when_a_block_is_undone() {
         let mut c = chain();
@@ -1532,6 +1729,9 @@ pub(crate) mod tests {
         let g = genesis();
         assert_ne!(g.id(&NET), g.id(&params::MAINNET));
         assert_ne!(g.id(&NET), Genesis { beacon_1: [9; 32], ..g.clone() }.id(&NET));
+        // A code release named changes block 0; none leaves the ids made before as they were.
+        assert_ne!(g.id(&NET), Genesis { code: Some([7; 32]), ..g.clone() }.id(&NET));
+        assert_eq!(g.id(&NET), Hash256(tagged::hash(&NET, "block 0", &[&g.time.to_le_bytes(), &g.closed_list, &g.final_list, &g.beacon_1, &g.beacon_2, &g.difficulty.to_le_bytes()])));
         assert_ne!(g.draw_seed(&NET), Genesis { beacon_2: [9; 32], ..g.clone() }.draw_seed(&NET));
         // The final list can't steer the first draw seed (§10).
         assert_eq!(g.draw_seed(&NET), Genesis { final_list: [9; 32], ..g.clone() }.draw_seed(&NET));

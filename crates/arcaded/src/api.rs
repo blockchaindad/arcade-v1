@@ -122,7 +122,10 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         }
         "wallet.send" => {
             let amount = req["amount"].as_u64().ok_or("amount required (satoshis)")?;
-            crate::coinsend::send(node, s("chain").as_deref(), &s("to").ok_or("to required")?, amount, s("from").as_deref(), req["send"] == true)
+            crate::coinsend::OWNER_CHANGE_OK.with(|c| c.set(req["owner_changed_ok"] == true));
+            let r = crate::coinsend::send(node, s("chain").as_deref(), &s("to").ok_or("to required")?, amount, s("from").as_deref(), req["send"] == true);
+            crate::coinsend::OWNER_CHANGE_OK.with(|c| c.set(false));
+            r
         }
         "wallet.link" => crate::links::link(node, &s("chain").ok_or("chain required")?, &s("wif").ok_or("wif required")?, &s("tag").ok_or("tag required")?),
         "wallet.unlink" => crate::links::unlink(node, &s("chain").ok_or("chain required")?, &s("address").ok_or("address required")?, &s("tag").ok_or("tag required")?),
@@ -331,8 +334,29 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         "mute.list" => Ok(json!(crate::msgsvc::mutes(node))),
         "mute.add" => crate::msgsvc::mute(node, &s("address").ok_or("address required")?, true),
         "mute.remove" => crate::msgsvc::mute(node, &s("address").ok_or("address required")?, false),
-        "tag.check" => Ok(json!(crate::claims::check(node, &s("tag").ok_or("tag required")?))),
-        "tag.claim" => Ok(json!(crate::claims::start(node, &s("tag").ok_or("tag required")?)?)),
+        // `chain`: the home chain (default) or the ARCADE chain (§15 step 7).
+        "tag.check" => Ok(json!(crate::claims::check_on(node, crate::claims::chain_for(node, s("chain").as_deref())?, &s("tag").ok_or("tag required")?))),
+        "tag.claim" => Ok(json!(crate::claims::start_on(node, crate::claims::chain_for(node, s("chain").as_deref())?, &s("tag").ok_or("tag required")?)?)),
+        // The ledger on the ARCADE chain (§15 step 7).
+        "ledger.announce" => crate::arcledger::announce(node),
+        "ledger.profile" => crate::arcledger::profile(node, &req),
+        "ledger.repo_push" => crate::arcledger::repo_push(node, &s("name").ok_or("name required")?, &s("manifest").ok_or("manifest required")?),
+        "ledger.repo_maintainer" => crate::arcledger::repo_maintainer(node, &s("name").ok_or("name required")?, &s("tag").ok_or("tag required")?, req["add"] != false),
+        "ledger.repo_fork" => crate::arcledger::repo_fork(node, &s("from").ok_or("from required")?, &s("name").ok_or("name required")?),
+        "ledger.item_open" => crate::arcledger::item_open(node, &req),
+        "ledger.item_comment" => crate::arcledger::item_comment(node, &req),
+        "ledger.item_state" => crate::arcledger::item_state(node, &req),
+        "ledger.items" => crate::arcledger::items(node, &req),
+        "ledger.repo" => crate::arcledger::repo(node, &s("name").ok_or("name required")?),
+        "ledger.repos" => crate::arcledger::repos(node, s("owner").as_deref()),
+        "ledger.balances" => crate::arcledger::balances(node, &s("address").ok_or("address required")?),
+        "ledger.tag_commit" => crate::arcledger::tag_commit(node, &s("tag").ok_or("tag required")?),
+        "ledger.tag_checkin" => crate::arcledger::tag_checkin(node),
+        "ledger.send" => {
+            let payload = hex::decode(s("hex").ok_or("hex required (the AnyData payload)")?.trim()).map_err(|_| "hex is not hex")?;
+            let (txid, fee) = crate::arcledger::send(node, &payload)?;
+            Ok(json!({"txid": txid, "fee": fee}))
+        }
         "tag.list" => Ok(json!(node.app.claims().map_err(|e| e.to_string())?)),
         "start.status" => Ok(crate::claims::start_status(node)),
         "faucet.ask" => {
@@ -599,6 +623,47 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         }
         "arc.keeper" => crate::arckeep::api(node, req),
         "arc.genesis" => crate::arcgenesis::status(node),
+        "arc.blob" => crate::arcsvc::blob(req),
+        // The viewer cache (§15 step 4): its size in MB (0: off; on by default at 2,048) and what it holds.
+        "arc.cache" => {
+            if let Some(mb) = req["mb"].as_u64() {
+                node.app.store.write(|w| w.put(arcade_app::META, b"arc_cache_mb", mb.to_string().as_bytes())).map_err(|e| e.to_string())?;
+                crate::arcblob::set_cache_limit(mb << 20);
+            }
+            let (files, bytes) = crate::arcblob::cache_use();
+            Ok(serde_json::json!({"mb": crate::arcblob::cache_limit() >> 20, "on": crate::arcblob::cache_limit() > 0, "files": files, "bytes": bytes}))
+        }
+        // Several blobs in one transaction: `files` [{path, type, class?, gzip?}], `send`.
+        "arc.blob_publish_many" => {
+            let mut items = Vec::new();
+            for f in req["files"].as_array().ok_or("files required")? {
+                let path = f["path"].as_str().ok_or("each file needs its path")?;
+                let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+                let class = arcade_arc::blob::Class::from_u8(f["class"].as_u64().unwrap_or(0) as u8).ok_or("class is 0 to 3")?;
+                let enc = if f["gzip"] == true { arcade_arc::blob::Encoding::Gzip } else { arcade_arc::blob::Encoding::Plain };
+                items.push((bytes, f["type"].as_str().unwrap_or("application/octet-stream").to_string(), class, enc));
+            }
+            crate::coinsend::publish_blobs(node, &items, req["send"] == true)
+        }
+        // Keep every blob's plain copy (an archive node), or let the classes drop them (§15 step 3).
+        "arc.archive" => {
+            if let Some(on) = req["on"].as_bool() {
+                node.app.store.write(|w| w.put(arcade_app::META, b"arc_archive", if on { b"1" } else { b"0" })).map_err(|e| e.to_string())?;
+            }
+            Ok(serde_json::json!({"archive": crate::arcsvc::archive(node)}))
+        }
+        // A blob from this arcade's wallet: `path` (a file here) or `hex`, its `type`, `class` (0 permanent, 1 release,
+        // 2 temporary), `gzip`; `send` to put it in the pool (without: only what it would cost).
+        "arc.blob_publish" => {
+            let bytes = match (s("path"), s("hex")) {
+                (Some(path), _) => std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?,
+                (None, Some(h)) => hex::decode(h.trim()).map_err(|_| "hex is not hex".to_string())?,
+                _ => return Err("path or hex required".into()),
+            };
+            let class = arcade_arc::blob::Class::from_u8(req["class"].as_u64().unwrap_or(0) as u8).ok_or("class is 0, 1 or 2")?;
+            let enc = if req["gzip"] == true { arcade_arc::blob::Encoding::Gzip } else { arcade_arc::blob::Encoding::Plain };
+            crate::coinsend::publish_blob(node, &bytes, &s("type").unwrap_or_else(|| "application/octet-stream".into()), class, enc, req["send"] == true)
+        }
         "code.status" => Ok(crate::arccode::status()),
         "code.add" => crate::arccode::add(req),
         "code.export" => crate::arccode::export(req),

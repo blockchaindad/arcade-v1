@@ -348,6 +348,15 @@
     <div class="row"><button id="o-check">Check now</button><button class="primary" id="o-now" disabled>Update now</button></div>
     <p class="msg" id="o-msg"></p>
 
+    <h2>Blob cache</h2>
+    <div class="grid">
+      <div class="card"><div class="k">Size limit</div><div class="v" id="o-cache-mb">—</div></div>
+      <div class="card"><div class="k">Holding</div><div class="v" id="o-cache-use">—</div></div>
+    </div>
+    <div class="row"><input type="number" id="o-cache-in" min="0" step="256" style="width:8em"> MB <button id="o-cache-set">Set</button></div>
+    <p class="opt">Blobs this arcade fetched for someone to view (ARCADE files, apps, pictures) are kept here and handed to other arcades that ask, so what many people view spreads to many arcades, and leaves them when nobody views it any more. On by default; 0 turns it off.</p>
+    <p class="msg" id="o-cache-msg"></p>
+
     <h2>Use this arcade from a browser</h2>
     <p class="opt">This same window, with every tab, opens in a web browser: on this computer, or on another one (a laptop) through an SSH tunnel. Nothing new is opened to the network: the arcade still answers only this computer, and the tunnel brings the other computer's browser here. <span class="web-only" hidden><b>You're using it in a browser now.</b></span></p>
     <ol class="howto">

@@ -133,6 +133,130 @@ pub fn apply<S: TagStore>(
     }
 }
 
+// ---------------- expiry (docs/ARCADECHAIN.md §15 step 8; the ARCADE chain only) ----------------
+//
+// On a chain that turns it on, a tag is kept by activity: any arcade record from its owner's address (a check-in, kind
+// 20, is the record for an owner with nothing else to send, and pays at least `checkin_fee` into the pot). `idle` after
+// the last activity, then `grace`, it is released. A released tag is claimed again only with a commitment made ahead:
+// during `reveal_blocks` after the release a claim must carry the salt of a commit record (kind 21,
+// `commitment(tag, address, salt)`) from an earlier block, and when the window ends the earliest commitment wins; after
+// the window the first claim wins again. The home chain's tags never expire (nothing here runs there).
+
+use std::sync::RwLock;
+
+/// (INSC kinds 5-8 are the inscription market's; the tag kinds go from 20.)
+pub const KIND_CHECKIN: u8 = 20;
+pub const KIND_COMMIT: u8 = 21;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Expiry {
+    /// Seconds without activity before the grace begins.
+    pub idle: u64,
+    /// Seconds of grace: still the owner's, flagged as expiring.
+    pub grace: u64,
+    /// Blocks after a release in which claims need a commitment (the earliest wins).
+    pub reveal_blocks: u32,
+    /// Least fee of a check-in's transaction.
+    pub checkin_fee: u64,
+    /// Seconds after a released tag changes owner that a send to it warns.
+    pub warn: u64,
+}
+
+impl Expiry {
+    /// The released time of a tag last active at `t`.
+    pub fn due(&self, t: u64) -> u64 {
+        t.saturating_add(self.idle).saturating_add(self.grace)
+    }
+}
+
+static EXPIRY: RwLock<BTreeMap<u16, Expiry>> = RwLock::new(BTreeMap::new());
+
+/// Turn expiry on (or off) for chain `c`: set by the ARCADE chain's service when it starts, before any block is indexed.
+pub fn set_expiry(c: u16, e: Option<Expiry>) {
+    let mut m = EXPIRY.write().unwrap();
+    match e {
+        Some(e) => m.insert(c, e),
+        None => m.remove(&c),
+    };
+}
+
+pub fn expiry(c: u16) -> Option<Expiry> {
+    EXPIRY.read().unwrap().get(&c).copied()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpiryOp {
+    CheckIn(String),
+    Commit([u8; 32]),
+}
+
+/// A check-in or commit record (kinds 5 and 6), on a chain with expiry. None = neither.
+pub fn parse_expiry_op(payload: &[u8]) -> Option<Result<ExpiryOp, &'static str>> {
+    if payload.len() < 4 || u16::from_be_bytes([payload[2], payload[3]]) != TYPE_ANY_DATA {
+        return None;
+    }
+    let d = &payload[4..];
+    if d.len() < 6 || &d[..4] != b"INSC" || d[4] != 1 || !(d[5] == KIND_CHECKIN || d[5] == KIND_COMMIT) {
+        return None;
+    }
+    Some((|| {
+        let len = *d.get(6).ok_or("truncated")? as usize;
+        let raw = d.get(7..7 + len).ok_or("truncated")?;
+        if d[5] == KIND_COMMIT {
+            return Ok(ExpiryOp::Commit(raw.try_into().map_err(|_| "a commitment is 32 bytes")?));
+        }
+        let tag = std::str::from_utf8(raw).map_err(|_| "not utf-8")?.to_string();
+        if let Some(p) = tag_problem(&tag) {
+            return Err(p);
+        }
+        Ok(ExpiryOp::CheckIn(tag))
+    })())
+}
+
+fn kind_payload(kind: u8, body: &[u8]) -> Vec<u8> {
+    let mut p = vec![0, 0];
+    p.extend_from_slice(&TYPE_ANY_DATA.to_be_bytes());
+    p.extend_from_slice(b"INSC");
+    p.extend_from_slice(&[1, kind, body.len() as u8]);
+    p.extend_from_slice(body);
+    p
+}
+
+pub fn checkin_payload(tag: &str) -> Vec<u8> {
+    kind_payload(KIND_CHECKIN, tag.as_bytes())
+}
+
+pub fn commit_payload(commitment: &[u8; 32]) -> Vec<u8> {
+    kind_payload(KIND_COMMIT, commitment)
+}
+
+/// A claim carrying the salt of its commitment (after the tag; readers that don't know it ignore it).
+pub fn claim_payload_salted(tag: &str, salt: &[u8]) -> Vec<u8> {
+    let mut p = claim_payload(tag);
+    p.push(salt.len() as u8);
+    p.extend_from_slice(salt);
+    p
+}
+
+/// The salt a claim carries, if any.
+pub fn claim_salt(payload: &[u8]) -> Option<Vec<u8>> {
+    let d = payload.get(4..)?;
+    let len = *d.get(6)? as usize;
+    let at = 7 + len;
+    let n = *d.get(at)? as usize;
+    d.get(at + 1..at + 1 + n).map(|s| s.to_vec())
+}
+
+/// What a commit record names: `sha256("arcade tag commit" 0 tag 0 address 0 salt)`.
+pub fn commitment(tag: &str, address: &str, salt: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    for part in [b"arcade tag commit".as_slice(), tag.as_bytes(), address.as_bytes(), salt] {
+        h.update(part);
+        h.update([0]);
+    }
+    h.finalize().into()
+}
+
 /// names_digest over rows in tag order: sha256 of "{tag}|{address}|{block_height}\n".
 pub fn digest<'a>(rows: impl Iterator<Item = (&'a str, &'a TagRow)>) -> String {
     let mut h = Sha256::new();
@@ -196,6 +320,30 @@ mod tests {
         t.truncate(t.len() - 1);
         assert_eq!(parse(&t), Some(Err("truncated")));
         assert_eq!(parse(&[0, 0, 0, 0]), None);
+    }
+
+    #[test]
+    fn expiry_records_read_back_and_stay_unknown_to_plain_readers() {
+        let c = commitment("bob", "aXyz", b"salt");
+        assert_ne!(c, commitment("bob", "aXyz", b"salu"));
+        assert_ne!(c, commitment("bob", "aXy", b"zsalt"), "parts are separated");
+        assert_eq!(parse_expiry_op(&commit_payload(&c)), Some(Ok(ExpiryOp::Commit(c))));
+        assert_eq!(parse_expiry_op(&checkin_payload("bob")), Some(Ok(ExpiryOp::CheckIn("bob".into()))));
+        assert_eq!(parse_expiry_op(&checkin_payload("Bob")), Some(Err("only a-z, 0-9 and _")));
+        // The home chain's reader doesn't know kinds 20 and 21 (nothing changes there).
+        assert_eq!(parse(&commit_payload(&c)), None);
+        assert_eq!(parse(&checkin_payload("bob")), None);
+        // A salted claim is still a claim to every reader, and its salt reads back.
+        let salted = claim_payload_salted("bob", b"0123456789abcdef");
+        assert_eq!(parse(&salted), Some(Ok(TagOp::Claim("bob".into()))));
+        assert_eq!(claim_salt(&salted).as_deref(), Some(&b"0123456789abcdef"[..]));
+        assert_eq!(claim_salt(&claim_payload("bob")), None);
+        let x = Expiry { idle: 10, grace: 5, reveal_blocks: 3, checkin_fee: 1, warn: 1 };
+        assert_eq!(x.due(100), 115);
+        set_expiry(9_999, Some(x));
+        assert_eq!(expiry(9_999), Some(x));
+        set_expiry(9_999, None);
+        assert_eq!(expiry(9_999), None);
     }
 
     #[test]

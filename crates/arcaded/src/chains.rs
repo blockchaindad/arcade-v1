@@ -357,7 +357,8 @@ pub fn add(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>) -> Res
     }
     let key = by_key(key).map(|p| p.key).unwrap_or(key);
     let p = by_key(key).ok_or_else(|| format!("unknown chain {key}; see  arcade chain list"))?;
-    if let Some(busy) = installing_now(node).filter(|b| b.key != p.key) {
+    // Headers only is small and quick (§15 step 15): it never waits behind another chain's install.
+    if let Some(busy) = installing_now(node).filter(|b| b.key != p.key && mode != "light") {
         if node.extra.lock().unwrap().contains_key(p.key) {
             return Err(format!("{} is already installed", p.name));
         }
@@ -389,8 +390,12 @@ fn add_now(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>) -> Res
     if !MODES.contains(&mode) {
         return Err(format!("mode must be one of {}", MODES.join(", ")));
     }
-    if mode == "light" || mode == "index" {
-        return Err("Light and Index-only storage (borrowing blocks from the mesh) are coming; use full or chain for now".into());
+    if mode == "index" {
+        return Err("Index-only storage (borrowing blocks from the mesh) is coming; use full, chain or light for now".into());
+    }
+    // Light: the chain's headers only (§15 step 15), no blocks, no indexes.
+    if mode == "light" && !indexes.is_empty() {
+        return Err("Light storage keeps headers only: no indexes".into());
     }
     let indexes = normalize(p, &indexes, false)?;
     if mode == "chain" && indexes.iter().any(|i| i != "addresses") {
@@ -884,8 +889,14 @@ pub fn status(node: &Node, key: &str) -> Result<Value, String> {
     if let Some(cur) = stages.iter_mut().find(|s| s["pct"].as_f64().unwrap_or(0.0) < 100.0) {
         cur["current"] = json!(true);
     }
-    let overall = stages.iter().filter(|s| s["info"] != true).map(|s| s["overall_pct"].as_f64().or(s["pct"].as_f64()).unwrap_or(0.0)).sum::<f64>()
+    let mut overall = stages.iter().filter(|s| s["info"] != true).map(|s| s["overall_pct"].as_f64().or(s["pct"].as_f64()).unwrap_or(0.0)).sum::<f64>()
         / stages.iter().filter(|s| s["info"] != true).count().max(1) as f64;
+    // Headers only: done when the best header reaches the network's height.
+    if mode == "light" {
+        let hdr = node.chain.best_header(p.chain_no).ok().flatten().and_then(|b| node.chain.header(p.chain_no, &b).ok().flatten()).map_or(0, |r| r.height as u64);
+        let top = run.as_ref().map_or(0, |r| r.peer_tip.load(Ordering::Relaxed) as u64).max(hdr);
+        overall = if top == 0 { 0.0 } else { 100.0 * hdr as f64 / top as f64 };
+    }
     let state = match &run {
         Some(r) => {
             if r.paused.load(Ordering::Relaxed) {
@@ -1233,6 +1244,51 @@ fn take_chain(c: u16, stop: &AtomicBool, mut waiting: impl FnMut()) -> Option<Fo
     }
 }
 
+/// A chain kept by its headers only (mode "light", §15 step 15): genesis, then header rounds from the coin's P2P
+/// peers, checked as a full sync checks them; never a block. Every arcade follows Bitcoin's this way (beacons, fraud
+/// proofs about Bitcoin segments).
+fn follow_headers(node: &Node, run: &ChainRun, syncer: &Syncer) {
+    let p = run.params;
+    let set = |s: String| *run.state.lock().unwrap() = s;
+    let height = || node.chain.best_header(p.chain_no).ok().flatten().and_then(|b| node.chain.header(p.chain_no, &b).ok().flatten()).map(|r| r.height).unwrap_or(0);
+    'outer: while !run.stop.load(Ordering::Relaxed) {
+        if run.paused.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_secs(2));
+            continue;
+        }
+        let Some(mut peer) = Node::dial_first(p, &node.coin_candidates(p), false) else {
+            set(format!("headers only · {}; no {} peer reachable, retrying", height(), p.name));
+            std::thread::sleep(Duration::from_secs(20));
+            continue;
+        };
+        run.peer_tip.fetch_max(peer.version.start_height.max(0) as u32, Ordering::Relaxed);
+        *run.source.lock().unwrap() = format!("{} P2P peer {} ({})", p.name, peer.addr, peer.version.user_agent.trim_matches('/'));
+        node.note_coin_peer(p.net, &peer.addr.to_string());
+        if let Err(e) = syncer.ensure_genesis(&mut peer) {
+            set(format!("genesis: {e}"));
+            std::thread::sleep(Duration::from_secs(10));
+            continue;
+        }
+        loop {
+            if run.stop.load(Ordering::Relaxed) || run.paused.load(Ordering::Relaxed) {
+                continue 'outer;
+            }
+            match syncer.sync_headers_once(&mut peer) {
+                Ok(0) => {
+                    set(format!("headers only · at header {} (the network's tip)", height()));
+                    std::thread::sleep(Duration::from_secs(30));
+                }
+                Ok(_) => set(format!("headers only · header {} of {}", height(), run.peer_tip.load(Ordering::Relaxed))),
+                Err(e) => {
+                    set(format!("headers: {e}"));
+                    crate::peerbook::fail(node, p.net, &peer.addr.to_string());
+                    continue 'outer;
+                }
+            }
+        }
+    }
+}
+
 fn follow(node: Arc<Node>, run: Arc<ChainRun>) {
     let p = run.params;
     let syncer = Syncer::new(&node.chain, p);
@@ -1240,6 +1296,9 @@ fn follow(node: Arc<Node>, run: Arc<ChainRun>) {
     // One thread stores a chain at a time: a restart launches this one while the old thread
     // may still be inside a round, and two writers undo each other's batches.
     let Some(_one) = take_chain(p.chain_no, &run.stop, || set("waiting for the previous sync of this chain to stop".into())) else { return };
+    if run.mode == "light" {
+        return follow_headers(&node, &run, &syncer);
+    }
     mesh_first(&node, &run, &syncer);
     let mut last_mesh = std::time::Instant::now();
     // The first balancing pass waits until the mesh has told us who holds what.

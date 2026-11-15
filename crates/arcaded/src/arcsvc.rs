@@ -57,7 +57,7 @@ use std::time::{Duration, Instant};
 /// Blocks in one answer, and its most bytes (at least one full block: 4 MB of storage
 /// section and 1 MB of transactions since §14.19).
 const ANSWER_BLOCKS: usize = 50;
-const ANSWER_BYTES: usize = 8 << 20;
+const ANSWER_BYTES: usize = 16 << 20;
 const _: () = assert!(ANSWER_BYTES >= arcade_arc::block::MAX_BLOCK_BYTES);
 /// A peer is asked again for a branch it named after this long without it.
 const ASK_AGAIN: Duration = Duration::from_secs(10);
@@ -144,6 +144,18 @@ pub struct Settings {
     /// The final genesis list block 0 starts from (§10, §14.24: `"list"`, as the bulletin's final.json writes it);
     /// its hash must be `genesis.final_list`.
     pub list: Option<arcade_arc::genesis::FinalList>,
+    /// Seconds after which an old block may travel without its blobs' bytes (local test chains: `blob_window`).
+    pub blob_window: u64,
+    /// Seconds a Temporary blob is kept (local test chains: `blob_temporary`; 90 days).
+    pub blob_temporary: u64,
+    /// @tag expiry on this chain's ledger (§15 step 8; local test chains: `tag_idle`, `tag_grace`, `tag_reveal_blocks`,
+    /// `tag_warn`).
+    pub tag_expiry: arcade_ledger::tags::Expiry,
+    /// Release checkpoints (§15 step 18): (height, block id) pairs each release ships, so a new or long-offline arcade
+    /// takes only the branch that holds them (`"checkpoints": [[height, "id"], ...]`).
+    pub checkpoints: Vec<(u64, Hash256)>,
+    /// Where the ledger snapshot named in block 0 is (a file; §15 step 19).
+    pub ledger_snapshot: Option<std::path::PathBuf>,
 }
 
 /// A final genesis list as final.json writes it (crate::arcgenesis): entries as item bytes, owners with replicas.
@@ -193,6 +205,16 @@ impl Settings {
             beacon_2: hash("beacon_2")?,
             // A string: the number can be longer than JSON numbers hold.
             difficulty: v["genesis"]["difficulty"].as_str().and_then(|d| d.parse().ok()).filter(|d| *d >= 1).ok_or("settings: genesis.difficulty must be a number in quotes")?,
+            // Mainnet: the first code release block 0 names (§15 step 17).
+            code: match v["genesis"]["code"].as_str() {
+                Some(_) => Some(hash("code")?),
+                None => None,
+            },
+            // The home chain's ledger snapshot it starts from (§15 step 19): its hash; the file is `ledger_snapshot`.
+            ledger: match v["genesis"]["ledger"].as_str() {
+                Some(_) => Some(hash("ledger")?),
+                None => None,
+            },
         };
         let mut holders = Vec::new();
         for h in v["holders"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
@@ -254,7 +276,27 @@ impl Settings {
         if holders.is_empty() && list.is_none() {
             return Err("settings: no holders and no genesis list: nobody could write block 1".into());
         }
-        Ok(Settings { genesis, holders, steps_per_second, segment_bytes, block_seconds, clock, audit_period, rules, list })
+        let secs = |k: &str, d: u64| v[k].as_u64().filter(|x| *x >= 1).unwrap_or(d);
+        let blob_window = secs("blob_window", params::BLOB_WINDOW);
+        let blob_temporary = secs("blob_temporary", 90 * 24 * 3600);
+        // 12 months of no activity, then 30 days' grace; a day of blocks to reveal committed claims; a check-in pays
+        // 0.1 ARCADE; sends warn for 90 days after a released tag changes hands (§15.1).
+        let tag_expiry = arcade_ledger::tags::Expiry {
+            idle: secs("tag_idle", 365 * 86_400),
+            grace: secs("tag_grace", 30 * 86_400),
+            reveal_blocks: secs("tag_reveal_blocks", 86_400 / params::BLOCK_SECONDS) as u32,
+            checkin_fee: params::COIN / 10,
+            warn: secs("tag_warn", 90 * 86_400),
+        };
+        let mut checkpoints = Vec::new();
+        for c in v["checkpoints"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
+            let (Some(h), Some(id)) = (c[0].as_u64(), c[1].as_str().and_then(|x| Hash256::from_hex(x).ok())) else {
+                return Err("settings: a checkpoint is [height, \"block id\"]".into());
+            };
+            checkpoints.push((h, id));
+        }
+        let ledger_snapshot = v["ledger_snapshot"].as_str().map(std::path::PathBuf::from);
+        Ok(Settings { genesis, holders, steps_per_second, segment_bytes, block_seconds, clock, audit_period, rules, list, blob_window, blob_temporary, tag_expiry, checkpoints, ledger_snapshot })
     }
 }
 
@@ -281,6 +323,9 @@ struct Peer {
     /// When its link last ticked.
     seen: Option<Instant>,
     asked: Option<Instant>,
+    /// When the last frame of the answer to our ask came: an answer still coming in is never asked over (a catch-up
+    /// with megabytes of blobs takes longer than ASK_AGAIN under load, and asking again threw its frames away, for good).
+    answer_at: Option<Instant>,
     ask_id: u64,
     /// The answer being put together: next frame number, bytes so far.
     parts: Option<(u64, Vec<u8>)>,
@@ -427,6 +472,9 @@ pub fn reconcile<T: TimeProofs, S: Storage>(db: &ChainDb, p: &ChainParams, chain
 /// Hand a block to the chain; a new tip goes to the store (the chain's one copy on disk: a side
 /// block is kept in memory only, and comes again from other arcades after a restart).
 fn take(node: &Node, svc: &Svc, block: Block) -> Result<Accepted, ChainError> {
+    // A block from a peer comes decoded without its blob ids (they follow from its bytes and the network): made here,
+    // so its blobs' bytes are kept below as well as checked by the chain.
+    let block = block.with_blob_ids(&svc.net);
     let mut st = svc.st.lock().unwrap();
     if svc.stop.load(Ordering::Relaxed) {
         return Ok(Accepted::Known);
@@ -440,6 +488,9 @@ fn take(node: &Node, svc: &Svc, block: Block) -> Result<Accepted, ChainError> {
     if got == Accepted::Known {
         return Ok(got);
     }
+    // Its blobs' bytes (checked by the chain) into the store, on any branch: a block taken on a side branch may yet be
+    // joined, and handed on.
+    crate::arcblob::keep_block(&svc.net, &block);
     if let Accepted::Tip { undone, .. } = &got {
         crate::arcseg::forget(&block.items);
         new_tip(node, svc, &mut st, undone);
@@ -453,6 +504,9 @@ fn new_tip(node: &Node, svc: &Svc, st: &mut State, undone: &[Hash256]) {
     let back: Vec<Tx> = undone.iter().rev().filter_map(|id| st.chain.block(id)).flat_map(|b| b.txs.iter().skip(1).cloned()).collect();
     st.pool.retip(st.chain.coins(), st.chain.tip().height + 1, back);
     st.refused.clear();
+    // Waiting blobs no waiting transaction brings any more go (the store keeps what blocks brought).
+    let named: std::collections::HashSet<arcade_arc::merkle::Hash> = st.pool.iter().flat_map(|w| w.blobs.iter().map(|b| b.0)).collect();
+    crate::arcblob::forget_except(&named);
     if let Err(e) = reconcile(&node.chain, svc.params, &st.chain) {
         eprintln!("arc: {e}");
     }
@@ -480,14 +534,42 @@ fn retry_waiting(node: &Node, svc: &Svc) {
 struct NodeSources(Arc<Node>);
 
 impl arcade_arc::registry::Sources for NodeSources {
+    // A chain kept whole answers from its blocks; one followed by headers only (Bitcoin on every arcade, §15 step 15)
+    // from its best header branch.
     fn tip(&self, chain: &str) -> Option<u64> {
         let p = crate::chains::find(chain)?;
-        self.0.chain.tip(p.chain_no).ok().flatten().map(|t| t.height as u64)
+        let blocks = self.0.chain.tip(p.chain_no).ok().flatten().map(|t| t.height as u64);
+        let headers = self.0.chain.best_header(p.chain_no).ok().flatten().and_then(|b| self.0.chain.header(p.chain_no, &b).ok().flatten()).map(|r| r.height as u64);
+        blocks.max(headers)
     }
     fn hash_at(&self, chain: &str, height: u64) -> Option<Hash256> {
         let p = crate::chains::find(chain)?;
-        self.0.chain.hash_at(p.chain_no, u32::try_from(height).ok()?).ok().flatten()
+        let h = u32::try_from(height).ok()?;
+        self.0.chain.hash_at(p.chain_no, h).ok().flatten().or_else(|| self.0.chain.header_hash_at(p, h).ok().flatten())
     }
+    fn ord_claim(&self, value: &[u8]) -> Option<arcade_arc::registry::OrdClaim> {
+        ord_claim(value)
+    }
+    fn envelope(&self, chain: &str, raw: &[u8], e: u32) -> Option<Option<(Vec<u8>, u64)>> {
+        let p = crate::chains::find(chain)?;
+        let tx = arcade_chain::Tx::parse_with(raw, &p.format).ok()?;
+        Some(arcade_ledger::ordwit::envelopes(&tx).get(e as usize).map(|x| (String::from_utf8_lossy(x.content_type.as_deref().unwrap_or_default()).into_owned().into_bytes(), x.body.as_ref().map_or(0, |b| b.len() as u64))))
+    }
+}
+
+/// What an ord inscription row says about its making (§15 step 13): one-piece inscriptions only.
+pub fn ord_claim(value: &[u8]) -> Option<arcade_arc::registry::OrdClaim> {
+    let v: Value = serde_json::from_slice(value).ok()?;
+    if v["pieces"].as_u64() != Some(1) || v["txs"].as_array()?.len() != 1 {
+        return None;
+    }
+    Some(arcade_arc::registry::OrdClaim {
+        txid: Hash256::from_hex(v["txs"][0].as_str()?).ok()?.0,
+        height: v["h"].as_u64()?,
+        e: v["e"].as_u64()? as u32,
+        content_type: v["ct"].as_str()?.as_bytes().to_vec(),
+        size: v["size"].as_u64()?,
+    })
 }
 
 /// A transaction from this arcade or from a peer: into the pool if it may wait there. Its fee.
@@ -502,7 +584,15 @@ fn take_tx(svc: &Svc, raw: &[u8]) -> Result<(Hash256, u64), PoolError> {
     if st.refused.contains(&id) {
         return Err(PoolError::Refused);
     }
-    match st.pool.add(tx, st.chain.coins(), st.chain.tip().height + 1) {
+    // Its records' blobs the chain hasn't got must be here (they came with it, or ahead of it in `bl` frames).
+    if arcade_arc::blob::records(&tx).iter().any(|r| {
+        let id = r.id(&svc.net);
+        !st.chain.holds_blob(&id) && !crate::arcblob::here(&id)
+    }) {
+        return Err(PoolError::BlobMissing);
+    }
+    let chain = &st.chain;
+    match st.pool.add_with(tx, chain.coins(), chain.tip().height + 1, &svc.net, &|id| chain.holds_blob(id)) {
         Ok(fee) => Ok((id, fee)),
         Err(e) => {
             // A coin that isn't there may yet come (its transaction is on the way, or a
@@ -568,9 +658,21 @@ fn write_block(chain: &LocalChain, pool: &Pool, secret: &[u8; 32], ticket: &Tick
     // The coinbase pays what is owed, then (rules 2) the writer's own share; fees join the pot (§14.18).
     let outputs = chain.payouts_for(&arcade_arc::vrf::public_key(secret));
     let coinbase_bytes = coins::coinbase(ticket.height, &ticket.prev, b"", &outputs).raw.len();
-    let (mut txs, _fees) = pool.pick(params::MAX_TX_BYTES.saturating_sub(coinbase_bytes));
+    let (mut txs, _fees) = pool.pick_with(params::MAX_TX_BYTES.saturating_sub(coinbase_bytes), arcade_arc::blob::MAX_BLOB_BYTES, &|id| !chain.holds_blob(id));
+    // The bytes of the blobs those bring that the chain hasn't got (the pool took them only with their bytes here).
+    let mut new = HashMap::new();
+    for tx in &txs {
+        for r in arcade_arc::blob::records(tx) {
+            let id = r.id(chain.net());
+            if !chain.holds_blob(&id) && !new.contains_key(&id) {
+                if let Some(b) = crate::arcblob::get(&id) {
+                    new.insert(id, b);
+                }
+            }
+        }
+    }
     txs.insert(0, coins::coinbase(ticket.height, &ticket.prev, b"", &outputs));
-    ticket.seal(chain.net(), secret, time, txs, items, pot, seed)
+    ticket.seal_with_blobs(chain.net(), secret, time, txs, items, pot, seed, &new)
 }
 
 /// What a block carries of `waiting` (§9): in group order; registration commits by their stamp's work, most first
@@ -644,6 +746,7 @@ fn run_writer_on(node: Arc<Node>, svc: Arc<Svc>, wrote: &mut VecDeque<Hash256>, 
     let mut on: Option<Hash256> = None;
     // The draw for the tip, its draw seed's proof, and whether it could be the height's best (crate::arckeep).
     let mut ticket: Option<(Ticket, Option<TimeProof>, bool)> = None;
+    let mut alone_said: Option<Instant> = None;
     let mut written: Option<Block> = None;
     // The VDF's proof of time for this tip's ticket, made in the background: (tip, its proof when done).
     let proving: Arc<Mutex<Option<(Hash256, Option<TimeProof>)>>> = Arc::new(Mutex::new(None));
@@ -676,6 +779,21 @@ fn run_writer_on(node: Arc<Node>, svc: Arc<Svc>, wrote: &mut VecDeque<Hash256>, 
                 });
             }
             let Some((t, seed, likely)) = &ticket else { continue };
+            // Never far alone: while others hold weight, a branch only this arcade writes could outrun the reorg limit
+            // and never join theirs (3-arcade test nets split so: first while their links came up under load, then
+            // with links up but no blocks getting through). No block from anyone else in the last half of the limit
+            // means this arcade isn't hearing the network (on a healthy one an arcade with a third of the weight
+            // writes 50 in a row once in 3^50 tries): it waits until another's block comes.
+            if (t.weight as u128) < st.chain.storage().total_weight() {
+                let me = node.identity.verifying_key().to_bytes();
+                if alone_streak(&st.chain, &me, params::REORG_LIMIT / 2) >= params::REORG_LIMIT / 2 {
+                    if alone_said.is_none_or(|t: Instant| t.elapsed() > Duration::from_secs(60)) {
+                        eprintln!("arc: not writing: the last {} blocks are this arcade's alone ({} arcades linked); waiting for another's block", params::REORG_LIMIT / 2, linked_peers().len());
+                        alone_said = Some(Instant::now());
+                    }
+                    continue;
+                }
+            }
             let pot = match *st.chain.proofs() {
                 // The stand-in: wait as long as the steps would take.
                 Clock::StandIn => {
@@ -765,17 +883,23 @@ fn installed_key(net: &Net) -> Vec<u8> {
 /// main"): its block 0 and genesis list, built in. `--arc-local <settings>` replaces it with a
 /// local test chain (closed test networks only).
 pub const TESTNET_SETTINGS: &str = include_str!("../arctest.json");
+/// The home chain's ledger the testnet's block 0 names (§15 step 19), built in with its settings.
+pub const TESTNET_LEDGER: &str = include_str!("../arctest-ledger.json");
 
 /// Read the settings of the chain this arcade can install, and start it if it is installed.
 pub fn define(node: &Arc<Node>, settings: &std::path::Path) -> Result<(), String> {
     let text = std::fs::read_to_string(settings).map_err(|e| format!("{}: {e}", settings.display()))?;
+    LOCAL.store(true, Ordering::Relaxed);
     define_text(node, &text)
 }
+
+/// The chain came from `--arc-local` settings (a closed test network).
+static LOCAL: AtomicBool = AtomicBool::new(false);
 
 /// [`define`] from the settings' text (the built-in testnet's, or a file's).
 pub fn define_text(node: &Arc<Node>, text: &str) -> Result<(), String> {
     let s = Settings::parse(&params::TESTNET, text)?;
-    let net = Net { block_seconds: s.block_seconds, audit_period: s.audit_period, rules: s.rules.unwrap_or(params::TESTNET.rules), ..params::TESTNET };
+    let net = Net { block_seconds: s.block_seconds, audit_period: s.audit_period, rules: s.rules.unwrap_or(params::TESTNET.rules), blob_window: s.blob_window, ..params::TESTNET };
     registry_of(&net, &s)?;
     let genesis = s.genesis.id(&net);
     let def = Def { net, params: store::chain_params(&net, &genesis), genesis, settings: s };
@@ -844,10 +968,20 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
     let (net, s, genesis, p) = (def.net, &def.settings, def.genesis, def.params);
     let mut holders = registry_of(&net, s)?;
     holders.set_sources(Arc::new(NodeSources(node.clone())));
-    let mut chain = Chain::new(net, &s.genesis, s.clock, holders, &[]);
+    let mut chain = Chain::new(net, &s.genesis, s.clock, holders, &s.checkpoints);
 
     let dir = node.home.join("arc").join(net.key);
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    crate::arcblob::init(dir.join("blobs"));
+    crate::arcblob::set_boost_secs(s.blob_temporary);
+    if let Some(mb) = node.app.store.read(|r| r.get(arcade_app::META, b"arc_cache_mb")).ok().flatten().and_then(|v| String::from_utf8(v).ok()?.parse::<u64>().ok()) {
+        crate::arcblob::set_cache_limit(mb << 20);
+    }
+    {
+        // A dropped plain copy is read back from this arcade's sealed replica of the blob family.
+        let (n, net2) = (Arc::downgrade(node), net);
+        crate::arcblob::set_sealed_reader(Box::new(move |h| { let node = n.upgrade()?; crate::arcseal::sealed_unit(&node, &net2, net2.key, arcade_arc::segment::FAMILY_BLOBS, h) }));
+    }
     let t0 = Instant::now();
     let mut refused = 0;
     // The chain's one copy on disk is the store's (docs/ARCADECHAIN.md §14.17): its best branch
@@ -858,7 +992,9 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
         let mut batch = Vec::new();
         for h in 1..=tip {
             let Some(b) = node.chain.hash_at(p.chain_no, h).ok().flatten().and_then(|id| node.chain.block_raw(p.chain_no, &id).ok().flatten())
-                .and_then(|raw| arcade_chain::Block::parse_with(&raw, &p.format).ok()).and_then(|sb| unstored(&sb)) else { break };
+                .and_then(|raw| arcade_chain::Block::parse_with(&raw, &p.format).ok()).and_then(|sb| unstored(&sb))
+                // The store keeps a block's blob ids; their bytes come back from the blob store to be checked again.
+                .and_then(|b| crate::arcblob::attach(&b)) else { break };
             batch.push(b);
             if batch.len() == 1_000 {
                 held += batch.len();
@@ -882,7 +1018,69 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
             while node.chain.remove_chain_batch(p.chain_no, 50_000).map_err(db_err)? > 0 {}
         }
     }
+    // The ledger on ARCADE (§15 step 7): tags, profiles and every arcade record, indexed in the same commit as each block
+    // the store takes; an arcade that stored blocks before it had them walks those once, below.
+    arcade_ledger::tags::set_expiry(p.chain_no, Some(s.tag_expiry));
+    let ledger: [Arc<dyn arcade_chaindb::Indexer>; 2] = [Arc::new(arcade_ledger::engine::LedgerIndexer), Arc::new(arcade_ledger::index::ProfileIndexer)];
+    let ledger_names: Vec<&'static str> = ledger.iter().map(|ix| ix.name()).collect();
+    for ix in ledger {
+        node.chain.add_indexer(p.chain_no, ix).map_err(db_err)?;
+    }
+    // The home chain's ledger, carried in (§15 step 19): once, before block 1, when block 0 names a snapshot.
+    if let Some(want) = s.genesis.ledger {
+        let done = node.app.store.read(|r| r.get(arcade_app::META, b"arc_ledger_snapshot")).ok().flatten().is_some();
+        if !done {
+            // A file the settings name (local test chains), else the one built in with the testnet's settings.
+            let text = match &s.ledger_snapshot {
+                Some(path) => std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?,
+                None if !LOCAL.load(Ordering::Relaxed) => TESTNET_LEDGER.as_bytes().to_vec(),
+                None => return Err("block 0 names a ledger snapshot: the settings' ledger_snapshot must say where it is".into()),
+            };
+            let snap: Value = serde_json::from_slice(&text).map_err(|e| format!("ledger snapshot: {e}"))?;
+            if arcade_ledger::snapshot::hash(&snap) != want {
+                return Err("the ledger snapshot isn't the one block 0 names".into());
+            }
+            let n = arcade_ledger::snapshot::import(&node.chain, p, &snap).map_err(db_err)?;
+            node.app.store.write(|w| w.put(arcade_app::META, b"arc_ledger_snapshot", &want)).map_err(|e| e.to_string())?;
+            eprintln!("arc: the ledger snapshot of {} at block {} carried in: {} tags, {} tokens, {} balances", snap["chain"], snap["height"], n.tags, n.tokens, n.balances);
+        }
+    }
     reconcile(&node.chain, p, &chain)?;
+    {
+        let n = node.clone();
+        std::thread::Builder::new()
+            .name("arc ledger walk".into())
+            .spawn(move || {
+                for name in ledger_names {
+                    loop {
+                        match n.chain.backfill(p, name, 500) {
+                            Ok(0) => break,
+                            Ok(_) => std::thread::sleep(Duration::from_millis(30)),
+                            Err(e) => {
+                                eprintln!("arc: the {name} index: {e}");
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+            .map_err(|e| e.to_string())?;
+    }
+    // Every arcade follows Bitcoin's headers (§15 step 15: beacons, fraud proofs about Bitcoin segments): added in
+    // light mode (headers only, about 70 MB) unless Bitcoin is kept here already. Not on local test chains.
+    if !LOCAL.load(Ordering::Relaxed) {
+        let n = node.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(20));
+            if n.extra.lock().unwrap().contains_key("btc") {
+                return;
+            }
+            match crate::chains::add(&n, "btc", "light", Vec::new()) {
+                Ok(_) => eprintln!("arc: following Bitcoin's headers (light)"),
+                Err(e) => eprintln!("arc: Bitcoin's headers: {e}"),
+            }
+        });
+    }
     if old_log.exists() {
         // The store now holds every block of the branch whole: the old copy goes.
         let stored_whole = (1..=chain.tip().height).all(|h| {
@@ -969,7 +1167,23 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
     // (its ticket is None while it has none).
     {
         let n = node.clone();
+        let svc = svc.clone();
         std::thread::Builder::new().name("arc writer".into()).spawn(move || run_writer(n, svc)).map_err(|e| e.to_string())?;
+    }
+    // The blob pruner (§15 step 3): plain copies the classes say may go, unless this arcade is an archive.
+    {
+        let (n, svc2, temporary) = (node.clone(), svc.clone(), s.blob_temporary);
+        std::thread::Builder::new()
+            .name("arc blob pruner".into())
+            .spawn(move || loop {
+                let every = (svc2.net.blob_window / 4).clamp(5, 300);
+                std::thread::sleep(Duration::from_secs(every));
+                if svc2.stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                prune_blobs(&n, &svc2, temporary);
+            })
+            .map_err(|e| e.to_string())?;
     }
     // The time keeper (crate::arckeep): one thread for the arcade's life, idle unless turned on.
     static KEEPER: std::sync::Once = std::sync::Once::new();
@@ -1076,6 +1290,7 @@ fn ask(svc: &Svc, link: &mut Link) -> Result<(), LinkError> {
         let p = peers.entry(link.peer_id.clone()).or_default();
         p.ask_id += 1;
         p.asked = Some(Instant::now());
+        p.answer_at = None;
         p.parts = Some((0, Vec::new()));
         p.ask_id
     };
@@ -1108,7 +1323,9 @@ fn serve(svc: &Svc, link: &mut Link, head: &Value) -> Result<(), LinkError> {
         let mut next = known.unwrap_or(0) + 1;
         let (mut blocks, mut bytes) = (Vec::new(), 0usize);
         while next <= top && blocks.len() < ANSWER_BLOCKS {
-            let b = chain.block(&chain.id_at(next).expect("a height of the branch")).expect("a block of the branch").encode();
+            // With its blobs' bytes again (the chain keeps their ids only); a block whose blob is gone ends the answer.
+            let Some(full) = crate::arcblob::attach(chain.block(&chain.id_at(next).expect("a height of the branch")).expect("a block of the branch")) else { break };
+            let b = full.encode();
             if !blocks.is_empty() && bytes + b.len() > ANSWER_BYTES {
                 break;
             }
@@ -1140,11 +1357,13 @@ fn on_answer(node: &Node, svc: &Svc, link: &mut Link, f: &Frame) -> Result<(), L
         let Some((next, bytes)) = p.parts.as_mut() else { return Ok(()) };
         if f.head["seq"].as_u64() != Some(*next) || bytes.len() + f.blob.len() > ANSWER_BYTES + (ANSWER_BLOCKS * 4) {
             // Out of order or too long: not an answer we can use. Asked again later.
+            eprintln!("arc: an answer from {} dropped: frame {:?} where {} was next, {} bytes so far", &link.peer_id[..link.peer_id.len().min(12)], f.head["seq"].as_u64(), *next, bytes.len());
             p.parts = None;
             return Ok(());
         }
         *next += 1;
         bytes.extend_from_slice(&f.blob);
+        p.answer_at = Some(Instant::now());
         if f.head["end"] != true {
             return Ok(());
         }
@@ -1153,11 +1372,13 @@ fn on_answer(node: &Node, svc: &Svc, link: &mut Link, f: &Frame) -> Result<(), L
     let mut gained = false;
     for raw in split_blocks(&data).unwrap_or_default() {
         let Ok(block) = Block::decode(&raw) else { break };
+        let (bh, nblobs, missing) = (block.header.height, block.blob_ids.len().max(block.blobs.len()), block.blobs.iter().filter(|b| b.is_empty()).count());
         match take(node, svc, block) {
             Ok(Accepted::Known) => {}
             Ok(_) => gained = true,
             Err(e) => {
-                eprintln!("arc: a block from {} wasn't taken: {e}", &link.peer_id[..link.peer_id.len().min(12)]);
+                let tip = svc.st.lock().unwrap().chain.tip().height;
+                eprintln!("arc: a block from {} wasn't taken: {e} (its height {bh}, our tip {tip}, {nblobs} blobs, {missing} without bytes)", &link.peer_id[..link.peer_id.len().min(12)]);
                 if broke_rules(&e) {
                     strike(svc, &link.peer_id);
                 }
@@ -1208,7 +1429,9 @@ pub fn on_frame(node: &Node, link: &mut Link, f: &Frame) -> Result<(), LinkError
                 p.heard = true;
                 p.wants = (!have).then_some(id);
                 // While an ask is out, its answer decides whether to ask again.
-                !have && p.asked.is_none_or(|t| t.elapsed() > ASK_AGAIN)
+                // An answer still arriving is waited for: only one that stalled is asked over.
+                let streaming = p.parts.is_some() && p.answer_at.is_some_and(|t| t.elapsed() <= ASK_AGAIN);
+                !have && !streaming && p.asked.is_none_or(|t| t.elapsed() > ASK_AGAIN)
             };
             if ask_now {
                 ask(svc, link)?;
@@ -1223,6 +1446,10 @@ pub fn on_frame(node: &Node, link: &mut Link, f: &Frame) -> Result<(), LinkError
             }
         }
         "txs" => on_txs(svc, link, f)?,
+        // A waiting blob ahead of the transactions that bring it (crate::arcblob).
+        "bl" => crate::arcblob::on_piece(&svc.net, &link.peer_id, &f.head, &f.blob),
+        // A blob piece asked of this arcade (a viewer's arcade fetching it, crate::arcblob::view).
+        "bq" => crate::arcblob::serve_piece(link, &f.head)?,
         "it" => {
             crate::arcseg::on_items(&svc.net, &f.blob);
         }
@@ -1324,6 +1551,26 @@ fn serve_txs(svc: &Svc, link: &mut Link, id: u64, blob: &[u8]) -> Result<(), Lin
         }
         (txs, ids.len() - reached)
     };
+    // The blobs they bring that the chain hasn't got go first, so they are here when the transactions arrive.
+    let blobs: Vec<(arcade_arc::merkle::Hash, Vec<u8>)> = {
+        let st = svc.st.lock().unwrap();
+        let mut seen = std::collections::HashSet::new();
+        ids.iter()
+            .filter_map(|t| st.pool.get(t))
+            .flat_map(|w| w.blobs.iter().map(|b| b.0))
+            .filter(|b| !st.chain.holds_blob(b) && seen.insert(*b))
+            .filter_map(|b| crate::arcblob::get(&b).map(|bytes| (b, bytes)))
+            .collect()
+    };
+    for (bid, bytes) in blobs {
+        let pieces: Vec<&[u8]> = bytes.chunks(CHUNK).collect();
+        let k = pieces.len();
+        for (i, c) in pieces.into_iter().enumerate() {
+            let mut f = frame(svc, "bl", json!({"id": hex::encode(bid), "seq": i, "end": i + 1 == k}));
+            f.blob = c.to_vec();
+            link.send(&f)?;
+        }
+    }
     let data = join_blocks(&txs);
     let chunks: Vec<&[u8]> = if data.is_empty() { vec![&[][..]] } else { data.chunks(CHUNK).collect() };
     let n = chunks.len();
@@ -1385,7 +1632,8 @@ pub fn tick(_node: &Node, link: &mut Link) -> Result<(), LinkError> {
         p.said = Some(id);
         let first = say && !p.greeted;
         p.greeted |= say;
-        (say, first, p.wants.is_some() && p.asked.is_none_or(|t| t.elapsed() > ASK_AGAIN))
+        let streaming = p.parts.is_some() && p.answer_at.is_some_and(|t| t.elapsed() <= ASK_AGAIN);
+        (say, first, p.wants.is_some() && !streaming && p.asked.is_none_or(|t| t.elapsed() > ASK_AGAIN))
     };
     if say {
         link.send(&frame(svc, "tip", json!({"id": id.to_hex(), "h": height, "w": total, "new": first})))?;
@@ -1532,6 +1780,54 @@ pub fn spender(at: &OutPoint) -> Option<Hash256> {
 }
 
 /// A wallet's signed transaction: into the pool, from where it goes to the other arcades.
+/// The arcades linked now that speak the ARCADE chain (seen lately, with a mesh link up), to ask for a blob.
+pub fn linked_peers() -> Vec<String> {
+    let Some(svc) = svc() else { return Vec::new() };
+    let peers = svc.peers.lock().unwrap();
+    peers.iter().filter(|(id, p)| p.seen.is_some_and(|t| t.elapsed() < LINKED) && crate::crvia::linked(id)).map(|(id, _)| id.clone()).collect()
+}
+
+/// The running ARCADE chain's network.
+pub fn svc_net() -> Option<Net> {
+    svc().map(|s| s.net)
+}
+
+/// Whether the running ARCADE chain's best branch holds blob `id` (crate::arcblob).
+pub fn holds_blob(id: &arcade_arc::merkle::Hash) -> bool {
+    svc().is_some_and(|s| s.st.lock().unwrap().chain.holds_blob(id))
+}
+
+/// `arc.blob {id}`: a blob's bytes (hex) and whether the chain holds it.
+pub fn blob(req: &Value) -> Result<Value, String> {
+    let id: arcade_arc::merkle::Hash = req["id"].as_str().and_then(|s| hex::decode(s).ok()).and_then(|b| b.try_into().ok()).ok_or("id required (64 hex)")?;
+    // Fetched from the arcades this one is linked to when it isn't here (kept in the viewer cache).
+    let bytes = crate::arcblob::view(&id).ok_or("no such blob here, nor at the arcades linked to this one")?;
+    Ok(json!({"id": hex::encode(id), "bytes": bytes.len(), "on_chain": holds_blob(&id), "hex": hex::encode(&bytes)}))
+}
+
+/// Whether a coin is unspent on the running ARCADE chain's best branch.
+pub fn unspent(op: &OutPoint) -> bool {
+    svc().is_some_and(|s| s.st.lock().unwrap().chain.coins().contains_key(op))
+}
+
+/// How many blocks in a row up to the tip `me` wrote (at most `max`).
+fn alone_streak<T: arcade_arc::time::TimeProofs, S: arcade_arc::chain::Storage>(chain: &Chain<T, S>, me: &[u8; 32], max: u64) -> u64 {
+    let tip = chain.tip().height;
+    let mut n = 0;
+    while n < max && n < tip {
+        match chain.id_at(tip - n).and_then(|id| chain.block(&id)) {
+            Some(b) if b.header.writer == *me => n += 1,
+            _ => break,
+        }
+    }
+    n
+}
+
+/// Whether transaction `txid` waits in the ARCADE chain's pool.
+pub fn pooled(txid: &Hash256) -> bool {
+    svc().is_some_and(|s| s.st.lock().unwrap().pool.iter().any(|w| w.tx.txid == *txid))
+}
+
 pub fn send_raw(raw: &[u8]) -> Result<(Hash256, u64), String> {
     let svc = svc().ok_or("the ARCADE chain isn't running here")?;
     take_tx(&svc, raw).map_err(|e| e.to_string())
@@ -1574,6 +1870,106 @@ pub fn raw_block_at(h: u64) -> Option<Vec<u8>> {
     }
     let id = st.chain.id_at(h)?;
     st.chain.block(&id).map(Block::encode)
+}
+
+/// Height `h`'s unit of the ARCADE chain's blob family (segment::FAMILY_BLOBS): the blobs that block brought, from the
+/// blob store. None while one isn't here.
+pub fn blobs_unit_at(h: u64) -> Option<Vec<u8>> {
+    let svc = svc()?;
+    let ids = {
+        let st = svc.st.lock().unwrap();
+        if h == 0 {
+            Vec::new()
+        } else {
+            // Temporary blobs aren't kept by the storage network (§15 step 3): not in the family.
+            let id = st.chain.id_at(h)?;
+            let b = st.chain.block(&id)?;
+            // A blob's class is the first record's that names it in the block.
+            let mut class: HashMap<arcade_arc::merkle::Hash, arcade_arc::blob::Class> = HashMap::new();
+            for r in b.txs.iter().skip(1).flat_map(arcade_arc::blob::records) {
+                class.entry(r.id(&svc.net)).or_insert(r.class);
+            }
+            use arcade_arc::blob::Class;
+            b.blob_ids.iter().filter(|i| !matches!(class.get(*i), Some(Class::Temporary | Class::Boost))).copied().collect()
+        }
+    };
+    let mut out = Vec::new();
+    arcade_chain::encode::write_varint(&mut out, ids.len() as u64);
+    for id in &ids {
+        let b = crate::arcblob::get(id)?;
+        arcade_chain::encode::write_varint(&mut out, b.len() as u64);
+        out.extend_from_slice(&b);
+    }
+    Some(out)
+}
+
+/// Replicas the network holds of the blob-family segment covering ARCADE height `h` (0 while none is listed), and
+/// whether this arcade holds one itself.
+fn blob_copies(node: &Node, svc: &Svc, h: u64) -> (u64, bool) {
+    use arcade_arc::segment::FAMILY_BLOBS;
+    let here = crate::arcseal::replicas(node, &svc.net).iter().any(|r| r.chain == svc.net.key && r.family == FAMILY_BLOBS && r.first <= h && h <= r.last);
+    let st = svc.st.lock().unwrap();
+    let reg = st.chain.storage();
+    let copies = reg
+        .catalog()
+        .spans(svc.net.key, FAMILY_BLOBS)
+        .filter(|(first, last, _)| *first <= h && h <= *last)
+        .find_map(|(_, _, listed)| listed.map(|l| reg.holders_of(&l.id)))
+        .unwrap_or(0);
+    (copies, here)
+}
+
+/// Whether this arcade keeps every blob's plain copy (`arc.archive`).
+pub fn archive(node: &Node) -> bool {
+    node.app.store.read(|r| r.get(arcade_app::META, b"arc_archive")).ok().flatten().is_some_and(|v| v == b"1")
+}
+
+/// One round of the blob classes (§15.1): a Temporary blob goes `temporary` seconds after its block; a Permanent or
+/// Release blob's plain copy goes once its block is older than the window and the storage network holds it (5
+/// replicas, or one here: reads unseal it), but the newest 5 of each release line stay plain.
+fn prune_blobs(node: &Node, svc: &Svc, temporary: u64) {
+    if archive(node) {
+        return;
+    }
+    use arcade_arc::blob::Class;
+    let now = arcade_app::now();
+    let known = crate::arcblob::known();
+    let mut newest: HashMap<String, Vec<(u64, arcade_arc::merkle::Hash)>> = HashMap::new();
+    for (id, m) in &known {
+        if m.class == Class::Release as u8 {
+            newest.entry(m.line.clone()).or_default().push((m.height, *id));
+        }
+    }
+    let mut keep_plain: HashSet<arcade_arc::merkle::Hash> = HashSet::new();
+    for list in newest.values_mut() {
+        list.sort_by(|a, b| b.0.cmp(&a.0));
+        keep_plain.extend(list.iter().take(5).map(|x| x.1));
+    }
+    let (mut dropped, mut freed) = (0, 0u64);
+    for (id, m) in known {
+        // Boosted (§15 step 4): kept plain until the boost runs out, whatever the class.
+        if m.boosted_until > now {
+            continue;
+        }
+        if m.class == Class::Temporary as u8 || m.class == Class::Boost as u8 {
+            if m.time.saturating_add(temporary).max(m.boosted_until) <= now {
+                freed += crate::arcblob::forget(&id);
+                dropped += 1;
+            }
+            continue;
+        }
+        if keep_plain.contains(&id) || !crate::arcblob::plain_here(&id) || m.time.saturating_add(svc.net.blob_window) > now {
+            continue;
+        }
+        let (copies, here) = blob_copies(node, svc, m.height);
+        if here || copies >= 5 {
+            freed += crate::arcblob::drop_plain(&id);
+            dropped += 1;
+        }
+    }
+    if dropped > 0 {
+        eprintln!("arc: blob classes: {dropped} plain copies dropped ({freed} bytes)");
+    }
 }
 
 /// The ARCADE chain's height here.
@@ -1946,6 +2342,11 @@ pub fn segment_root(node: &Node, req: &Value) -> Result<Value, String> {
 pub fn submit(req: &Value) -> Result<Value, String> {
     let svc = svc().ok_or("the ARCADE chain isn't running here")?;
     let raw = req["hex"].as_str().and_then(|h| hex::decode(h).ok()).ok_or("hex required")?;
+    // The bytes of the blobs it brings (crate::arcblob), held until a block brings them.
+    for b in req["blobs"].as_array().into_iter().flatten() {
+        let bytes = b.as_str().and_then(|h| hex::decode(h).ok()).ok_or("blobs are hex")?;
+        crate::arcblob::hold(&svc.net, bytes).ok_or("a blob is too big, or there is no room for more waiting blobs")?;
+    }
     let (id, fee) = take_tx(&svc, &raw).map_err(|e| e.to_string())?;
     Ok(json!({"id": id.to_hex(), "fee": fee}))
 }

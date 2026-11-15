@@ -9,7 +9,26 @@ function agoText(t) {
   return `${Math.round(s / 3600)} hours ago`;
 }
 
+async function refreshCache() {
+  try {
+    const c = await api("arc.cache");
+    $("o-cache-mb").textContent = c.on ? `${c.mb} MB` : "off";
+    $("o-cache-use").textContent = `${c.files} files, ${(c.bytes / 1048576).toFixed(1)} MB`;
+    if (document.activeElement !== $("o-cache-in")) $("o-cache-in").value = c.mb;
+  } catch (e) {
+    $("o-cache-mb").textContent = "—";
+    $("o-cache-use").textContent = "the ARCADE chain isn't running here";
+  }
+}
+$("o-cache-set").addEventListener("click", async () => {
+  const mb = Math.max(0, Math.floor(Number($("o-cache-in").value) || 0));
+  try { await api("arc.cache", { mb }); say("o-cache-msg", mb ? `Blob cache set to ${mb} MB.` : "Blob cache off."); }
+  catch (e) { say("o-cache-msg", e.message, true); }
+  refreshCache();
+});
+
 async function refreshOptions() {
+  refreshCache();
   const u = await api("update.status");
   $("o-ver").textContent = u.version || "local build";
   $("o-new").textContent = u.newest ? (u.newer ? `${u.newest} (newer)` : `${u.newest} (this one)`) : "—";

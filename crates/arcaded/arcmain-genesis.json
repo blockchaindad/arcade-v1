@@ -1,0 +1,22 @@
+{
+ "net": "arc",
+ "_note": "Mainnet genesis (docs/ARCADECHAIN.md \u00a710, \u00a715 step 17). Run with --arc-genesis on the assembler and every arcade taking part. Before 2026-12-21: set block_0.code to the first code release's id (scripts/code-publish.py) and block_0.difficulty from the expected list weight (the testnet's restart rule); both are named in block 0, so they can't change after.",
+ "assembler": "b2c3efb8060c4ec479dffa1353f97ad1cf575fac558d72dc1cfa20a6092e634d",
+ "_assembler": "the GX10",
+ "segment_bytes": 16777216,
+ "opens": 1797811200,
+ "closes": 1798416000,
+ "beacon_1": 1798459200,
+ "answers_1_by": 1798545600,
+ "beacon_2": 1798588800,
+ "answers_2_by": 1798675200,
+ "beacon_chain": "btc",
+ "beacon_depth": 6,
+ "block_0": {
+  "time": 1798761600,
+  "difficulty": "55819391973383240",
+  "clock": "vdf",
+  "code": null,
+  "_times": "2026-12-21 commits open; 12-28 the list closes; beacons 12-28 12:00 and 12-30 00:00; answers by 12-29 12:00 and 12-31 00:00; 12-31 the final list (corrected from receipts) is public; block 0 2027-01-01 00:00 UTC"
+ }
+}

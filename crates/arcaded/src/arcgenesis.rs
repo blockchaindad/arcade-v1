@@ -321,11 +321,28 @@ fn assemble(node: &Node) {
     }
     let closing = arcade_app::now() >= s.closes && BOARD.get().closed.is_none();
     if closing {
-        let h = closed_list().hash(&s.net);
+        let mut l = closed_list();
+        // Rehearsals of the correction (§15 step 16): an assembler that leaves a receipted commit out.
+        if std::env::var_os("ARCADE_GENESIS_TEST_LEAVE_OUT").is_some() {
+            let me = node.identity.verifying_key().to_bytes();
+            if let Some(at) = l.commits.iter().rposition(|c| c.owner != me) {
+                let c = l.commits.remove(at);
+                eprintln!("arc genesis: (test) leaving out the receipted commit of {}", hex::encode(&c.owner[..8]));
+            }
+        }
+        let h = l.hash(&s.net);
         let sig = block::sign(&node.identity, &closed_message(&s.net, &h));
         take(Record::Closed(h, sig));
         eprintln!("arc genesis: the list closed: {}", hex::encode(h));
     }
+}
+
+/// The closed list's hash, as every arcade makes it from the receipted items on its bulletin (§10, §15 step 16). The
+/// assembler's signed closed hash is only a check: a receipt proves its item belongs in the list, so a list the
+/// assembler closed without a receipted item is corrected here, by everyone alike, and the seeds, the final list and
+/// block 0 all follow the corrected one.
+fn closed_hash(net: &Net) -> Hash {
+    closed_list().hash(net)
 }
 
 /// The closed list: receipted catalog entries and commits.
@@ -504,7 +521,7 @@ fn take_part(node: &Arc<Node>) {
         Phase::Answers1 if !mine.answered_1 => {
             let (Some(b1), _) = beacons(node) else { return };
             let Some(c) = my_commit(&me) else { return };
-            let closed = BOARD.get().closed.map(|x| x.0).unwrap_or_else(|| closed_list().hash(&net));
+            let closed = closed_hash(&net);
             let pseed = genesis::proof_seed(&net, &closed, &b1);
             let held: Option<Vec<&crate::arcseal::Replica>> = c.replicas.iter().map(|(seg, _)| replicas.iter().find(|r| r.segment == *seg)).collect();
             let Some(held) = held else { return eprintln!("arc genesis: a replica of our commit isn't here any more") };
@@ -531,7 +548,7 @@ fn take_part(node: &Arc<Node>) {
         Phase::Answers2 if !mine.answered_2 => {
             let (_, Some(b2)) = beacons(node) else { return };
             let Some(c) = my_commit(&me) else { return };
-            let closed = BOARD.get().closed.map(|x| x.0).unwrap_or_else(|| closed_list().hash(&net));
+            let closed = closed_hash(&net);
             let oseed = genesis::open_seed(&net, &closed, &b2);
             for (seg, _) in &c.replicas {
                 let Some(r) = replicas.iter().find(|r| r.segment == *seg) else { continue };
@@ -552,12 +569,21 @@ fn take_part(node: &Arc<Node>) {
                 if let Some((list, struck)) = final_list(node) {
                     let fj = final_json(&net, &list, &struck);
                     let _ = std::fs::write(&out, fj.to_string());
-                    if let (Some(b0), (Some(b1), Some(b2))) = (&s.block_0, beacons(node)) {
-                        let closed = BOARD.get().closed.map(|x| x.0).unwrap_or_else(|| closed_list().hash(&net));
+                    // Mainnet starts from a named code release only (§15 step 17).
+                    let code_missing = net == params::MAINNET && s.block_0.as_ref().is_some_and(|b| b["code"].as_str().is_none_or(|c| c.len() != 64));
+                    if code_missing {
+                        *NOTE.lock().unwrap() = "block 0 isn't written: the settings' block_0.code doesn't name the first code release".into();
+                    }
+                    if let (Some(b0), (Some(b1), Some(b2)), false) = (&s.block_0, beacons(node), code_missing) {
+                        let closed = closed_hash(&net);
                         let mut chain = b0.clone();
                         chain["net"] = json!(net.key);
                         chain["genesis"] = json!({"time": b0["time"], "difficulty": b0["difficulty"], "closed_list": hex::encode(closed),
                             "final_list": hex::encode(list.hash(&net)), "beacon_1": hex::encode(b1), "beacon_2": hex::encode(b2)});
+                        // Mainnet: block 0 names the first code release (§15 step 17), from the settings' block_0.
+                        if let Some(code) = b0["code"].as_str() {
+                            chain["genesis"]["code"] = json!(code);
+                        }
                         chain["segment_bytes"] = json!(s.segment_bytes);
                         chain["list"] = json!({"entries": fj["entries"], "owners": fj["owners"]});
                         // In block_0 "time" is block 0's moment; in chain settings it names the clock ("clock" here).
@@ -699,7 +725,9 @@ pub fn status(node: &Node) -> Result<Value, String> {
     Ok(json!({
         "net": s.net.key, "phase": format!("{ph:?}"), "assembler": hex::encode(s.assembler), "i_am_assembler": me == s.assembler,
         "records": records, "items": items, "receipts": receipts,
-        "closed": {"entries": closed.entries.len(), "commits": closed.commits.len(), "hash_here": hex::encode(closed.hash(&s.net)), "hash_assembler": assembler_closed},
+        "closed": {"entries": closed.entries.len(), "commits": closed.commits.len(), "hash_here": hex::encode(closed.hash(&s.net)), "hash_assembler": assembler_closed.clone(),
+                   // The assembler's list left a receipted item out (or took an unreceipted one): corrected (§15 step 16).
+                   "corrected": assembler_closed.is_some_and(|a| a != hex::encode(closed.hash(&s.net)))},
         "beacons": [b1.map(hex::encode), b2.map(hex::encode)],
         "my_commit_receipted": mine_receipted > 0,
         "note": NOTE.lock().unwrap().clone(),
