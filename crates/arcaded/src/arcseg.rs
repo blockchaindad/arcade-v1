@@ -155,6 +155,9 @@ pub fn unit_bytes(node: &Node, p: &ChainParams, family: u8, h: u32) -> Option<Ve
     if family == segment::FAMILY_COINS {
         return coins_record(node, p, h);
     }
+    if family == segment::FAMILY_BLOBS {
+        return crate::arcsvc::runs(p).then(|| crate::arcsvc::blobs_unit_at(h as u64)).flatten();
+    }
     let (start, _) = journal_span(node, p, family)?;
     if h < start {
         return Some(arcade_chaindb::journal::EMPTY.to_vec());
@@ -212,7 +215,10 @@ fn journal_span(node: &Node, p: &ChainParams, family: u8) -> Option<(u32, u32)> 
 /// The families of a chain this arcade can cut: the blocks, and every journaled index.
 pub fn families(node: &Node, p: &ChainParams) -> Vec<u8> {
     let mut v = vec![segment::FAMILY_BLOCKS];
-    if !crate::arcsvc::runs(p) {
+    if crate::arcsvc::runs(p) {
+        // The ARCADE chain's blobs, sealed and paid as its blocks are.
+        v.push(segment::FAMILY_BLOBS);
+    } else {
         // The coins each block spends: from the blocks, on every coin kept here.
         v.push(segment::FAMILY_COINS);
         v.extend(JOURNALED.iter().map(|(f, _)| *f).filter(|f| journal_span(node, p, *f).is_some()));
@@ -234,6 +240,7 @@ pub fn family_name(family: u8) -> &'static str {
         MAPS => "maps",
         TAGS => "tags",
         segment::FAMILY_COINS => "coins",
+        segment::FAMILY_BLOBS => "blobs",
         _ => "index",
     }
 }
@@ -252,7 +259,10 @@ fn tip_of(node: &Node, p: &ChainParams) -> u32 {
 fn measure(node: &Node, p: &ChainParams, family: u8, most: usize) -> bool {
     let tip = tip_of(node, p);
     let mut settled = tip.saturating_sub(SETTLED) as u64;
-    if family != segment::FAMILY_BLOCKS {
+    // Blocks, the coins they spend and the ARCADE chain's blobs are made from the chain itself: as far as it is settled.
+    // An index journal no further than the index has journaled. (Until 2026-11-14 the coins family was measured as a
+    // journal, found none, and was never cut.)
+    if !matches!(family, segment::FAMILY_BLOCKS | segment::FAMILY_COINS | segment::FAMILY_BLOBS) {
         let Some((_, to)) = journal_span(node, p, family) else { return false };
         settled = settled.min(to as u64);
     }
@@ -452,7 +462,7 @@ fn seal_work(node: &Node, net: &Net, p: &ChainParams, family: u8) -> Option<(u64
     let mut settled = tip.checked_sub(SETTLED as u64)?;
     // An index family no further than its index has journaled; blocks and the coins they spend (made from the blocks)
     // as far as the chain is settled.
-    if family != segment::FAMILY_BLOCKS && family != segment::FAMILY_COINS {
+    if !matches!(family, segment::FAMILY_BLOCKS | segment::FAMILY_COINS | segment::FAMILY_BLOBS) {
         settled = settled.min(journal_span(node, p, family)?.1 as u64);
     }
     Some((next, settled))
@@ -515,6 +525,10 @@ fn close_then_prune(open: crate::arcseal::Open, full: u64, range_ended: bool, cl
 
 /// One copy on disk once a segment is closed: the sealed one (the ARCADE chain keeps its own blocks as it writes them).
 fn prune_closed(node: &Node, p: &'static ChainParams, family: u8, first: u64, last: u64) -> u64 {
+    // Blobs keep their plain copies here: which may go, and when, is their class's (§15 step 3).
+    if family == segment::FAMILY_BLOBS {
+        return 0;
+    }
     if family == segment::FAMILY_BLOCKS {
         if crate::arcsvc::runs(p) { 0 } else { prune_sealed(node, p, first, last) }
     } else {

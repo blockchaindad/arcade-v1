@@ -30,12 +30,16 @@ pub const FAMILY_BLOCKS: u8 = 0;
 pub const FAMILY_ORD: u8 = 1;
 /// The families (2 to 8: the other indexes in the same layout, arcade_chaindb::journal: ledger,
 /// profiles, messages, names, tokens, maps, tags) the catalog lists.
-pub const FAMILIES: &[u8] = &[FAMILY_BLOCKS, FAMILY_ORD, 2, 3, 4, 5, 6, 7, 8, FAMILY_COINS];
+pub const FAMILIES: &[u8] = &[FAMILY_BLOCKS, FAMILY_ORD, 2, 3, 4, 5, 6, 7, 8, FAMILY_COINS, FAMILY_BLOBS];
 /// The coins each block spends (Martin 2026-11-12): with the blocks, everything the coin tables and the address index
 /// are rebuilt from. Per height: u32 count, then per input of every transaction but the coinbase, in block order: the
 /// coin's txid (32), vout (u32), value (u64), the height it was made at (u32), 1 if a coinbase made it else 0, its
 /// script (u32 length + bytes). All little-endian.
 pub const FAMILY_COINS: u8 = 9;
+/// The ARCADE chain's blobs (§15 step 2, crate::blob): per height, the blobs that block brought, in its order: a varint
+/// count, then each as a varint length and its bytes (a block that brought none: the count 0). Sealed, audited and paid
+/// as any family, so the arcades that keep the blobs are paid for keeping them.
+pub const FAMILY_BLOBS: u8 = 10;
 /// Bytes of one table row.
 pub const ROW: u64 = 8;
 

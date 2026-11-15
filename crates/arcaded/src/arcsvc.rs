@@ -1646,6 +1646,28 @@ pub fn raw_block_at(h: u64) -> Option<Vec<u8>> {
     st.chain.block(&id).map(Block::encode)
 }
 
+/// Height `h`'s unit of the ARCADE chain's blob family (segment::FAMILY_BLOBS): the blobs that block brought, from the
+/// blob store. None while one isn't here.
+pub fn blobs_unit_at(h: u64) -> Option<Vec<u8>> {
+    let svc = svc()?;
+    let ids = {
+        let st = svc.st.lock().unwrap();
+        if h == 0 {
+            Vec::new()
+        } else {
+            st.chain.blob_ids(&st.chain.id_at(h)?)
+        }
+    };
+    let mut out = Vec::new();
+    arcade_chain::encode::write_varint(&mut out, ids.len() as u64);
+    for id in &ids {
+        let b = crate::arcblob::get(id)?;
+        arcade_chain::encode::write_varint(&mut out, b.len() as u64);
+        out.extend_from_slice(&b);
+    }
+    Some(out)
+}
+
 /// The ARCADE chain's height here.
 pub fn height() -> Option<u64> {
     Some(svc()?.st.lock().unwrap().chain.tip().height)
