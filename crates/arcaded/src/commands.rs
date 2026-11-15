@@ -153,6 +153,7 @@ cmds! {
     "ledger.announce" Wallet "" "Publish this wallet's profile (messaging key under its @tag) on the ARCADE chain.";
     "ledger.profile" Read "address | tag" "A profile and @tag as the ARCADE chain's ledger holds them.";
     "ledger.send" Wallet "hex" "Send one arcade record (the whole payload after the marker) on the ARCADE chain.";
+    "ledger.balances" Read "address" "An address's arcade token balances on the ARCADE chain (free, reserved, offered, accepted).";
     "ledger.tag_commit" Wallet "tag" "Commit ahead to claiming a released @tag on the ARCADE chain.";
     "ledger.tag_checkin" Wallet "" "Keep this wallet's @tag on the ARCADE chain with a check-in (0.1 ARCADE into the pot).";
     "ledger.repo_push" Wallet "name, manifest" "Point @owner/name at a git manifest blob (owner or maintainer).";

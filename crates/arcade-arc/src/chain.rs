@@ -55,6 +55,11 @@ pub struct Genesis {
     pub beacon_2: Hash,
     /// `D` for the first epoch.
     pub difficulty: u128,
+    /// The first code release the network starts from (crates/arcaded arccode: its record's id), on mainnet: block 0
+    /// names it, so the code is fixed by the chain itself (§15 step 17). None on the test networks made before.
+    pub code: Option<Hash>,
+    /// The home chain's ledger snapshot the ARCADE ledger starts from (§15 step 19: arcade-ledger snapshot), its SHA-256.
+    pub ledger: Option<Hash>,
 }
 
 impl Genesis {
@@ -63,7 +68,7 @@ impl Genesis {
         Hash256(tagged::hash(
             net,
             "block 0",
-            &[&self.time.to_le_bytes(), &self.closed_list, &self.final_list, &self.beacon_1, &self.beacon_2, &self.difficulty.to_le_bytes()],
+            &[&self.time.to_le_bytes(), &self.closed_list, &self.final_list, &self.beacon_1, &self.beacon_2, &self.difficulty.to_le_bytes(), self.code.as_ref().map_or(&[][..], |c| &c[..]), self.ledger.as_ref().map_or(&[][..], |c| &c[..])],
         ))
     }
 
@@ -1035,7 +1040,7 @@ pub(crate) mod tests {
     }
 
     fn genesis() -> Genesis {
-        Genesis { time: START, closed_list: [1; 32], final_list: [2; 32], beacon_1: [3; 32], beacon_2: [4; 32], difficulty: 1 << 40 }
+        Genesis { time: START, closed_list: [1; 32], final_list: [2; 32], beacon_1: [3; 32], beacon_2: [4; 32], difficulty: 1 << 40, code: None, ledger: None }
     }
 
     fn holders() -> FixedHolders {
@@ -1724,6 +1729,9 @@ pub(crate) mod tests {
         let g = genesis();
         assert_ne!(g.id(&NET), g.id(&params::MAINNET));
         assert_ne!(g.id(&NET), Genesis { beacon_1: [9; 32], ..g.clone() }.id(&NET));
+        // A code release named changes block 0; none leaves the ids made before as they were.
+        assert_ne!(g.id(&NET), Genesis { code: Some([7; 32]), ..g.clone() }.id(&NET));
+        assert_eq!(g.id(&NET), Hash256(tagged::hash(&NET, "block 0", &[&g.time.to_le_bytes(), &g.closed_list, &g.final_list, &g.beacon_1, &g.beacon_2, &g.difficulty.to_le_bytes()])));
         assert_ne!(g.draw_seed(&NET), Genesis { beacon_2: [9; 32], ..g.clone() }.draw_seed(&NET));
         // The final list can't steer the first draw seed (§10).
         assert_eq!(g.draw_seed(&NET), Genesis { final_list: [9; 32], ..g.clone() }.draw_seed(&NET));

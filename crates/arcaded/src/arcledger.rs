@@ -360,3 +360,16 @@ pub fn items(node: &Node, req: &Value) -> Result<Value, String> {
     }
     Ok(json!({"repo": format!("@{full}"), "items": out}))
 }
+
+/// `ledger.balances {address}`: an address's arcade token balances on ARCADE, each [free, reserved, offered, accepted].
+pub fn balances(node: &Node, address: &str) -> Result<Value, String> {
+    let c = chain()?.chain_no;
+    let pre = arcade_store::KeyBuf::new().u16(c).bytes(address.as_bytes()).u8(0).done();
+    let rows = node.chain.store(c).read(|r| r.scan_prefix(arcade_ledger::engine::BALANCE, &pre)).map_err(|e| e.to_string())?;
+    let list: Vec<Value> = rows.into_iter().filter_map(|(k, v)| {
+        let pid = u32::from_be_bytes(k.get(k.len() - 4..)?.try_into().ok()?);
+        let a: Vec<u64> = (0..4).map(|i| v.get(i * 8..i * 8 + 8).map_or(0, |b| u64::from_be_bytes(b.try_into().unwrap()))).collect();
+        Some(json!({"id": pid, "amounts": a}))
+    }).collect();
+    Ok(json!({"address": address, "balances": list}))
+}

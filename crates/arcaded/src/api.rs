@@ -349,6 +349,7 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         "ledger.items" => crate::arcledger::items(node, &req),
         "ledger.repo" => crate::arcledger::repo(node, &s("name").ok_or("name required")?),
         "ledger.repos" => crate::arcledger::repos(node, s("owner").as_deref()),
+        "ledger.balances" => crate::arcledger::balances(node, &s("address").ok_or("address required")?),
         "ledger.tag_commit" => crate::arcledger::tag_commit(node, &s("tag").ok_or("tag required")?),
         "ledger.tag_checkin" => crate::arcledger::tag_checkin(node),
         "ledger.send" => {

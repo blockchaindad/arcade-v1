@@ -25,5 +25,12 @@
  ],
  "steps_per_second": 250000,
  "segment_bytes": 16777216,
- "time": "vdf"
+ "time": "vdf",
+ "checkpoints": [
+  [
+   1000,
+   "68edf4355fafff5acace91b5f82b56c508e8ae47e863c32dce9334b0ae2816f1"
+  ]
+ ],
+ "_checkpoints": "Release checkpoints (§15 step 18): each release adds the newest settled block, so a new or long-offline arcade takes only the branch through them."
 }

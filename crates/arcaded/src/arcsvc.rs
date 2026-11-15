@@ -151,6 +151,11 @@ pub struct Settings {
     /// @tag expiry on this chain's ledger (§15 step 8; local test chains: `tag_idle`, `tag_grace`, `tag_reveal_blocks`,
     /// `tag_warn`).
     pub tag_expiry: arcade_ledger::tags::Expiry,
+    /// Release checkpoints (§15 step 18): (height, block id) pairs each release ships, so a new or long-offline arcade
+    /// takes only the branch that holds them (`"checkpoints": [[height, "id"], ...]`).
+    pub checkpoints: Vec<(u64, Hash256)>,
+    /// Where the ledger snapshot named in block 0 is (a file; §15 step 19).
+    pub ledger_snapshot: Option<std::path::PathBuf>,
 }
 
 /// A final genesis list as final.json writes it (crate::arcgenesis): entries as item bytes, owners with replicas.
@@ -200,6 +205,16 @@ impl Settings {
             beacon_2: hash("beacon_2")?,
             // A string: the number can be longer than JSON numbers hold.
             difficulty: v["genesis"]["difficulty"].as_str().and_then(|d| d.parse().ok()).filter(|d| *d >= 1).ok_or("settings: genesis.difficulty must be a number in quotes")?,
+            // Mainnet: the first code release block 0 names (§15 step 17).
+            code: match v["genesis"]["code"].as_str() {
+                Some(_) => Some(hash("code")?),
+                None => None,
+            },
+            // The home chain's ledger snapshot it starts from (§15 step 19): its hash; the file is `ledger_snapshot`.
+            ledger: match v["genesis"]["ledger"].as_str() {
+                Some(_) => Some(hash("ledger")?),
+                None => None,
+            },
         };
         let mut holders = Vec::new();
         for h in v["holders"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
@@ -273,7 +288,15 @@ impl Settings {
             checkin_fee: params::COIN / 10,
             warn: secs("tag_warn", 90 * 86_400),
         };
-        Ok(Settings { genesis, holders, steps_per_second, segment_bytes, block_seconds, clock, audit_period, rules, list, blob_window, blob_temporary, tag_expiry })
+        let mut checkpoints = Vec::new();
+        for c in v["checkpoints"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
+            let (Some(h), Some(id)) = (c[0].as_u64(), c[1].as_str().and_then(|x| Hash256::from_hex(x).ok())) else {
+                return Err("settings: a checkpoint is [height, \"block id\"]".into());
+            };
+            checkpoints.push((h, id));
+        }
+        let ledger_snapshot = v["ledger_snapshot"].as_str().map(std::path::PathBuf::from);
+        Ok(Settings { genesis, holders, steps_per_second, segment_bytes, block_seconds, clock, audit_period, rules, list, blob_window, blob_temporary, tag_expiry, checkpoints, ledger_snapshot })
     }
 }
 
@@ -940,7 +963,7 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
     let (net, s, genesis, p) = (def.net, &def.settings, def.genesis, def.params);
     let mut holders = registry_of(&net, s)?;
     holders.set_sources(Arc::new(NodeSources(node.clone())));
-    let mut chain = Chain::new(net, &s.genesis, s.clock, holders, &[]);
+    let mut chain = Chain::new(net, &s.genesis, s.clock, holders, &s.checkpoints);
 
     let dir = node.home.join("arc").join(net.key);
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -993,6 +1016,20 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
     // The ledger on ARCADE (§15 step 7): tags, profiles and every arcade record, indexed in the same commit as each block
     // the store takes; an arcade that stored blocks before it had them walks those once, below.
     arcade_ledger::tags::set_expiry(p.chain_no, Some(s.tag_expiry));
+    // The home chain's ledger, carried in (§15 step 19): once, before block 1, when block 0 names a snapshot.
+    if let Some(want) = s.genesis.ledger {
+        let done = node.app.store.read(|r| r.get(arcade_app::META, b"arc_ledger_snapshot")).ok().flatten().is_some();
+        if !done {
+            let path = s.ledger_snapshot.clone().ok_or("block 0 names a ledger snapshot: the settings' ledger_snapshot must say where it is")?;
+            let snap: Value = serde_json::from_slice(&std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?).map_err(|e| format!("ledger snapshot: {e}"))?;
+            if arcade_ledger::snapshot::hash(&snap) != want {
+                return Err("the ledger snapshot isn't the one block 0 names".into());
+            }
+            let n = arcade_ledger::snapshot::import(&node.chain, p, &snap).map_err(db_err)?;
+            node.app.store.write(|w| w.put(arcade_app::META, b"arc_ledger_snapshot", &want)).map_err(|e| e.to_string())?;
+            eprintln!("arc: the ledger snapshot of {} at block {} carried in: {} tags, {} tokens, {} balances", snap["chain"], snap["height"], n.tags, n.tokens, n.balances);
+        }
+    }
     let ledger: [Arc<dyn arcade_chaindb::Indexer>; 2] = [Arc::new(arcade_ledger::engine::LedgerIndexer), Arc::new(arcade_ledger::index::ProfileIndexer)];
     let ledger_names: Vec<&'static str> = ledger.iter().map(|ix| ix.name()).collect();
     for ix in ledger {

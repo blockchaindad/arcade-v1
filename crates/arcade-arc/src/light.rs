@@ -236,7 +236,7 @@ mod tests {
     fn genesis(c: &TestChain) -> Genesis {
         // The test chain's block 0, read back from what the chain made of it.
         let zero = c.entry(&c.id_at(0).unwrap()).unwrap();
-        Genesis { time: zero.time, closed_list: [1; 32], final_list: [2; 32], beacon_1: [3; 32], beacon_2: [4; 32], difficulty: zero.difficulty }
+        Genesis { time: zero.time, closed_list: [1; 32], final_list: [2; 32], beacon_1: [3; 32], beacon_2: [4; 32], difficulty: zero.difficulty, code: None, ledger: None }
     }
 
     fn light(c: &TestChain) -> Headers<StandIn> {
