@@ -376,3 +376,32 @@ answered: `summary`, `blocks`, `block`, `tx`, `address`, `inscriptions`, `inscri
 `tokens`, `token`, `collections`, `collection`, `collection_of`, `held`, `names`, `name`, `maps`, `map`,
 `mempool`, `ledger`, `ledger_tokens`, `ledger_token`, `ledger_inscriptions`, `ledger_inscription`, `tag`,
 `search`, and `chains`; any other name is 404.
+
+## Repositories for apps
+
+The ARCADE chain's git repositories (docs/ARCADECHAIN.md §15 steps 6, 9 and 10), for an app that shows them as a
+code host does (`crates/arcaded/src/arcgit.rs`, `reposvc.rs`). Reads are public data and need no page pass:
+
+    GET /r/git/repos?owner=<tag>            every repository (ledger.repos)
+    GET /r/git/repo?name=@owner/name        one, with its maintainers and push history (ledger.repo)
+    GET /r/git/items?repo=@owner/name       its issues and pull requests with their texts (ledger.items)
+    GET /r/git/blob/<id>                    a blob the chain holds, as stored: a manifest, a pack, its index
+
+The app reads git objects from the packs itself. Writes need the page's pass and the wallet owner's approval:
+
+    POST /r/repo/<op>     push | fork | maintainer | item_open | item_comment | item_state   (202: the request)
+    GET  /r/repo/req/<id> where it stands: status, and repo.state working | done | failed with its txids
+    GET  /r/repo/me       this wallet's @tag on the ARCADE chain
+
+A request is filed like `/r/send` and shown over the app (Approve or Refuse); it is signed by the wallet's @tag on
+ARCADE whatever chain the app is on. A push carries `files` (base64: packs, each followed by its index, then the
+manifest last, 3.8 MB at most); the manifest names a new pack by `name` (its checksum) with empty `pack`/`idx`
+ids, which the arcade fills in, and every pack it names must be on the chain or in the push. `merge: <number>`
+makes the push a pull request's merge (the merge record moves the repository). The work runs in the background:
+records wait for the wallet's coins, a push for its manifest's block, then the push record.
+
+**Arcade V1.0's own code** shows as the read-only repository `@arcade/arcade-v1` (`relrepo.rs`): the newest held
+signed release's git bundle, its pack served as is and its index built once beside it, with a tag per release.
+`/r/git/repos` lists it, `/r/git/repo` describes it (`release`, and `log` = the releases), it has no issues, and
+`git clone http://<arcade>/git/@arcade/arcade-v1` clones it. @arcade is a reserved tag, so nobody can take the name;
+a ledger repository of that name would win.

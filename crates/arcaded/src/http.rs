@@ -205,6 +205,7 @@ const CONTENT_CSP: &str = "sandbox allow-scripts; default-src 'self' data: blob:
 fn status_line(code: u16) -> &'static str {
     match code {
         200 => "200 OK",
+        202 => "202 Accepted",
         300 => "300 Multiple Choices",
         307 => "307 Temporary Redirect",
         400 => "400 Bad Request",
@@ -590,6 +591,17 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
                 return respond(&mut s, status_line(a.code), a.ctype, &cors, &a.body);
             }
         }
+        // The ARCADE chain's git repositories (/r/git/..., arcgit::page_read): public data, with or without a pass, so an
+        // app can show them as a code host does.
+        if matches!(r.method.as_str(), "GET" | "HEAD") {
+            if let Some(a) = crate::arcgit::page_read(node, &path, &query_fields(&r.query)) {
+                let mut extra = cors.clone();
+                if a.gzip {
+                    extra.push(("Content-Encoding", "gzip".into()));
+                }
+                return respond(&mut s, status_line(a.code), a.ctype, &extra, if r.method == "HEAD" { &[] } else { &a.body });
+            }
+        }
         // The explorer's public reads (/r/explorer/<name>, explorer::page_read): what Arcade V1.0's own
         // Explorer shows, for an app that shows it too. Public data, with or without a pass.
         if matches!(r.method.as_str(), "GET" | "HEAD") {
@@ -614,6 +626,18 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
         if r.method == "POST" && path == "/r/send" && page_chain.is_some() {
             let msg = json!({"error": format!("this app is on {}: this arcade's wallet sends on {} only", page_chain.unwrap().name, node.params.name)});
             return respond(&mut s, "400 Bad Request", "application/json", &cors, msg.to_string().as_bytes());
+        }
+        // Repository writes (reposvc.rs): on the ARCADE chain whatever chain the app is on, filed like a send and
+        // approved over the app; their state and this wallet's @tag there for the page that asks.
+        if let Some(rest) = path.strip_prefix("/r/repo/") {
+            let Some((_, page)) = page.clone() else { return respond(&mut s, "400 Bad Request", "application/json", &cors, br#"{"error":"open this page in the arcade: the request has no page to come from"}"#) };
+            let (code, v) = match (r.method.as_str(), rest) {
+                ("GET" | "HEAD", "me") => (200, crate::reposvc::me(node)),
+                ("GET" | "HEAD", x) if x.starts_with("req/") => crate::reposvc::status(node, &page, &x[4..]),
+                ("POST", op) => crate::reposvc::file(node, &page, op, &serde_json::from_slice(&r.body).unwrap_or(Value::Null)),
+                _ => (404, json!({"error": "no such repository request"})),
+            };
+            return respond(&mut s, status_line(code), "application/json", &cors, v.to_string().as_bytes());
         }
         // A market write (marketsvc.rs, docs/MARKET.md step 2) files a request like a send does.
         let market_op = path.strip_prefix("/r/market/").filter(|op| matches!(*op, "place" | "cancel" | "take" | "swap_place" | "swap_take" | "swap_cancel"));
