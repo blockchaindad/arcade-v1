@@ -1183,6 +1183,10 @@ impl ChainDb {
         }
         let end = tip.height.min(start + max - 1);
         let t0 = std::time::Instant::now();
+        // Sealed blocks (Earn ARCADE) keep no plain body here: the sealed copy answers for them,
+        // for the block itself and for a prevout's transaction. Parsed sealed blocks are kept
+        // for this call (many inputs spend from the same earlier block).
+        let mut sealed_blocks: std::collections::HashMap<u32, Vec<Tx>> = std::collections::HashMap::new();
         self.wstore(c)?.write(|w| {
             let mut done = 0u32;
             for h in start..=end {
@@ -1191,7 +1195,13 @@ impl ChainDb {
                 }
                 let hv = w.get(HEIGHT, &k_height(c, h))?.ok_or(StoreError::Corrupt { table: HEIGHT, why: "gap" })?;
                 let b = be_u32(&hv, 32);
-                let raw = block_raw_at(w, c, b)?;
+                let raw = match block_raw_at(w, c, b) {
+                    Ok(raw) => raw,
+                    Err(e) => {
+                        let hash = Hash256(hv[..32].try_into().map_err(other)?);
+                        self.sealed_raw(c, &hash).ok_or(e)?
+                    }
+                };
                 let blk = Block::parse_with(&raw, &params.format).map_err(other)?;
                 let mut prevouts = Vec::with_capacity(blk.txs.len());
                 for tx in &blk.txs {
@@ -1201,7 +1211,19 @@ impl ChainDb {
                             let (pb, pp) = locate(w, params, &i.prevout.txid)?.ok_or_else(|| other("prevout tx not stored"))?;
                             let praw = w.get(BLOCK_TX, &k_block_tx(c, pb, pp))?.ok_or_else(|| other("prevout tx missing"))?;
                             if is_pruned(&praw) {
-                                return Err(other("an earlier block's body is held by other arcades (pruned here)"));
+                                if !sealed_blocks.contains_key(&pb) {
+                                    let txs = w.get(BLOCK_META, &k_block(c, pb))?
+                                        .and_then(|m| parse_meta(&m).ok())
+                                        .and_then(|m| self.sealed_raw(c, &Header::parse(&m.header80).hash()))
+                                        .and_then(|raw| Block::parse_with(&raw, &params.format).ok())
+                                        .map(|blk| blk.txs)
+                                        .ok_or_else(|| other("an earlier block's body is held by other arcades (pruned here)"))?;
+                                    sealed_blocks.insert(pb, txs);
+                                }
+                                let out = sealed_blocks[&pb].get(pp as usize).and_then(|t| t.outputs.get(i.prevout.vout as usize))
+                                    .ok_or_else(|| other("bad prevout"))?;
+                                pv.push(Prevout { value: out.value, script: out.script_pubkey.clone() });
+                                continue;
                             }
                             // Only the spent output: the previous tx can be a large inscription,
                             // and parsing (and hashing) all of it per input is the slow part.
