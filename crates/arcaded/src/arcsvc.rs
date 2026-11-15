@@ -59,6 +59,8 @@ use std::time::{Duration, Instant};
 const ANSWER_BLOCKS: usize = 50;
 const ANSWER_BYTES: usize = 16 << 20;
 const _: () = assert!(ANSWER_BYTES >= arcade_arc::block::MAX_BLOCK_BYTES);
+/// Ids in a `get`'s locator, at most (a side branch takes up to half).
+const LOCATOR: usize = 32;
 /// A peer is asked again for a branch it named after this long without it.
 const ASK_AGAIN: Duration = Duration::from_secs(10);
 /// A peer's asks are answered this far apart at the closest; one that comes sooner waits.
@@ -330,6 +332,10 @@ struct Peer {
     ask_id: u64,
     /// The answer being put together: next frame number, bytes so far.
     parts: Option<(u64, Vec<u8>)>,
+    /// The last block its answers brought that we hold, on whatever branch: the next ask
+    /// starts from it, so a branch of its longer than one answer is walked to its end
+    /// (as Bitcoin's getheaders goes on from the last header it got, not from its own tip).
+    reached: Option<Hash256>,
     served: Option<Instant>,
     /// Its ask that came too soon after the last answer, answered when its turn comes.
     waiting: Option<Value>,
@@ -1302,21 +1308,57 @@ fn id_of(v: &Value) -> Option<Hash256> {
     Hash256::from_hex(v.as_str()?).ok()
 }
 
-/// Ask `peer` for the branch it named: our newest blocks, thinning out further back, tell
-/// it where the two chains part.
-fn ask(svc: &Svc, link: &mut Link) -> Result<(), LinkError> {
-    let loc: Vec<String> = {
-        let st = svc.st.lock().unwrap();
-        let top = st.chain.tip().height;
-        let (mut back, mut step, mut loc) = (0u64, 1u64, Vec::new());
-        while back <= top && loc.len() < 32 {
-            loc.push(st.chain.id_at(top - back).expect("a height of the branch").to_hex());
+/// Where the two chains part, as told to a peer: first the side branch its last answer
+/// brought (from that block back to our best chain, thinning out), then our newest blocks,
+/// thinning out further back. At most LOCATOR ids.
+fn locator(chain: &LocalChain, reached: Option<Hash256>) -> Vec<Hash256> {
+    let mut loc = Vec::with_capacity(LOCATOR);
+    // The side branch: walked back by parent until it meets the best chain.
+    let mut at = reached.and_then(|r| chain.entry(&r));
+    let (mut skip, mut step) = (0u64, 1u64);
+    while let Some(e) = at {
+        if chain.id_at(e.height) == Some(e.id) || loc.len() >= LOCATOR / 2 {
+            break;
+        }
+        if skip == 0 {
+            loc.push(e.id);
             if loc.len() >= 3 {
                 step *= 2;
             }
-            back += step;
+            skip = step;
         }
-        loc
+        skip -= 1;
+        at = chain.entry(&e.prev);
+    }
+    // Our best chain, from its tip.
+    let top = chain.tip().height;
+    let (mut back, mut step, mut ours) = (0u64, 1u64, 0usize);
+    while back <= top && loc.len() < LOCATOR {
+        loc.push(chain.id_at(top - back).expect("a height of the branch"));
+        ours += 1;
+        if ours >= 3 {
+            step *= 2;
+        }
+        back += step;
+    }
+    // Block 0 always closes it (as in Bitcoin), so the answer never starts over from 1 when
+    // the steps jumped past every block the two chains share.
+    let genesis = chain.id_at(0).expect("block 0");
+    if loc.last() != Some(&genesis) {
+        if loc.len() >= LOCATOR {
+            loc.pop();
+        }
+        loc.push(genesis);
+    }
+    loc
+}
+
+/// Ask `peer` for the branch it named, from where the two chains part (`locator`).
+fn ask(svc: &Svc, link: &mut Link) -> Result<(), LinkError> {
+    let reached = svc.peers.lock().unwrap().get(&link.peer_id).and_then(|p| p.reached);
+    let loc: Vec<String> = {
+        let st = svc.st.lock().unwrap();
+        locator(&st.chain, reached).iter().map(|id| id.to_hex()).collect()
     };
     let id = {
         let mut peers = svc.peers.lock().unwrap();
@@ -1328,6 +1370,30 @@ fn ask(svc: &Svc, link: &mut Link) -> Result<(), LinkError> {
         p.ask_id
     };
     link.send(&frame(svc, "get", json!({"id": id, "loc": loc})))
+}
+
+/// The blocks answering a locator: our best branch after the newest of `loc` that is on it,
+/// at most ANSWER_BLOCKS and ANSWER_BYTES, each made whole by `whole` (None ends the answer);
+/// and whether more follow.
+fn answer(chain: &LocalChain, loc: &[Hash256], whole: impl Fn(&Block) -> Option<Vec<u8>>) -> (Vec<Vec<u8>>, bool) {
+    let known = loc.iter().take(LOCATOR).find_map(|l| {
+        let h = chain.entry(l)?.height;
+        (chain.id_at(h) == Some(*l)).then_some(h)
+    });
+    let top = chain.tip().height;
+    let mut next = known.unwrap_or(0) + 1;
+    let (mut blocks, mut bytes) = (Vec::new(), 0usize);
+    while next <= top && blocks.len() < ANSWER_BLOCKS {
+        // With its blobs' bytes again (the chain keeps their ids only); a block whose blob is gone ends the answer.
+        let Some(b) = whole(chain.block(&chain.id_at(next).expect("a height of the branch")).expect("a block of the branch")) else { break };
+        if !blocks.is_empty() && bytes + b.len() > ANSWER_BYTES {
+            break;
+        }
+        bytes += b.len();
+        blocks.push(b);
+        next += 1;
+    }
+    (blocks, next <= top)
 }
 
 /// Answer a `get`: our branch after the newest block of `loc` that is on it.
@@ -1347,26 +1413,8 @@ fn serve(svc: &Svc, link: &mut Link, head: &Value) -> Result<(), LinkError> {
     let Some(id) = head["id"].as_u64() else { return Ok(()) };
     let (blocks, more) = {
         let st = svc.st.lock().unwrap();
-        let chain = &st.chain;
-        let known = head["loc"].as_array().into_iter().flatten().take(32).filter_map(id_of).find_map(|l| {
-            let h = chain.entry(&l)?.height;
-            (chain.id_at(h) == Some(l)).then_some(h)
-        });
-        let top = chain.tip().height;
-        let mut next = known.unwrap_or(0) + 1;
-        let (mut blocks, mut bytes) = (Vec::new(), 0usize);
-        while next <= top && blocks.len() < ANSWER_BLOCKS {
-            // With its blobs' bytes again (the chain keeps their ids only); a block whose blob is gone ends the answer.
-            let Some(full) = crate::arcblob::attach(chain.block(&chain.id_at(next).expect("a height of the branch")).expect("a block of the branch")) else { break };
-            let b = full.encode();
-            if !blocks.is_empty() && bytes + b.len() > ANSWER_BYTES {
-                break;
-            }
-            bytes += b.len();
-            blocks.push(b);
-            next += 1;
-        }
-        (blocks, next <= top)
+        let loc: Vec<Hash256> = head["loc"].as_array().into_iter().flatten().take(LOCATOR).filter_map(id_of).collect();
+        answer(&st.chain, &loc, |b| crate::arcblob::attach(b).map(|full| full.encode()))
     };
     let data = join_blocks(&blocks);
     let chunks: Vec<&[u8]> = if data.is_empty() { vec![&[][..]] } else { data.chunks(CHUNK).collect() };
@@ -1402,13 +1450,17 @@ fn on_answer(node: &Node, svc: &Svc, link: &mut Link, f: &Frame) -> Result<(), L
         }
         p.parts.take().expect("just used").1
     };
-    let mut gained = false;
+    let (mut gained, mut reached) = (false, None);
     for raw in split_blocks(&data).unwrap_or_default() {
         let Ok(block) = Block::decode(&raw) else { break };
         let (bh, nblobs, missing) = (block.header.height, block.blob_ids.len().max(block.blobs.len()), block.blobs.iter().filter(|b| b.is_empty()).count());
+        let id = block.header.id();
         match take(node, svc, block) {
-            Ok(Accepted::Known) => {}
-            Ok(_) => gained = true,
+            Ok(Accepted::Known) => reached = Some(id),
+            Ok(_) => {
+                gained = true;
+                reached = Some(id);
+            }
             Err(e) => {
                 let tip = svc.st.lock().unwrap().chain.tip().height;
                 eprintln!("arc: a block from {} wasn't taken: {e} (its height {bh}, our tip {tip}, {nblobs} blobs, {missing} without bytes)", &link.peer_id[..link.peer_id.len().min(12)]);
@@ -1426,13 +1478,19 @@ fn on_answer(node: &Node, svc: &Svc, link: &mut Link, f: &Frame) -> Result<(), L
         if p.wants.is_some_and(|w| st.chain.entry(&w).is_some()) {
             p.wants = None;
         }
+        // The next ask goes on from the last block this answer brought, on whatever branch.
+        let moved = reached.is_some_and(|r| p.reached != Some(r));
+        if reached.is_some() {
+            p.reached = reached;
+        }
         // An answer that brought something: the next ask needn't wait. So too one that
         // brought nothing new because another arcade was quicker with the same blocks. Only
         // a peer that named a block and didn't bring us nearer it is asked again after a while.
-        if gained || p.wants.is_none() {
+        if gained || moved || p.wants.is_none() {
             p.asked = None;
         }
-        gained && (f.head["more"] == true || p.wants.is_some())
+        // Blocks we held already move the ask on too (a branch partly fetched before).
+        (gained || moved) && (f.head["more"] == true || p.wants.is_some())
     };
     if again {
         ask(svc, link)?;
@@ -2513,6 +2571,75 @@ mod tests {
             let b = block_by(c, who);
             assert!(matches!(c.accept(b, LATE), Ok(Accepted::Tip { .. })));
         }
+    }
+
+    /// Fetch `from`'s branch into `into` the way two linked arcades do (`get` with a locator,
+    /// `answer`, blocks taken), remembering the last block each answer brought when `remember`.
+    /// The number of asks it took, or None when `into` stopped getting nearer within `most`.
+    fn fetch(into: &mut LocalChain, from: &LocalChain, remember: bool, most: usize) -> Option<usize> {
+        let mut reached = None;
+        for asks in 1..=most {
+            let loc = locator(into, if remember { reached } else { None });
+            let (blocks, more) = answer(from, &loc, |b| Some(b.encode()));
+            let mut gained = false;
+            for raw in blocks {
+                let b = Block::decode(&raw).unwrap();
+                let id = b.header.id();
+                match into.accept(b, LATE) {
+                    Ok(Accepted::Known) => {}
+                    Ok(_) => gained = true,
+                    Err(e) => panic!("a block of the other branch wasn't taken: {e}"),
+                }
+                reached = Some(id);
+            }
+            if into.tip().id == from.tip().id {
+                return Some(asks);
+            }
+            if !more && !gained {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// Two writers cut off from each other each write a branch longer than one answer (the
+    /// 2026-11-15 split: forked at 126, 46 and 50 blocks each). Linked again, the lighter
+    /// one takes the heavier branch: each ask goes on from the last block the answer brought.
+    #[test]
+    fn a_split_longer_than_one_answer_heals() {
+        let (mut a, mut b) = (chain(), chain());
+        grow(&mut a, 1, 10);
+        for h in 1..=10 {
+            b.accept(a.block(&a.id_at(h).unwrap()).unwrap().clone(), LATE).unwrap();
+        }
+        grow(&mut a, 1, ANSWER_BLOCKS as u64 + 15);
+        grow(&mut b, 2, ANSWER_BLOCKS as u64 + 25);
+        assert_ne!(a.id_at(11), b.id_at(11));
+        let (heavy, mut light) = if a.tip().total_difficulty > b.tip().total_difficulty { (a, b) } else { (b, a) };
+        let fork_depth = light.tip().height - 10;
+        assert!(fork_depth > ANSWER_BLOCKS as u64 && fork_depth < params::REORG_LIMIT);
+
+        // Asked from our own best chain only (before the fix), the same first answer comes
+        // back for ever: the other branch is never fetched past one answer.
+        let mut stuck = chain();
+        for h in 1..=light.tip().height {
+            stuck.accept(light.block(&light.id_at(h).unwrap()).unwrap().clone(), LATE).unwrap();
+        }
+        assert_eq!(fetch(&mut stuck, &heavy, false, 10), None);
+        assert_eq!(stuck.tip().id, light.tip().id);
+        assert!(heavy.id_at(11 + ANSWER_BLOCKS as u64).is_some_and(|id| stuck.entry(&id).is_none()));
+
+        // Going on from the last block brought: the whole branch in a few asks, and the
+        // lighter copy moves over to it.
+        let asks = fetch(&mut light, &heavy, true, 10).expect("the heavier branch is taken");
+        assert!(asks <= 3, "{asks} asks");
+        assert_eq!(light.tip().id, heavy.tip().id);
+
+        // And the other way round nothing moves: the heavier copy keeps its own branch.
+        let before = heavy.tip().id;
+        let mut heavy = heavy;
+        let _ = fetch(&mut heavy, &light, true, 3);
+        assert_eq!(heavy.tip().id, before);
     }
 
     fn stored_matches(db: &ChainDb, p: &ChainParams, c: &LocalChain) {

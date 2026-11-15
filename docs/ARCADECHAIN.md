@@ -465,12 +465,14 @@ Two parts of the chain are stand-ins so the rest can be built and tested, and **
   ```text
   tip  {id, h, w}          my best block: id, height, total difficulty. Sent on each link when it changes.
   get  {id: n, loc}        send me your branch after the newest of these blocks that is on it
-                           (my last three blocks, then twice as far back each time, at most 32)
+                           (first the side branch your last answer brought me, from its newest
+                           block back to my best chain, thinning out; then my last three blocks,
+                           then twice as far back each time; block 0 last; at most 32)
   a    {id: n, seq, end, more} + bytes     up to 50 blocks or 4 MB, oldest first, each with its
                            length in front, cut into frames of at most 60,000 bytes
   ```
 
-  An arcade that hears of a tip it doesn't have asks for it; an answer that brought something is followed by the next ask at once. An arcade that named a tip and whose answer brought nothing toward it is asked again only after 10 seconds; one whose blocks another arcade delivered first is not held back. Asks from one arcade are answered at most twice a second: one that comes sooner waits its turn (the newest ask replaces an older one still waiting).
+  An arcade that hears of a tip it doesn't have asks for it; an answer that brought something is followed by the next ask at once, **going on from the last block that answer brought** (as Bitcoin's `getheaders` goes on from the last header it got). Before 2026-11-15 every ask started from the asker's own best chain, so a branch more than one answer (50 blocks) past the fork was never fetched past its first 50 blocks while it was still the lighter branch here: the testnet split for good that day after the GX10 lost its network for 5½ hours and both writers wrote alone (forked at 126; GX10 to 171, JB20B to 175; the GX10 got the JB20B's branch to 157 and no further). An arcade that named a tip and whose answer brought nothing toward it is asked again only after 10 seconds; one whose blocks another arcade delivered first is not held back. Asks from one arcade are answered at most twice a second: one that comes sooner waits its turn (the newest ask replaces an older one still waiting).
 - **The writer.** On each new tip the arcade draws, waits as long as its draw's proof of time takes, and writes one block whose coinbase pays what is owed and which carries the waiting transactions that pay best (§14.10). It never writes a second block on the same block: one the chain doesn't take yet (its time ahead of the clock) is offered again as it is.
 - **The local test chain.** `arcaded --arc-local settings.json` tells the arcade of a chain on the two stand-ins of §14.8, for arcades on a closed test network; it is then there to install. The settings give block 0, the holders (arcade id, bytes, payout address) how many steps a second the stand-in proof of time counts, and, if wanted, a smaller segment size (`segment_bytes`; a closed network's chains may never fill 16 MiB). Every arcade of one local chain must be given the same settings. An arcade started without the option knows no ARCADE chain and shows none. (The public testnet's chain will be known to every arcade without an option.)
 

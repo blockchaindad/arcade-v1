@@ -584,6 +584,9 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
             if let Some(o) = v["owner"].as_str() {
                 v["owner_tag"] = json!(tag_of(&x, o));
             }
+            if let Some(t) = v["h"].as_u64().and_then(|h| block_time(&x, h)) {
+                v["time"] = json!(t);
+            }
             Ok(v)
         }
         "explorer.tokens" => {
@@ -756,6 +759,7 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
             v["content"] = ledger_content(&x, v["txid"].as_str().unwrap_or(""), 4 << 20);
             if let Some(o) = v["owner"].as_str() { v["owner_tag"] = json!(tag_of(&x, o)); }
             if let Some(o) = v["creator"].as_str() { v["creator_tag"] = json!(tag_of(&x, o)); }
+            if let Some(t) = v["block_height"].as_u64().and_then(|h| block_time(&x, h)) { v["time"] = json!(t); }
             Ok(v)
         }
         "explorer.tag" => tag_page(&x, &s("tag").ok_or("give an @tag")?),
@@ -827,6 +831,7 @@ fn ledger_token(x: &Ctx, pid: u32) -> R {
     v["holders"] = json!(hs.len());
     v["total_shown"] = json!(token_amount(&v, v["total"].as_u64().unwrap_or(0)));
     if let Some(i) = v["issuer"].as_str() { v["issuer_tag"] = json!(tag_of(x, i)); }
+    if let Some(t) = v["creation_block"].as_u64().and_then(|h| block_time(x, h)) { v["creation_time"] = json!(t); }
     v["top"] = json!(hs.iter().take(25).map(|(b, a)| json!({"address": a, "tag": tag_of(x, a), "balance": token_amount(&v, *b)})).collect::<Vec<_>>());
     Ok(v)
 }
@@ -869,6 +874,13 @@ fn geneses(x: &Ctx, height: u32) -> Option<u32> {
     }
     let v = x.node.chain.store(x.c()).read(|r| r.get(ord::BLOCK, &KeyBuf::new().u16(x.c()).u32(height).done())).ok()??;
     Some(u32::from_be_bytes(v[64..68].try_into().ok()?))
+}
+
+/// The time block `height` of the best chain says it was made (unix seconds).
+fn block_time(x: &Ctx, height: u64) -> Option<u32> {
+    let c = x.c();
+    let hash = x.node.chain.hash_at(c, u32::try_from(height).ok()?).ok()??;
+    Some(x.node.chain.header(c, &hash).ok()??.header.time)
 }
 
 fn block_row(x: &Ctx, height: u32) -> Option<Value> {
@@ -1201,14 +1213,16 @@ fn out_json(x: &Ctx, txid: &Hash256, vout: u32, value: u64, script: &[u8]) -> Va
 
 fn tx(x: &Ctx, id: &str) -> R {
     let txid = Hash256::from_hex(id.trim()).map_err(|_| format!("{id} is not a txid"))?;
-    let (t, height) = match tx_any(x, &txid) {
-        Some(found) => found,
+    // When it happened: its block's time, or (still waiting) when this arcade first saw it.
+    let (t, height, seen) = match tx_any(x, &txid) {
+        Some((t, height)) => (t, height, None),
         None => {
             let pool = waiting(x)?;
-            let t = pool.iter().filter_map(|(_, raw)| Tx::parse_with(raw, &x.p.format).ok()).find(|t| t.txid == txid).ok_or_else(|| format!("no transaction {id} on {}", x.p.name))?;
-            (t, None)
+            let (seen, t) = pool.iter().filter_map(|(seen, raw)| Tx::parse_with(raw, &x.p.format).ok().map(|t| (*seen, t))).find(|(_, t)| t.txid == txid).ok_or_else(|| format!("no transaction {id} on {}", x.p.name))?;
+            (t, None, (seen > 0).then_some(seen))
         }
     };
+    let time = height.and_then(|h| block_time(x, u64::from(h)));
     let mut total_in = 0u64;
     let inputs: Vec<Value> = t.inputs.iter().map(|i| {
         if t.is_coinbase() {
@@ -1223,7 +1237,7 @@ fn tx(x: &Ctx, id: &str) -> R {
     let outputs: Vec<Value> = t.outputs.iter().enumerate().map(|(k, o)| out_json(x, &txid, k as u32, o.value, &o.script_pubkey)).collect();
     let out: u64 = t.outputs.iter().map(|o| o.value).sum();
     let born = if x.has("ord") && !t.is_coinbase() { ord::genesis_ctype(&t.inputs[0].script_sig, ord::dialect(x.p)).map(|ct| String::from_utf8_lossy(&ct).into_owned()) } else { None };
-    Ok(json!({"txid": txid.to_hex(), "height": height, "confirmations": height.map(|h| tip(x).saturating_sub(h) + 1).unwrap_or(0),
+    Ok(json!({"txid": txid.to_hex(), "height": height, "time": time, "seen": seen, "confirmations": height.map(|h| tip(x).saturating_sub(h) + 1).unwrap_or(0),
               "coinbase": t.is_coinbase(), "size": t.raw.len(), "rbf": t.inputs.iter().any(|i| i.sequence < 0xffff_fffe),
               "fee": if t.is_coinbase() { None } else { Some(total_in.saturating_sub(out)) }, "in": total_in, "out": out,
               "inputs": inputs, "outputs": outputs, "genesis": born, "unit": unit(x.p)}))
@@ -1276,7 +1290,7 @@ fn addr(x: &Ctx, a: &str, req: &Value) -> R {
         let hist = x.node.chain.history_for_script(c, &script).map_err(e)?;
         let rows: Vec<Value> = hist.iter().rev().take(50).map(|(h, t12, recv, sent)| {
             let txid = x.node.chain.txids_by_t12(x.p, t12).ok().and_then(|v| v.first().copied());
-            json!({"height": h, "txid": txid.map(|t| t.to_hex()), "received": recv, "sent": sent})
+            json!({"height": h, "time": block_time(x, u64::from(*h)), "txid": txid.map(|t| t.to_hex()), "received": recv, "sent": sent})
         }).collect();
         v["balance"] = json!(x.node.chain.balance_for_script(c, &script).map_err(e)?);
         v["tx_count"] = json!(hist.len());
