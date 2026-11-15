@@ -25,6 +25,7 @@
   <button data-tab="wallet">Wallet</button>
   <button data-tab="messages">Messages</button>
   <button data-tab="feed">Feed</button>
+  <button data-tab="people">People</button>
   <button data-tab="apps">Apps</button>
   <button data-tab="explorer">Explorer</button>
   <button data-tab="chains">Chains &amp; Coins</button>
@@ -214,6 +215,61 @@
     <div class="row"><button id="fd-prev">Newer</button><span class="s" id="fd-page"></span><button id="fd-next">Older</button></div>
   </section>
 
+  <!-- People: A:// on the ARCADE chain: your profile, follows, the address book (people.js) -->
+  <section id="people" class="tab">
+    <div class="pp-sub" id="pp-sub">
+      <button data-v="profile" class="on">My profile</button><button data-v="follows">Following · Followers</button><button data-v="contacts">Address book</button>
+    </div>
+    <p class="msg" id="pp-msg"></p>
+
+    <div class="pp-view" id="pp-profile">
+      <h1>My profile</h1>
+      <p class="s">Your public card on the ARCADE chain. Every arcade shows the same one, and it moves with your @tag.</p>
+      <div class="pp-banner" id="pp-republish" hidden></div>
+      <div class="pp-two">
+        <div class="card">
+          <label class="k" for="pp-name">Display name</label><input id="pp-name" maxlength="64">
+          <label class="k" for="pp-bio">About</label><textarea id="pp-bio" rows="3" maxlength="400"></textarea>
+          <label class="k" for="pp-url">Link</label><input id="pp-url" maxlength="200" placeholder="https://">
+          <label class="k" for="pp-pic">Picture</label>
+          <div class="row"><input type="file" id="pp-pic" accept="image/*"><span class="s" id="pp-picnote">An image is kept as a blob on the ARCADE chain (0.01 ARCADE a kB).</span></div>
+          <label class="k">Addresses shown on your card</label>
+          <div id="pp-addrs" class="pp-addrs"></div>
+          <div class="pp-fee"><span class="s" id="pp-cost"></span><button class="primary" id="pp-publish">Publish profile</button></div>
+        </div>
+        <div class="card" id="pp-card"></div>
+      </div>
+    </div>
+
+    <div class="pp-view" id="pp-follows" hidden>
+      <h1>Following · Followers</h1>
+      <p class="s">Follows and unfollows are records on the ARCADE chain, so every arcade counts the same followers.</p>
+      <div class="row"><input id="pp-followtag" placeholder="@tag to follow"><button class="primary" id="pp-follow">Follow</button></div>
+      <div class="pp-two">
+        <div class="card"><h2 class="pp-h2">Following <span class="s" id="pp-nfollowing"></span></h2><div id="pp-following"></div></div>
+        <div class="card"><h2 class="pp-h2">Followers <span class="s" id="pp-nfollowers"></span></h2><div id="pp-followers"></div></div>
+      </div>
+    </div>
+
+    <div class="pp-view" id="pp-contacts" hidden>
+      <h1>Address book</h1>
+      <p class="s">The people you send to, with their addresses on every coin. It follows your wallet to any device you sign in on.</p>
+      <div class="pp-lock"><b>Only you can read it.</b> Each entry is encrypted to your wallet's key before it goes on the chain. Others see that you keep an address book, not who is in it.</div>
+      <div class="card">
+        <div class="row"><input id="pp-search" placeholder="Search names, @tags, addresses"><button class="primary" id="pp-add">Add contact</button></div>
+        <div class="pp-form" id="pp-form" hidden>
+          <input id="pp-cid" type="hidden">
+          <div class="pp-two"><div><label class="k" for="pp-cname">Name</label><input id="pp-cname" maxlength="60"></div><div><label class="k" for="pp-ctag">@tag (optional)</label><input id="pp-ctag" maxlength="25"></div></div>
+          <label class="k">Addresses</label><div id="pp-caddrs" class="pp-addrs"></div>
+          <label class="k" for="pp-cnote">Note</label><input id="pp-cnote" maxlength="120">
+          <div class="row"><button class="primary" id="pp-csave">Save</button><button id="pp-ccancel">Cancel</button><span class="s">One record, about 0.0008 ARCADE.</span></div>
+        </div>
+        <div class="tablewrap"><table class="pp-table"><thead><tr><th>Name</th><th>@tag</th><th>Addresses</th><th>Note</th><th></th></tr></thead><tbody id="pp-crows"></tbody></table></div>
+        <p class="s" id="pp-cempty" hidden>No contacts yet. Add the people you send to.</p>
+      </div>
+    </div>
+  </section>
+
   <!-- API: sidecar apps (JSON-RPC with the cookie) and websites (web API with keys) -->
   <section id="apitab" class="tab">
     <h1>API</h1>
@@ -385,6 +441,7 @@
 <script src="explorer.js"></script>
 <script src="messages.js"></script>
 <script src="feed.js"></script>
+<script src="people.js"></script>
 <script src="apitab.js"></script>
 <script src="apps.js"></script>
 <script src="rings.js"></script>
