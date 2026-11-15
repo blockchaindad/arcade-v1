@@ -382,6 +382,18 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             let (k, _) = node.app.tag_key(p, s("index").and_then(|i| i.parse().ok()).unwrap_or(0)).map_err(|e| e.to_string())?;
             Ok(json!(crate::faucet::ask(node, &k.address, &s("tag").unwrap_or_default())?))
         }
+        "faucet.arc" => {
+            // A website signs a user in and names their ARCADE address; without one, this wallet's.
+            match s("address").filter(|a| !a.is_empty()) {
+                Some(a) => crate::arcfaucet::ask(node, &a),
+                None => {
+                    let ap = crate::arcsvc::defined().ok_or("this arcade doesn't know the ARCADE chain")?;
+                    let (k, _) = node.app.tag_key(ap, 0).map_err(|e| e.to_string())?;
+                    crate::arcfaucet::ask(node, &k.address)
+                }
+            }
+        }
+        "faucet.arc_status" => Ok(crate::arcfaucet::status(node)),
         "mempool" => {
             // The chain asked for (`--chain`), the home chain by default; the ARCADE chain's pool is its own.
             let p = crate::sitesvc::chain(node, req)?;
