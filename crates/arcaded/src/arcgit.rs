@@ -14,6 +14,10 @@ use serde_json::Value;
 
 /// A blob the ARCADE chain holds (only what a block brought is a repository's part), for a viewer.
 fn on_chain(id: &str) -> Option<Vec<u8>> {
+    // Arcade V1.0's releases as a repository (crate::relrepo): made-up ids for its manifest, pack and index.
+    if id.starts_with("release-") {
+        return crate::relrepo::blob(id);
+    }
     let bid: [u8; 32] = hex::decode(id).ok()?.try_into().ok()?;
     crate::arcsvc::holds_blob(&bid).then(|| crate::arcblob::view(&bid)).flatten()
 }
@@ -33,8 +37,11 @@ pub fn serve(node: &crate::node::Node, rest: &str) -> (&'static str, Vec<u8>) {
     if let Some(named) = rest.strip_prefix('@').or_else(|| rest.strip_prefix("%40")) {
         let mut parts = named.splitn(3, '/');
         let (owner, name, file) = (parts.next().unwrap_or(""), parts.next().unwrap_or("").trim_end_matches(".git"), parts.next().unwrap_or(""));
+        if let Some(m) = crate::relrepo::manifest_of(node, &crate::relrepo::plain(&format!("{owner}/{name}"))) {
+            return serve_manifest(&m, file);
+        }
         let Ok(full) = arcade_ledger::repos::full_name(&format!("{owner}/{name}"), None) else { return ("404 Not Found", b"not a repository name\n".to_vec()) };
-        let Some(m) = crate::arcledger::repo_manifest(node, &full) else { return ("404 Not Found", format!("no repository @{full} on the ARCADE chain\n").into_bytes()) };
+        let Some(m) = crate::arcledger::repo_manifest(node, &full).or_else(|| crate::relrepo::manifest_of(node, &full)) else { return ("404 Not Found", format!("no repository @{full} on the ARCADE chain\n").into_bytes()) };
         return serve_manifest(&m, file);
     }
     let (id, file) = rest.split_once('/').unwrap_or((rest, ""));
@@ -116,8 +123,20 @@ pub fn page_read(node: &crate::node::Node, path: &str, q: &serde_json::Map<Strin
         _ => None,
     }).filter(|s| !s.is_empty());
     Some(match rest {
-        "repos" => json_answer(crate::arcledger::repos(node, s("owner").as_deref())),
+        "repos" => json_answer(crate::arcledger::repos(node, s("owner").as_deref()).map(|mut v| {
+            // Arcade V1.0's own code, from its releases (crate::relrepo), unless the ledger has that repository.
+            let owner = s("owner").map(|o| o.trim_start_matches('@').to_lowercase());
+            if owner.as_deref().is_none_or(|o| o == "arcade") && crate::arcledger::repo_row(node, crate::relrepo::FULL).is_none() {
+                if let (Some(row), Some(list)) = (crate::relrepo::row(), v["repos"].as_array_mut()) {
+                    list.push(row);
+                }
+            }
+            v
+        })),
         "repo" => match s("name") {
+            Some(n) if crate::relrepo::is_it(node, &crate::relrepo::plain(&n)) => {
+                json_answer(crate::relrepo::info().ok_or_else(|| "no release of Arcade V1.0 is held here".to_string()))
+            }
             Some(n) => json_answer(crate::arcledger::repo(node, &n)),
             None => json_answer(Err("name required (@owner/name)".into())),
         },
@@ -126,7 +145,10 @@ pub fn page_read(node: &crate::node::Node, path: &str, q: &serde_json::Map<Strin
             if let Some(n) = s("number").and_then(|n| n.parse::<u64>().ok()) {
                 req["number"] = serde_json::json!(n);
             }
-            if req["repo"].is_null() {
+            if s("repo").is_some_and(|r| crate::relrepo::is_it(node, &crate::relrepo::plain(&r))) {
+                // The releases' repository: no ledger records (yet), so no issues or pull requests.
+                json_answer(Ok(serde_json::json!({"repo": format!("@{}", crate::relrepo::FULL), "items": []})))
+            } else if req["repo"].is_null() {
                 json_answer(Err("repo required (@owner/name)".into()))
             } else {
                 json_answer(crate::arcledger::items(node, &req))
@@ -134,6 +156,12 @@ pub fn page_read(node: &crate::node::Node, path: &str, q: &serde_json::Map<Strin
         }
         r if r.starts_with("blob/") => {
             let id = &r["blob/".len()..];
+            if id.starts_with("release-") {
+                return Some(match crate::relrepo::blob(id) {
+                    Some(body) => PageAnswer { code: 200, ctype: "application/octet-stream", gzip: false, body },
+                    None => PageAnswer { code: 404, ctype: "text/plain", gzip: false, body: b"no such release file here\n".to_vec() },
+                });
+            }
             let bid: Option<[u8; 32]> = hex::decode(id).ok().and_then(|b| b.try_into().ok());
             match bid.filter(crate::arcsvc::holds_blob).and_then(|b| crate::arcblob::view(&b).map(|bytes| (b, bytes))) {
                 Some((b, body)) => PageAnswer { code: 200, ctype: "application/octet-stream", gzip: crate::arcblob::gzipped(&b), body },

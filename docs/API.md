@@ -399,3 +399,9 @@ manifest last, 3.8 MB at most); the manifest names a new pack by `name` (its che
 ids, which the arcade fills in, and every pack it names must be on the chain or in the push. `merge: <number>`
 makes the push a pull request's merge (the merge record moves the repository). The work runs in the background:
 records wait for the wallet's coins, a push for its manifest's block, then the push record.
+
+**Arcade V1.0's own code** shows as the read-only repository `@arcade/arcade-v1` (`relrepo.rs`): the newest held
+signed release's git bundle, its pack served as is and its index built once beside it, with a tag per release.
+`/r/git/repos` lists it, `/r/git/repo` describes it (`release`, and `log` = the releases), it has no issues, and
+`git clone http://<arcade>/git/@arcade/arcade-v1` clones it. @arcade is a reserved tag, so nobody can take the name;
+a ledger repository of that name would win.
