@@ -13,6 +13,7 @@ mod handlegate;
 mod addrsvc;
 mod collsvc;
 mod knowncoll;
+mod oplist;
 mod announce;
 mod api;
 mod apikeys;
