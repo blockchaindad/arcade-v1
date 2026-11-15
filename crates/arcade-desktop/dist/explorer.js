@@ -24,6 +24,9 @@
     if (s < 90) return `${s}s ago`; if (s < 5400) return `${Math.floor(s / 60)}m ago`; if (s < 172800) return `${Math.floor(s / 3600)}h ago`;
     return new Date(t * 1000).toLocaleDateString();
   };
+  // A block's or transaction's time in full (Martin 2026-11-15: on every block and transaction), with how long ago while that is under two days.
+  const stamp = (t) => t ? new Date(t * 1000).toLocaleString("en-US", { year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "";
+  const when = (t) => !t ? "" : Date.now() / 1000 - t < 172800 ? `${stamp(t)} · ${ago(t)}` : stamp(t);
   const units = (v, dec) => { // base-unit decimal string -> display
     try {
       const b = BigInt(v || "0"), d = 10n ** BigInt(dec ?? 18), w = b / d, f = (b % d).toString().padStart(Number(dec ?? 18), "0").replace(/0+$/, "");
@@ -115,7 +118,7 @@
     return h("div", { class: "x-list" }, list.map((b) => h("div", { class: "x-blk", onclick: () => go("block", String(b.height)) },
       h("div", { class: "x-hbox" }, h("b", {}, fmt(b.height)), h("small", {}, ago(b.time))),
       h("div", { class: "x-mid" }, h("div", { class: "x-hash" }, b.hash),
-        h("div", { class: "chips" }, b.txs != null ? h("span", { class: "chip" }, `${b.txs} tx`) : "", b.inscriptions ? h("span", { class: "chip ins" }, `${b.inscriptions} inscription${b.inscriptions > 1 ? "s" : ""}`) : "")))));
+        h("div", { class: "chips" }, b.time ? h("span", { class: "faint" }, stamp(b.time)) : "", b.txs != null ? h("span", { class: "chip" }, `${b.txs} tx`) : "", b.inscriptions ? h("span", { class: "chip ins" }, `${b.inscriptions} inscription${b.inscriptions > 1 ? "s" : ""}`) : "")))));
   }
   // HTML thumbnails take turns (Martin 2026-11-10: nine at a time, more overwhelms the page):
   // at most HTML_MAX run at once, only those on screen; one that scrolls away or leaves the
@@ -291,8 +294,8 @@
     const m = await xapi("explorer.mempool", { chain: chain.key });
     // Lender pools give fee and size, not output totals.
     const lent = m.txs.some((t) => t.out == null);
-    const body = m.txs.length ? table([["Txid"], [lent ? "Fee" : "Out", 1], ["Size", 1], ["Kind"]], m.txs.map((t) => ({ go: () => go("tx", t.txid),
-      cells: [[h("span", { class: "mono" }, short(t.txid, 16, 8))], [t.out != null ? coins(t.out) : t.fee != null ? coins(t.fee) : "", 1], [t.size != null ? `${fmt(t.size)} B` : "", 1], [h("span", { class: "chip" + (t.kind === "inscription" ? " ins" : "") }, (t.mine ? "yours · " : "") + t.kind + (t.rbf ? " · RBF" : ""))]] })))
+    const body = m.txs.length ? table([["Txid"], ["Seen"], [lent ? "Fee" : "Out", 1], ["Size", 1], ["Kind"]], m.txs.map((t) => ({ go: () => go("tx", t.txid),
+      cells: [[h("span", { class: "mono" }, short(t.txid, 16, 8))], [h("span", { class: "faint" }, t.seen ? when(t.seen) : "")], [t.out != null ? coins(t.out) : t.fee != null ? coins(t.fee) : "", 1], [t.size != null ? `${fmt(t.size)} B` : "", 1], [h("span", { class: "chip" + (t.kind === "inscription" ? " ins" : "") }, (t.mine ? "yours · " : "") + t.kind + (t.rbf ? " · RBF" : ""))]] })))
       : h("div", { class: "x-empty" }, "No unconfirmed transactions right now.");
     return h("div", {}, sect(`Mempool · ${fmt(m.count ?? m.txs.length)}`, null, body),
       m.pending_tags.length ? h("p", { class: "x-note" }, `Tag claims waiting for a block: ${m.pending_tags.map((t) => "@" + (t.tag || t)).join(", ")}`) : "",
@@ -417,7 +420,7 @@
     return h("div", {}, crumbs(link("Arcade ledger", "ledger"), link("Tokens", "ltokens"), t.name || `#${t.id}`),
       head(t.name || `Token ${t.id}`, h("span", { class: "chip arc" }, t.type === 2 ? "divisible" : "indivisible"), t.managed ? pill("managed", true) : pill("fixed supply", true)),
       kv([["Id", String(t.id)], ["Supply", t.total_shown], ["Issuer", addrLink(t.issuer, t.issuer_tag)], ["Category", [t.category, t.subcategory].filter(Boolean).join(" · ") || "—"],
-        t.url && ["Url", t.url], t.data && ["Data", t.data], ["Created", link(`block ${fmt(t.creation_block)}`, "block", String(t.creation_block))], ["Creation tx", link(short(t.creation_txid, 12, 8), "tx", t.creation_txid, "mono")], ["Holders", fmt(t.holders)]]),
+        t.url && ["Url", t.url], t.data && ["Data", t.data], ["Created", h("span", {}, link(`block ${fmt(t.creation_block)}`, "block", String(t.creation_block)), t.creation_time ? ` · ${when(t.creation_time)}` : "")], ["Creation tx", link(short(t.creation_txid, 12, 8), "tx", t.creation_txid, "mono")], ["Holders", fmt(t.holders)]]),
       h("h2", { class: "x-h2" }, "Top holders"),
       t.top.length ? table([["Holder"], ["Balance", 1]], t.top.map((x) => ({ go: () => go("address", x.address), cells: [[addrLink(x.address, x.tag)], [x.balance, 1]] }))) : h("div", { class: "x-empty" }, "Nobody holds any."));
   }
@@ -427,14 +430,14 @@
       head(`Arcade inscription #${fmt(i.number)}`, h("span", { class: "chip arc" }, (i.content_type || "").split(";")[0] || "no type"), contentLink(`/app/${chain.key}/${i.txid}`, `Arcade inscription #${fmt(i.number)}`)),
       h("div", { class: "x-split" }, preview(ledgerItem(i), true),
         kv([["Txid", link(short(i.txid, 14, 8), "tx", i.txid, "mono")], ["Owner", addrLink(i.owner, i.owner_tag)], ["Creator", addrLink(i.creator, i.creator_tag)],
-          ["Inscribed", link(`block ${fmt(i.block_height)}`, "block", String(i.block_height))], ["Content type", i.content_type || "—"], ["Size", `${fmt(i.content_len)} bytes · ${i.chunks} chunk${i.chunks === 1 ? "" : "s"}`],
+          ["Inscribed", h("span", {}, link(`block ${fmt(i.block_height)}`, "block", String(i.block_height)), i.time ? ` · ${when(i.time)}` : "")], ["Content type", i.content_type || "—"], ["Size", `${fmt(i.content_len)} bytes · ${i.chunks} chunk${i.chunks === 1 ? "" : "s"}`],
           ["sha256", h("span", { class: "mono" }, i.sha256 || "")], i.json && ["JSON", h("span", { class: "mono" }, JSON.stringify(i.json).slice(0, 300))]])));
   }
   async function vBlock() {
     const b = await xapi("explorer.block", { chain: chain.key, id: arg });
     return h("div", {}, crumbs(link("Blocks", "blocks"), fmt(b.height)),
       head(`Block ${fmt(b.height)}`, pill(b.best ? `${fmt(b.confirmations)} confirmations` : "not on the best chain", b.best)),
-      kv([["Hash", h("span", { class: "mono" }, b.hash)], ["Time", `${new Date(b.time * 1000).toLocaleString()} · ${ago(b.time)}`],
+      kv([["Hash", h("span", { class: "mono" }, b.hash)], ["Time", when(b.time)],
         ["Transactions", fmt(b.tx_count)], ["Size", `${fmt(b.size)} bytes`], b.inscriptions != null && ["New inscription pieces", fmt(b.inscriptions)],
         ["Previous", link(short(b.prev, 16, 8), "block", b.prev, "mono")], b.next && ["Next", link(short(b.next, 16, 8), "block", b.next, "mono")],
         // An ARCADE block has a writer and a proof of time where a coin's has proof of work.
@@ -442,7 +445,7 @@
           ["Proof of time", `${fmt(b.arcade.steps)} steps`]]
           : [["Bits · nonce · version", h("span", { class: "mono" }, `${b.bits} · ${b.nonce} · ${b.version}`)], ["Merkle root", h("span", { class: "mono" }, b.merkle_root)]])]),
       h("h2", { class: "x-h2" }, "Transactions"),
-      table([["Txid"], [""], ["In · out"], ["Output", 1]], b.txs.map((t) => ({ go: () => go("tx", t.txid), cells: [[h("span", { class: "mono" }, short(t.txid, 18, 8))],
+      table([["Txid"], ["Time"], [""], ["In · out"], ["Output", 1]], b.txs.map((t) => ({ go: () => go("tx", t.txid), cells: [[h("span", { class: "mono" }, short(t.txid, 18, 8))], [h("span", { class: "faint" }, stamp(b.time))],
         [t.coinbase ? h("span", { class: "chip" }, "coinbase") : t.inscription ? h("span", { class: "chip ins" }, "inscription") : ""], [`${t.inputs} · ${t.outputs}`], [coins(t.out), 1]] }))),
       b.tx_count > b.txs.length ? h("p", { class: "x-note" }, `Showing the first ${b.txs.length} of ${fmt(b.tx_count)} transactions.`) : "");
   }
@@ -452,7 +455,7 @@
     return h("div", {}, crumbs(link("Blocks", "blocks"), t.height != null ? link(fmt(t.height), "block", String(t.height)) : "mempool", "transaction"),
       head("Transaction", pill(t.height != null ? `${fmt(t.confirmations)} confirmation${t.confirmations === 1 ? "" : "s"}` : "unconfirmed", t.height != null), pill(t.rbf ? "signals RBF" : "no RBF", !t.rbf),
         t.genesis ? h("span", { class: "chip ins" }, `inscribes ${t.genesis.split(";")[0]}`) : ""),
-      kv([["Txid", h("span", { class: "mono" }, t.txid)], ["Size", `${fmt(t.size)} bytes`], t.fee != null && ["Fee", coins(t.fee)], ["Total out", coins(t.out)]]),
+      kv([["Txid", h("span", { class: "mono" }, t.txid)], t.time ? ["Time", when(t.time)] : t.seen ? ["First seen", when(t.seen)] : null, ["Size", `${fmt(t.size)} bytes`], t.fee != null && ["Fee", coins(t.fee)], ["Total out", coins(t.out)]]),
       h("div", { class: "x-flow" },
         io(t.inputs.map((i) => i.coinbase ? h("div", {}, h("span", { class: "chip" }, "new coins (coinbase)")) :
           h("div", {}, h("span", { class: "a" }, addrLink(i.address, i.tag)), h("span", {}, link(i.value != null ? coins(i.value) : "?", "tx", i.txid))))),
@@ -478,8 +481,8 @@
         table([["Number"], ["Type"], ["Txid"]], a.ledger_inscriptions.map((i) => ({ go: () => go("linsc", i.txid),
           cells: [[`#${fmt(i.number)}`], [(i.content_type || "").split(";")[0]], [h("span", { class: "mono" }, short(i.txid || "", 16, 8))]] })))) : "",
       a.history ? h("h2", { class: "x-h2" }, "History") : "",
-      !a.history ? "" : a.history.length ? table([["Block"], ["Txid"], ["Received", 1], ["Sent", 1]], a.history.map((r) => ({ go: r.txid ? () => go("tx", r.txid) : null,
-        cells: [[fmt(r.height)], [h("span", { class: "mono" }, short(r.txid || "", 16, 8))], [r.received ? coins(r.received) : "", 1], [r.sent ? coins(r.sent) : "", 1]] })))
+      !a.history ? "" : a.history.length ? table([["Block"], ["Time"], ["Txid"], ["Received", 1], ["Sent", 1]], a.history.map((r) => ({ go: r.txid ? () => go("tx", r.txid) : null,
+        cells: [[fmt(r.height)], [h("span", { class: "faint" }, stamp(r.time))], [h("span", { class: "mono" }, short(r.txid || "", 16, 8))], [r.received ? coins(r.received) : "", 1], [r.sent ? coins(r.sent) : "", 1]] })))
         : h("div", { class: "x-empty" }, "No transactions."));
   }
   async function vInscription() {
@@ -492,7 +495,7 @@
       head(`Inscription #${fmt(i.n)}`, h("span", { class: "chip ins" }, ct || "no type"), i.burned != null ? pill("burned", false) : "", i.from_arcade || i._mesh ? "" : contentLink(`/content/${i.id}`, `Inscription #${fmt(i.n)}`)),
       h("div", { class: "x-split" }, preview(i, true),
         kv([["Id", h("span", { class: "mono" }, i.id)], collRow, ["Holder", i.owner ? addrLink(i.owner, i.owner_tag) : h("span", { class: "faint" }, i.burned != null ? `burned at ${fmt(i.burned)}` : "—")],
-          i.at && ["Location", link(short(i.at, 12, 10), "tx", i.at.split(":")[0], "mono")], ["Inscribed", link(`block ${fmt(i.h)}`, "block", String(i.h))],
+          i.at && ["Location", link(short(i.at, 12, 10), "tx", i.at.split(":")[0], "mono")], ["Inscribed", h("span", {}, link(`block ${fmt(i.h)}`, "block", String(i.h)), i.time ? ` · ${when(i.time)}` : "")],
           ["Content type", i.ct || "—"], ["Size", `${fmt(i.size)} bytes · ${i.pieces} piece${i.pieces === 1 ? "" : "s"}`], i.proto && ["Protocol", i.proto],
           i.delegate && ["Delegate", link(short(i.delegate, 12, 6), "inscription", i.delegate, "mono")], i.parent && ["Parent", link(short(i.parent, 12, 6), "inscription", i.parent, "mono")],
           i.re && ["Reinscription", "yes"], ["Reveal", link(short(i.txs?.[i.txs.length - 1] || "", 12, 8), "tx", i.txs?.[i.txs.length - 1], "mono")]])));
