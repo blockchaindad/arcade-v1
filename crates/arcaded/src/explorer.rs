@@ -101,8 +101,13 @@ fn ctx<'a>(node: &'a Node, req: &Value) -> Result<Ctx<'a>, String> {
     let indexes = if p.chain_no == node.params.chain_no {
         crate::chains::home_indexes(node)
     } else if crate::arcsvc::runs(p) {
-        // The ARCADE chain: its blocks, transactions and addresses, nothing else.
-        if node.chain.addresses_on(p.chain_no).unwrap_or(false) { vec!["addresses".to_string()] } else { vec![] }
+        // The ARCADE chain: its blocks, transactions and addresses, and the arcade ledger it always keeps (arcsvc
+        // indexes it with every block: tags, profiles, tokens, inscriptions, apps).
+        let mut ix = vec!["ledger".to_string()];
+        if node.chain.addresses_on(p.chain_no).unwrap_or(false) {
+            ix.push("addresses".to_string());
+        }
+        ix
     } else if !node.extra.lock().unwrap().contains_key(p.key) && crate::borrow::is_borrowed(p.key) {
         // Borrowed: no indexes here; blocks and transactions come from lenders (crate::borrow).
         vec![]

@@ -80,12 +80,18 @@
       h("div", { class: "s" }, `A rating is a review on ${HOME.name}: a small fee, like a comment. Your latest one counts; change it any time, or remove it.`));
   }
 
+  // The chain an app is inscribed on (Martin 2026-11-15: a badge on every app in the lists): its coin and name.
+  function chainBadge(a) {
+    const b = h("span", { class: "ap-chain", title: `Inscribed on ${a.chain_name || a.chain}` });
+    b.append(coinLogo(a.chain, a.chain_name, "span", "ap-chain-logo"), document.createTextNode(a.chain_name || a.chain));
+    return b;
+  }
+
   function pills(a) {
     return h("div", { class: "ap-pills" },
       a.card.multiplayer ? h("span", { class: "pill" }, "multiplayer") : "",
       a.card.category ? h("span", { class: "pill" }, catLabel(a.card.category)) : "",
-      a.card.genre ? h("span", { class: "pill" }, a.card.genre) : "",
-      h("span", { class: "pill" }, a.chain_name));
+      a.card.genre ? h("span", { class: "pill" }, a.card.genre) : "");
   }
 
   async function act(kind, a, extra = {}) {
@@ -115,7 +121,7 @@
     return h("div", { class: "ap-card" }, cover(a),
       h("div", { class: "ap-body" },
         h("div", { class: "ap-title" }, h("b", {}, a.card.name), star),
-        pills(a), h("div", { class: "s" }, byline(a), " · ", ratingLine(a)),
+        h("div", { class: "ap-pills" }, chainBadge(a), pills(a)), h("div", { class: "s" }, byline(a), " · ", ratingLine(a)),
         a.card.description ? h("div", { class: "ap-desc" }, a.card.description) : "",
         h("div", { class: "row ap-row" }, openB, wear || inst, wear ? inst : "", details),
         h("div", { class: "fd-acts" },
@@ -132,7 +138,7 @@
       const un = h("button", { class: "small" }, "Uninstall"); un.onclick = async () => { await api("apps.uninstall", { id: a.id }); draw(); };
       return h("div", { class: "ap-mine" }, h("div", { class: "ap-cover ap-tile" }, "?"), h("b", {}, a.card?.name || a.id), h("div", { class: "s" }, "Not found on the chains here now"), un);
     }
-    const tile = h("div", { class: "ap-mine" + (a.removed ? " gone" : "") }, cover(a), h("b", {}, a.card.name), h("div", { class: "s" }, a.removed ? "removed by its publisher" : (a.card.version ? "v" + a.card.version : "")));
+    const tile = h("div", { class: "ap-mine" + (a.removed ? " gone" : "") }, cover(a), h("b", {}, a.card.name), chainBadge(a), h("div", { class: "s" }, a.removed ? "removed by its publisher" : (a.card.version ? "v" + a.card.version : "")));
     // A theme's tile wears it (its page is only a preview of the look; Preview in the store opens that).
     tile.onclick = (e) => { if (e.target.tagName !== "BUTTON" && !a.removed) (a.card.category === "themes" ? useTheme(a) : open(a)); };
     const un = h("button", { class: "small" }, "Uninstall");
@@ -155,7 +161,7 @@
     });
     const openB = h("button", { class: "primary" }, "Open"); openB.onclick = () => open(a);
     $("ap2-body").replaceChildren(h("div", { class: "ap-detail" }, back,
-      h("div", { class: "ap-card" }, cover(a), h("div", { class: "ap-body" }, h("h2", {}, a.card.name), pills(a), h("div", { class: "s" }, byline(a)),
+      h("div", { class: "ap-card" }, cover(a), h("div", { class: "ap-body" }, h("h2", {}, a.card.name), h("div", { class: "ap-pills" }, chainBadge(a), pills(a)), h("div", { class: "s" }, byline(a)),
         h("div", { class: "ap-desc" }, a.card.description || ""), h("div", { class: "row ap-row" }, openB))),
       claimed.length ? h("div", { class: "card" }, h("div", { class: "k" }, "This app asks for"), ...sw, h("div", { class: "s" }, "Off: it asks you the first time it wants it.")) : "",
       h("h2", {}, "Ratings"),
@@ -195,7 +201,7 @@
             const ok = h("button", { class: "small primary" }, "Show it"); ok.onclick = async () => { await api("apps.review", { chain: a.chain, txid: a.txid, verdict: "clear" }); draw(); };
             const no = h("button", { class: "small" }, "Keep hidden"); no.onclick = async () => { await api("apps.review", { chain: a.chain, txid: a.txid, verdict: "confirm" }); draw(); };
             const tr = h("button", { class: "small" }, "Trust this publisher"); tr.onclick = async () => { await api("apps.trust", { address: a.creator, on: true }); draw(); };
-            return h("div", { class: "ap-card" }, cover(a), h("div", { class: "ap-body" }, h("b", {}, a.card.name), h("div", { class: "s" }, byline(a)), h("div", { class: "s bad" }, a.flag), h("div", { class: "row ap-row" }, ok, no, tr)));
+            return h("div", { class: "ap-card" }, cover(a), h("div", { class: "ap-body" }, h("b", {}, a.card.name), chainBadge(a), h("div", { class: "s" }, byline(a)), h("div", { class: "s bad" }, a.flag), h("div", { class: "row ap-row" }, ok, no, tr)));
           }) : [h("div", { class: "mx-empty" }, "Nothing to review.")]));
       }
     } catch (e) { note(e.message, true); }

@@ -11,7 +11,7 @@
 //! - Installing keeps (chain, creator, name): it always opens the newest version.
 
 use crate::node::Node;
-use arcade_chain::params::{by_key, ChainParams};
+use arcade_chain::params::ChainParams;
 use arcade_ledger::cards::{self, Card};
 use arcade_store::KeyBuf;
 use serde_json::{json, Value};
@@ -50,6 +50,10 @@ fn ledger_chains(node: &Node) -> Vec<&'static ChainParams> {
         if r.indexes.iter().any(|i| i == "ledger") {
             out.push(r.params);
         }
+    }
+    // The ARCADE chain keeps the arcade ledger whenever it runs here (arcsvc): its apps are in the store too.
+    if let Some(p) = crate::arcsvc::defined().filter(|p| crate::arcsvc::runs(p)) {
+        out.push(p);
     }
     out
 }
@@ -441,7 +445,7 @@ pub fn installed(node: &Node) -> Value {
 }
 
 fn find(node: &Node, chain: &str, txid: &str) -> Result<(App, String), String> {
-    let p = by_key(chain).ok_or_else(|| format!("unknown chain {chain}"))?;
+    let p = crate::chains::find(chain).ok_or_else(|| format!("unknown chain {chain}"))?;
     let a = gather(node)
         .into_iter()
         .find(|a| a.chain.chain_no == p.chain_no && a.versions.iter().any(|v| v.txid == txid))
