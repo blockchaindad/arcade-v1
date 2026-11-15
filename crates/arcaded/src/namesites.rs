@@ -653,11 +653,20 @@ pub fn content(node: &Node, id: &str, ask: bool) -> Option<(String, Vec<u8>)> {
         let seen = SEEN.lock().unwrap().as_ref().and_then(|m| m.get(&id).copied());
         let mut list: Vec<&'static ChainParams> = seen.into_iter().collect();
         if seen.is_none() {
+            // Chains whose names can be read, and those an arcade on the mesh keeps (a borrowed chain's inscriptions
+            // are asked of whoever keeps it, as the Explorer does; Dogecoin's come without its names).
             list = chains(node);
+            let ords: Vec<&'static ChainParams> = ALL_CHAINS.iter().copied().filter(|p| !list.iter().any(|l| l.chain_no == p.chain_no) && !crate::shares::index_holders(node, p.net, "").is_empty()).collect();
+            list.extend(ords);
         }
-        list.retain(|p| !here.iter().any(|h| h.chain_no == p.chain_no));
-        got = each(&list, |p| crate::explorer::handle(node, "explorer.inscription", &json!({"chain": p.key, "id": id}))).into_iter().find_map(|(_, r)| {
-            let c = r.ok()?["content"].take();
+        // A chain said to keep the ord index here can still miss it (a borrowed chain's index, still being read):
+        // its local lookup just failed, so it is asked of the mesh too, as the Explorer does.
+        let answers: Vec<(&'static ChainParams, Value)> = each(&list, |p| crate::explorer::handle(node, "explorer.inscription", &json!({"chain": p.key, "id": id})))
+            .into_iter()
+            .filter_map(|(p, r)| Some((p, r.ok()?)))
+            .collect();
+        got = answers.iter().find_map(|(_, r)| {
+            let c = &r["content"];
             let ct = c["type"].as_str().unwrap_or("").to_string();
             match c["kind"].as_str()? {
                 "image" => {
@@ -669,6 +678,12 @@ pub fn content(node: &Node, id: &str, ask: bool) -> Option<(String, Vec<u8>)> {
                 _ => None,
             }
         });
+        // What the preview can't carry whole (a script, a long page, a big picture: an Anti Doginal Dog loads a 292 KB
+        // renderer) is rebuilt from the inscription's own transactions, each fetched from a lender and checked
+        // against its txid, so the bytes are the chain's, not an arcade's word.
+        if got.is_none() {
+            got = answers.iter().find_map(|(p, r)| rebuilt(node, p, r));
+        }
     }
     if let Some((ct, body)) = &got {
         let mut g = KEPT.lock().unwrap();
@@ -682,6 +697,26 @@ pub fn content(node: &Node, id: &str, ask: bool) -> Option<(String, Vec<u8>)> {
         }
     }
     got
+}
+
+/// Largest inscription rebuilt from a borrowed chain's transactions for /content.
+const REBUILD_MOST: u64 = 4 << 20;
+
+/// An inscription's (content type, bytes) from its record on another arcade (its type, size and transactions):
+/// the transactions come from the chain's lenders, each checked against its txid, and the body is read out of them
+/// as this arcade's own index would. None when the chain isn't borrowed here or a piece can't be had.
+fn rebuilt(node: &Node, p: &'static ChainParams, rec: &Value) -> Option<(String, Vec<u8>)> {
+    if rec["size"].as_u64().map_or(true, |s| s > REBUILD_MOST) {
+        return None;
+    }
+    let txids: Vec<arcade_chain::Hash256> = rec["txs"].as_array()?.iter().filter_map(|t| arcade_chain::Hash256::from_hex(t.as_str()?).ok()).collect();
+    if txids.is_empty() {
+        return None;
+    }
+    let txs = crate::borrow::raw_txs(node, p, &txids).ok()?;
+    let body = ord::body_of(p, rec, &|h| txs.get(h).cloned()).ok()?;
+    // The record's size is another arcade's word too: the body read from the chain must agree with it.
+    (Some(body.len() as u64) == rec["size"].as_u64()).then(|| (rec["ct"].as_str().unwrap_or("").to_string(), body))
 }
 
 #[cfg(test)]

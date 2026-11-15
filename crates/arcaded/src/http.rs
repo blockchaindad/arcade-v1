@@ -976,7 +976,8 @@ fn core_rpc(node: &Node, s: &mut TcpStream, r: &Req) {
     // kept but still syncing or indexing, the home chain included) answers from its lenders;
     // what the borrowed side doesn't answer, a kept copy still does.
     let (p, kept) = match r.path.strip_prefix("/chain/").map(|k| k.trim_end_matches('/')) {
-        Some(k) => match node.chain_params(k) {
+        // The ARCADE chain answers too once installed here (a publisher's coins, its sends into the chain's pool).
+        Some(k) => match node.chain_params(k).or_else(|| crate::arcsvc::defined().filter(|p| p.key == k && crate::arcsvc::runs(p))) {
             Some(p) => (p, true),
             None => match crate::chains::find(k).filter(|p| crate::borrow::is_borrowed(p.key)) {
                 Some(p) => (p, false),

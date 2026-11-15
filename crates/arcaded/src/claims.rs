@@ -447,7 +447,9 @@ pub fn find_own_tag(node: &Node, now: bool) -> Option<String> {
     if let Some(t) = node.app.tag_keys(p.chain_no).unwrap_or_default().into_iter().find_map(|k| k.tag) {
         return Some(t);
     }
-    if node.app.claims().unwrap_or_default().iter().any(|c| c.chain == p.chain_no && c.status != ClaimStatus::Failed) {
+    // A claim under way is this arcade's own wallet's (claims are made from Home, for it): an added account
+    // in use still has its @handle looked for, or its arcade could prove no handle and lose the mesh's indexes.
+    if node.app.active_account().is_empty() && node.app.claims().unwrap_or_default().iter().any(|c| c.chain == p.chain_no && c.status != ClaimStatus::Failed) {
         return None;
     }
     // Looked for at most every 30 s (a minute while other arcades are asked): the words are

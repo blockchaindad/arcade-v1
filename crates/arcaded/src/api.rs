@@ -48,6 +48,27 @@ fn handle(node: Arc<Node>, s: UnixStream) {
     }
 }
 
+/// Make this arcade's wallet: new words, or restored from `phrase` (with its @handle, when the
+/// chain already shows it). New and restored wallets alike ask the mesh for a test coin.
+pub fn create_wallet(node: &Node, phrase: Option<&str>) -> Result<Value, String> {
+    let p = node.params;
+    let restored = phrase.is_some();
+    let words = node.app.create_wallet(phrase).map_err(|e| e.to_string())?;
+    // A restored wallet's @handle, found on chain right away (else after a later sync round).
+    let tag = if restored { crate::claims::find_own_tag(node, true) } else { None };
+    // Test coins for the first handle come by themselves: asked for now, so they are
+    // usually here by the time a handle is picked (a restored wallet may have some).
+    if tag.is_none() {
+        if let Ok((k, _)) = node.app.tag_key(p, 0) {
+            let script = arcade_wallet::keys::p2pkh_script_for(&arcade_wallet::secp256k1::PublicKey::from_slice(&hex::decode(&k.pubkey).unwrap()).unwrap());
+            if crate::claims::coins(node, &script).is_empty() {
+                let _ = crate::faucet::ask_if_needed(node, &k.address, "");
+            }
+        }
+    }
+    Ok(json!({"phrase": if restored { Value::Null } else { json!(words) }, "restored": restored, "tag": tag}))
+}
+
 pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
     let s = |k: &str| req[k].as_str().map(String::from);
     let p = node.params;
@@ -85,23 +106,7 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             crate::udpsvc::set(node, req)
         }
         "peers" => Ok(json!(node.links.lock().unwrap().values().map(|l| json!({"addr": l.addr, "node_id": l.node_id, "since": l.since})).collect::<Vec<_>>())),
-        "wallet.create" => {
-            let phrase = node.app.create_wallet(s("phrase").as_deref()).map_err(|e| e.to_string())?;
-            let restored = s("phrase").is_some();
-            // A restored wallet's @handle, found on chain right away (else after a later sync round).
-            let tag = if restored { crate::claims::find_own_tag(node, true) } else { None };
-            // Test coins for the first handle come by themselves: asked for now, so they are
-            // usually here by the time a handle is picked (a restored wallet may have some).
-            if tag.is_none() {
-                if let Ok((k, _)) = node.app.tag_key(p, 0) {
-                    let script = arcade_wallet::keys::p2pkh_script_for(&arcade_wallet::secp256k1::PublicKey::from_slice(&hex::decode(&k.pubkey).unwrap()).unwrap());
-                    if crate::claims::coins(node, &script).is_empty() {
-                        let _ = crate::faucet::ask_if_needed(node, &k.address, "");
-                    }
-                }
-            }
-            Ok(json!({"phrase": if restored { Value::Null } else { json!(phrase) }, "restored": restored, "tag": tag}))
-        }
+        "wallet.create" => create_wallet(node, s("phrase").as_deref()),
         "wallet.phrase" => Ok(json!({"phrase": node.app.phrase().map_err(|e| e.to_string())?})),
         "wallet.keys" => {
             // Any chain: the same 12 words derive each chain's own addresses (its BIP44 coin type).
@@ -144,6 +149,7 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         "wallet.link" => crate::links::link(node, &s("chain").ok_or("chain required")?, &s("wif").ok_or("wif required")?, &s("tag").ok_or("tag required")?),
         "wallet.unlink" => crate::links::unlink(node, &s("chain").ok_or("chain required")?, &s("address").ok_or("address required")?, &s("tag").ok_or("tag required")?),
         "account.signin" => crate::accountsvc::sign_in(node, &s("tag").ok_or("tag required")?, &s("password").ok_or("password required")?, s("from").as_deref().filter(|f| !f.is_empty())),
+        "account.add" => crate::accountsvc::add_words(node, &s("phrase").ok_or("phrase required")?),
         "account.list" => Ok(crate::accountsvc::list(node)),
         "account.switch" => crate::accountsvc::switch(node, &s("id").unwrap_or_default()),
         "account.signout" => crate::accountsvc::sign_out(node, &s("id").ok_or("id required")?),
@@ -391,7 +397,13 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             Ok(json!(crate::faucet::ask(node, &k.address, &s("tag").unwrap_or_default())?))
         }
         "mempool" => {
-            let pool = node.chain.mempool(c).map_err(|e| e.to_string())?;
+            // The chain asked for (`--chain`), the home chain by default; the ARCADE chain's pool is its own.
+            let p = crate::sitesvc::chain(node, req)?;
+            let pool = if crate::arcsvc::runs(p) {
+                crate::arcsvc::waiting(5_000).into_iter().map(|raw| (0, raw)).collect()
+            } else {
+                node.chain.mempool(p.chain_no).map_err(|e| e.to_string())?
+            };
             let txs: Vec<Value> = pool
                 .iter()
                 .filter_map(|(seen, raw)| arcade_chain::Tx::parse_with(raw, &p.format).ok().map(|t| (seen, t)))
@@ -470,14 +482,30 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         }
         "profile" => {
             use arcade_ledger::index;
+            // Balance and history on the chain asked for (`--chain`, the ARCADE chain too), the home chain by default.
+            // Tags and profiles: that chain's own ledger first (the ARCADE chain keeps one), else the home chain's.
+            let pc = crate::sitesvc::chain(node, req)?;
+            let ledgers: Vec<u16> = if pc.chain_no == c { vec![c] } else { vec![pc.chain_no, c] };
             let q = s("who").ok_or("give an @tag or an address")?;
             let address = match q.strip_prefix('@') {
-                Some(t) => index::tag_row(&node.chain, c, &t.to_lowercase()).map_err(|e| e.to_string())?
-                    .ok_or_else(|| format!("@{t} is not claimed on {}", p.name))?.address,
+                Some(t) => {
+                    let t = t.to_lowercase();
+                    let (l, row) = ledgers.iter().find_map(|&l| Some((l, index::tag_row(&node.chain, l, &t).ok().flatten()?)))
+                        .ok_or_else(|| format!("@{t} is not claimed on {}", pc.name))?;
+                    // Claimed on another chain than the one asked about: the same key, written as that chain's address
+                    // (as a send to @name finds it there).
+                    match (l != pc.chain_no).then(|| arcade_chain::params::ALL_CHAINS.iter().copied().chain(crate::arcsvc::defined()).find(|x| x.chain_no == l)).flatten() {
+                        Some(lp) => arcade_ledger::address::script_for_address(lp, &row.address)
+                            .filter(|sc| sc.len() == 25 && sc[..3] == [0x76, 0xa9, 0x14])
+                            .map(|sc| arcade_ledger::address::base58check(pc.p2pkh_version, &sc[3..23]))
+                            .unwrap_or(row.address),
+                        None => row.address,
+                    }
+                }
                 None => q.clone(),
             };
-            let tag = index::tag_of(&node.chain, c, &address).map_err(|e| e.to_string())?;
-            let mut prof = index::profile(&node.chain, c, &address).map_err(|e| e.to_string())?;
+            let tag = ledgers.iter().find_map(|&l| index::tag_of(&node.chain, l, &address).ok().flatten());
+            let mut prof = ledgers.iter().find_map(|&l| index::profile(&node.chain, l, &address).ok().flatten());
             // A chain this arcade did not know when the profile was indexed is kept as "h160:<hex>": its address is
             // read now (2026-11-12: Bellscoin and Luckycoin showed as hashes, so nobody could pay them there).
             if let Some(list) = prof.as_mut().and_then(|v| v["linked"].as_array_mut()) {
@@ -492,20 +520,20 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             }
             // Who follows this account and whom it follows (follows.rs), as counts.
             let follow_counts = json!({"followers": crate::follows::followers_of(node, &address).len(), "following": crate::follows::following_of(node, &address).len()});
-            let script = arcade_ledger::address::script_for_address(p, &address);
+            let script = arcade_ledger::address::script_for_address(pc, &address);
             let (balance, history) = match &script {
-                Some(sc) => (node.chain.balance_for_script(c, sc).unwrap_or(0), node.chain.history_for_script(c, sc).map(|h| h.len()).unwrap_or(0)),
+                Some(sc) => (node.chain.balance_for_script(pc.chain_no, sc).unwrap_or(0), node.chain.history_for_script(pc.chain_no, sc).map(|h| h.len()).unwrap_or(0)),
                 None => (0, 0),
             };
             // Does someone else's profile state this address as theirs?
-            let linked_by = index::owner_of_linked(&node.chain, c, p.key, &address).unwrap_or(None);
+            let linked_by = index::owner_of_linked(&node.chain, c, pc.key, &address).unwrap_or(None);
             // The tag in a profile is only a claim; verified when the tag table agrees.
             let tag_verified = match (prof.as_ref().and_then(|v| v["tag"].as_str()), &tag) {
                 (Some(t), Some(real)) => Some(t == real),
                 (Some(_), None) => Some(false),
                 _ => None,
             };
-            Ok(json!({"address": address, "tag": tag, "balance": balance, "history_rows": history,
+            Ok(json!({"chain": pc.key, "address": address, "tag": tag, "balance": balance, "history_rows": history,
                       "profile": prof, "profile_tag_verified": tag_verified, "stated_by": linked_by, "follows": follow_counts}))
         }
         "ord" | "ord.chunks" | "name" | "map" | "token" | "tokens" => {

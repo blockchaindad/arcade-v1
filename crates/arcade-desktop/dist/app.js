@@ -230,11 +230,15 @@ function drawMesh(ov) {
   }));
 }
 
-async function drawAccounts() {
+// The accounts table (Wallet → Accounts, and Options); redrawn only when the list changes.
+async function drawAccounts(tb = $("w-accs"), m = $("w-msg"), force = true) {
   const accs = await api("account.list").catch(() => []);
-  $("w-accs").replaceChildren(...accs.map((a) => {
+  const sig = JSON.stringify(accs);
+  if (!force && tb.dataset.sig === sig) return;
+  tb.dataset.sig = sig;
+  tb.replaceChildren(...accs.map((a) => {
     const tr = document.createElement("tr");
-    const name = (a.tag ? "@" + a.tag : (a.own ? "This arcade's wallet" : a.id)) + (a.active ? " (in use)" : "");
+    const name = (a.tag ? "@" + a.tag : (a.own ? "This arcade's wallet" : "Another account")) + (a.active ? " (in use)" : "");
     for (const t of [name, a.address || (a.own ? "this PC" : ""), a.own ? "" : (a.from || "")]) {
       const td = document.createElement("td"); td.textContent = t; tr.append(td);
     }
@@ -242,8 +246,8 @@ async function drawAccounts() {
     if (!a.active) {
       const u = document.createElement("button"); u.textContent = "Use";
       u.addEventListener("click", async () => {
-        try { await api("account.switch", { id: a.id }); msg($("w-msg"), `Now using ${name.replace(" (in use)", "")}.`, "ok"); refresh(); }
-        catch (e) { msg($("w-msg"), e.message, "bad"); }
+        try { await api("account.switch", { id: a.id }); msg(m, `Now using ${name.replace(" (in use)", "")}.`, "ok"); refresh(); }
+        catch (e) { msg(m, e.message, "bad"); }
       });
       td.append(u);
     }
@@ -251,8 +255,8 @@ async function drawAccounts() {
       const b = document.createElement("button"); b.textContent = "Sign out";
       b.addEventListener("click", async () => {
         if (b.dataset.sure !== "1") { b.dataset.sure = "1"; b.textContent = "Sign out: sure?"; return; }
-        try { await api("account.signout", { id: a.id }); msg($("w-msg"), `Signed out; its words, keys and messages are gone from this arcade.`, "ok"); refresh(); }
-        catch (e) { msg($("w-msg"), e.message, "bad"); }
+        try { await api("account.signout", { id: a.id }); msg(m, `Signed out; its words, keys and messages are gone from this arcade.`, "ok"); refresh(); }
+        catch (e) { msg(m, e.message, "bad"); }
       });
       td.append(b);
     }
@@ -547,7 +551,7 @@ async function refresh() {
     if (tab === "wallet") await refreshWallet();
     if (tab === "mine") await refreshMine();
     if (tab === "activity") await refreshActivity();
-    if (tab === "options") { await refreshOptions(); refreshWebUi(); }
+    if (tab === "options") { await refreshOptions(); refreshWebUi(); drawAccounts($("o-accs"), $("o-acc-msg"), false); }
   } catch (e) {
     $("conn").textContent = e && e.starting ? "starting the service…" : "service not running"; $("conn").className = "pill bad";
   }
@@ -566,6 +570,23 @@ $("w-done").addEventListener("click", () => { $("w-phrase-words").textContent = 
 $("w-restore").addEventListener("click", async () => {
   try { const r = await api("wallet.create", { phrase: $("w-words").value }); $("w-words").value = ""; msg($("w-msg"), r && r.tag ? `Wallet restored: you're @${r.tag} again.` : "Wallet restored. If it had a name, it shows here once this arcade or another can read it from the chain.", "ok"); refresh(); }
   catch (e) { msg($("w-msg"), e.message, "bad"); }
+});
+$("o-add").addEventListener("click", async () => {
+  const b = $("o-add"), m = $("o-acc-msg");
+  if (b.disabled) return;
+  b.disabled = true; msg(m, "Bringing in the account…");
+  try {
+    const r = await api("account.add", { phrase: $("o-words").value.trim().toLowerCase().split(/\s+/).join(" ") });
+    $("o-words").value = "";
+    const who = r.account.tag ? `@${r.account.tag}` : r.own ? "this arcade's wallet" : r.account.address;
+    msg(m, !r.added ? `That account is already here: now using ${who}.`
+      : r.own ? `Restored as this arcade's wallet${r.account.tag ? `: you're @${r.account.tag} again` : ""}. Addresses and coins show up on every chain as it is read.`
+      : `Added ${who} and using it now. Its addresses and coins show up on every chain as it is read${r.account.tag ? "" : "; its @handle too, once found on the chain"}.`, "ok");
+    drawStart.sig = null;
+    await drawAccounts($("o-accs"), m);
+    refresh();
+  } catch (e) { msg(m, e.message, "bad"); }
+  finally { b.disabled = false; }
 });
 $("w-more").addEventListener("toggle", () => { if ($("w-more").open) { drawAccounts(); drawLinks(picked()); } });
 $("w-link").addEventListener("click", async () => {

@@ -1487,6 +1487,25 @@ pub fn broadcast_tx(node: &Node, p: &'static ChainParams, tx: &Tx) -> Result<Val
     Ok(json!(answers))
 }
 
+/// Transactions of a borrowed chain, from a lender's Core in as few asks as the batch limit allows (each checked
+/// against its txid).
+pub fn raw_txs(node: &Node, p: &ChainParams, txids: &[arcade_chain::Hash256]) -> Result<HashMap<arcade_chain::Hash256, Tx>, String> {
+    let mut out = HashMap::new();
+    for part in txids.chunks(crate::coreshare::MAX_CALLS) {
+        let calls: Vec<Value> = part.iter().map(|t| json!(["getrawtransaction", [t.to_hex(), 0]])).collect();
+        let (_, a) = call_any(node, p, Value::Array(calls))?;
+        for (want, got) in part.iter().zip(a.iter()) {
+            let raw = hex::decode(r(got)?.as_str().ok_or("not hex")?).map_err(|e| e.to_string())?;
+            let tx = Tx::parse_with(&raw, &p.format).map_err(|e| e.to_string())?;
+            if tx.txid != *want {
+                return Err("the lender's transaction has another txid".into());
+            }
+            out.insert(*want, tx);
+        }
+    }
+    Ok(out)
+}
+
 /// A transaction of a borrowed chain, from a lender's Core (checked against its txid).
 pub fn raw_tx(node: &Node, p: &ChainParams, txid: &arcade_chain::Hash256) -> Result<Tx, String> {
     let (_, a) = call_any(node, p, json!([["getrawtransaction", [txid.to_hex(), 0]]]))?;

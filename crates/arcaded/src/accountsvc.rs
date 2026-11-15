@@ -7,6 +7,10 @@
 //! The original's routes (web/app.py): GET /signin/{tag}?here=1, GET /signin/{tag}/imported,
 //! GET /auth/challenge + POST /auth/login, GET /account/mailbox.
 //!
+//! Or add an account from its 12 words (`add_words`): the whole account at once, every chain's
+//! addresses derived from them, its @handle read back from the chain. On an arcade with no wallet
+//! yet the words become its own wallet.
+//!
 //! Several accounts live side by side; one is active, and the wallet, messages, groups and
 //! rooms follow it (arcade_app::AppDb keeps each account's rows apart).
 
@@ -36,6 +40,14 @@ pub fn list(node: &Node) -> Value {
     let mut out = vec![json!({"id": "", "own": true, "active": active.is_empty(), "tag": own_tag(node)})];
     for a in list_raw(node) {
         let mut a = a;
+        // Its @handle, read from the chain by its address. Never by switching to the account for a moment
+        // (with_account): the list is drawn on every refresh, and a send or a sync running meanwhile would act
+        // on the wrong account.
+        if a["tag"].is_null() {
+            if let Some(addr) = a["address"].as_str() {
+                a["tag"] = json!(arcade_ledger::index::tag_of(&node.chain, node.params.chain_no, addr).ok().flatten());
+            }
+        }
         a["active"] = json!(a["id"] == active.as_str());
         a["own"] = json!(false);
         out.push(a);
@@ -87,6 +99,49 @@ pub fn sign_out(node: &Node, id: &str) -> Result<Value, String> {
     save(node, &l)?;
     let _ = node.app.event("wallet", &format!("signed out account {id}"));
     Ok(list(node))
+}
+
+// ---------------- add from 12 words ----------------
+
+/// Add an account from its 12 words and make it the active one: the whole account (every chain's
+/// addresses come from the words; its @handle from the chain). With no wallet here yet, the words
+/// become this arcade's own wallet, as the first-run Restore does. Words already here (the own
+/// wallet's or an added account's) just switch to that account.
+pub fn add_words(node: &Node, phrase: &str) -> Result<Value, String> {
+    let phrase = arcade_wallet::keys::check_phrase(&phrase.trim().to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")).map_err(|e| e.to_string())?;
+    let own_has = with_account(node, "", || node.app.has_wallet()).map_err(|e| e.to_string())?;
+    if !own_has {
+        node.app.set_active_account("").map_err(|e| e.to_string())?;
+        let r = crate::api::create_wallet(node, Some(&phrase))?;
+        return Ok(json!({"account": {"id": "", "own": true, "tag": r["tag"]}, "added": true, "own": true}));
+    }
+    if with_account(node, "", || node.app.phrase()).ok().as_deref() == Some(phrase.as_str()) {
+        switch(node, "")?;
+        return Ok(json!({"account": {"id": "", "own": true, "tag": own_tag(node)}, "added": false, "own": true}));
+    }
+    let (login, _) = login_key(&phrase)?;
+    let login_pub = hex::encode(login.verifying_key().to_bytes());
+    let id = account_id(&login_pub);
+    let mut l = list_raw(node);
+    if l.iter().any(|a| a["id"] == id.as_str()) {
+        switch(node, &id)?;
+        let a = l.into_iter().find(|a| a["id"] == id.as_str()).unwrap_or_default();
+        return Ok(json!({"account": {"id": id, "tag": a["tag"], "address": a["address"]}, "added": false, "own": false}));
+    }
+    let p = node.params;
+    let seed = arcade_wallet::keys::seed_from_phrase(&phrase).map_err(|e| e.to_string())?;
+    let x = arcade_wallet::keys::tag_key(&seed[..], p.bip44_coin_type, 0).map_err(|e| e.to_string())?;
+    let addr0 = arcade_wallet::keys::p2pkh_address(&x.public(), p.p2pkh_version);
+    with_account(node, &id, || node.app.create_wallet(Some(&phrase)).map(|_| ())).map_err(|e| e.to_string())?;
+    let tag = with_account(node, &id, || {
+        let _ = node.app.tag_key(p, 0);
+        crate::claims::find_own_tag(node, true)
+    });
+    l.push(json!({"id": id, "tag": tag, "address": addr0, "pubkey": login_pub, "from": "12 words", "added": now()}));
+    save(node, &l)?;
+    node.app.set_active_account(&id).map_err(|e| e.to_string())?;
+    let _ = node.app.event("wallet", &format!("added account {} from its words", tag.as_ref().map(|t| format!("@{t}")).unwrap_or_else(|| addr0.clone())));
+    Ok(json!({"account": {"id": id, "tag": tag, "address": addr0}, "added": true, "own": false}))
 }
 
 // ---------------- the original's sealed records ----------------
@@ -345,5 +400,44 @@ mod tests {
         let blob = json!({"kdf": "PBKDF2-SHA512", "iterations": 1000, "salt": hex::encode(salt), "nonce": hex::encode(nonce), "sealed": hex::encode(ct)});
         assert_eq!(open_sealed(&blob, "pw").unwrap(), b"legal winner");
         assert_eq!(open_sealed(&blob, "nope").unwrap_err(), "wrong password");
+    }
+}
+
+#[cfg(test)]
+mod words_tests {
+    use super::*;
+
+    const A: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const B: &str = "legal winner thank year wave sausage worth useful legal winner thank yellow";
+
+    #[test]
+    fn words_bring_whole_accounts() {
+        let t = crate::sitesvc::tests::setup();
+        let node = &t.node;
+        // No wallet yet: the words become this arcade's own wallet.
+        let r = add_words(node, &A.to_uppercase()).unwrap();
+        assert_eq!((r["own"].as_bool(), r["added"].as_bool()), (Some(true), Some(true)));
+        assert_eq!(node.app.phrase().unwrap(), A);
+        assert!(add_words(node, "abandon abandon abandon").is_err());
+        // Another account's words: added beside it and used.
+        let r = add_words(node, &format!("  {B} ")).unwrap();
+        assert_eq!((r["own"].as_bool(), r["added"].as_bool()), (Some(false), Some(true)));
+        let id = r["account"]["id"].as_str().unwrap().to_string();
+        assert_eq!(node.app.active_account(), id);
+        assert_eq!(node.app.phrase().unwrap(), B);
+        assert_eq!(list(node).as_array().unwrap().len(), 2);
+        // Words already here switch to that account; nothing is added twice.
+        let r = add_words(node, A).unwrap();
+        assert_eq!((r["own"].as_bool(), r["added"].as_bool()), (Some(true), Some(false)));
+        assert_eq!(node.app.active_account(), "");
+        let r = add_words(node, B).unwrap();
+        assert_eq!(r["added"].as_bool(), Some(false));
+        assert_eq!(node.app.active_account(), id);
+        assert_eq!(list(node).as_array().unwrap().len(), 2);
+        // Signing it out leaves the own wallet as it was.
+        sign_out(node, &id).unwrap();
+        assert_eq!(node.app.active_account(), "");
+        assert_eq!(node.app.phrase().unwrap(), A);
+        assert_eq!(list(node).as_array().unwrap().len(), 1);
     }
 }
