@@ -23,6 +23,7 @@ mod arcseal;
 mod arcserve;
 mod arcseg;
 mod arcblob;
+mod arcgit;
 mod arccode;
 mod arcgenesis;
 mod arckeep;

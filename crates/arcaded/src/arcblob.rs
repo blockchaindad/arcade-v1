@@ -205,11 +205,14 @@ pub fn view(id: &Hash) -> Option<Vec<u8>> {
     }
     let net = crate::arcsvc::svc_net()?;
     for peer in crate::arcsvc::linked_peers() {
-        if let Ok((b, kind)) = fetch_from(&peer, id) {
+        if let Ok((b, kind, gz)) = fetch_from(&peer, id) {
             if arcade_arc::blob::id_of_bytes(&net, &b) == *id {
                 cache_put(id, &b);
                 if !kind.is_empty() {
                     let _ = std::fs::write(cache_dir().join(format!("{}.kind", hex::encode(id))), &kind);
+                }
+                if gz {
+                    let _ = std::fs::write(cache_dir().join(format!("{}.gz", hex::encode(id))), b"1");
                 }
                 return Some(b);
             }
@@ -223,12 +226,21 @@ pub fn kind_of(id: &Hash) -> Option<String> {
     meta(id).map(|m| m.kind).or_else(|| std::fs::read_to_string(cache_dir().join(format!("{}.kind", hex::encode(id)))).ok())
 }
 
+/// Whether a blob is stored gzipped (its record's encoding; for a fetched one, what the arcade it came from said), so a
+/// viewer is told to undo it.
+pub fn gzipped(id: &Hash) -> bool {
+    match meta(id) {
+        Some(m) => m.encoding == arcade_arc::blob::Encoding::Gzip as u8,
+        None => cache_dir().join(format!("{}.gz", hex::encode(id))).exists(),
+    }
+}
+
 /// Bytes of a blob per answer piece (a mesh frame is 64 KiB at most, head and blob).
 const PIECE: u64 = 48_000;
 /// Pieces asked for at once.
 const WINDOW: usize = 16;
 
-fn fetch_from(peer: &str, id: &Hash) -> Result<(Vec<u8>, String), String> {
+fn fetch_from(peer: &str, id: &Hash) -> Result<(Vec<u8>, String, bool), String> {
     use crate::crsource::Pipe;
     use arcade_mesh::link::Frame;
     use std::time::{Duration, Instant};
@@ -262,7 +274,7 @@ fn fetch_from(peer: &str, id: &Hash) -> Result<(Vec<u8>, String), String> {
         out.extend_from_slice(&f.blob);
         if out.len() as u64 >= len {
             out.truncate(len as usize);
-            return Ok((out, kind));
+            return Ok((out, kind, f.head["gz"] == true));
         }
     }
     Err("no answer".into())
@@ -279,6 +291,9 @@ pub fn serve_piece(link: &mut arcade_mesh::link::Link, head: &serde_json::Value)
         Some(b) => {
             f.head["len"] = serde_json::json!(b.len());
             f.head["kind"] = serde_json::json!(kind.unwrap_or_default());
+            if head["b"].as_str().and_then(|s| hex::decode(s).ok()).and_then(|b| <Hash>::try_from(b).ok()).is_some_and(|id| gzipped(&id)) {
+                f.head["gz"] = serde_json::json!(true);
+            }
             let from = (at as usize).min(b.len());
             f.blob = b[from..(from + PIECE as usize).min(b.len())].to_vec();
         }
