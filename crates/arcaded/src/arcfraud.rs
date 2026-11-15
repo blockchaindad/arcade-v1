@@ -173,7 +173,9 @@ pub fn height_holding(first: u64, last: u64, at: u64, mut row: impl FnMut(u64) -
 /// Every ten minutes: listed segments of blocks of the chains kept here, against our own roots.
 pub fn start(node: std::sync::Arc<Node>) {
     let _ = std::thread::Builder::new().name("arc fraud watch".into()).spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(600));
+        // Every 10 minutes, or 10 blocks on a faster test chain: well inside a segment's challenge window (§15 step 11).
+        let every = crate::arcsvc::svc().map_or(600, |s| (s.net().block_seconds * 10).clamp(10, 600));
+        std::thread::sleep(Duration::from_secs(every));
         if let Err(e) = watch(&node) {
             eprintln!("arc: fraud watch: {e}");
         }
@@ -199,7 +201,13 @@ fn watch(node: &Node) -> Result<(), String> {
                 continue;
             }
             eprintln!("arc: the listed {} segment {first}..={last} isn't the one this arcade makes: looking for the proof", p.name);
-            let holders: Vec<String> = reg.all_replicas().iter().filter(|r| r.1 == l.id).map(|r| hex::encode(r.2)).collect();
+            // Its replicas' owners, and its poster: in its challenge window nobody is registered yet, but the poster
+            // made the root from the data.
+            let mut holders: Vec<String> = reg.all_replicas().iter().filter(|r| r.1 == l.id).map(|r| hex::encode(r.2)).collect();
+            let poster = hex::encode(l.entry.poster);
+            if !holders.contains(&poster) {
+                holders.push(poster);
+            }
             // A holder that hands out nothing can't be checked against: its leaves are demanded on the chain (§2.4).
             let reachable = holders.iter().any(|peer| ask(peer, json!({"seg": hex::encode(l.id), "kind": "h", "first": 0, "count": 1})).is_some_and(|a| !a.1.is_empty()));
             if !reachable {

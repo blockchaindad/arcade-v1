@@ -611,10 +611,10 @@ pub fn register(node: &Node, net: &Net, p: &ChainParams, reg: &Registry, tip: u6
         add(Item::RegProof(RegProof { owner: me, leaves: opened }));
         return;
     }
-    // A new batch: what is sealed here, listed and not registered.
+    // A new batch: what is sealed here, listed (past its challenge window, §15 step 11) and not registered.
     let todo: Vec<&crate::arcseal::Replica> = mine
         .iter()
-        .filter(|r| reg.catalog().get(&r.segment).is_some() && !reg.registered(&block::replica_id(net, &r.segment, &me)))
+        .filter(|r| reg.catalog().get(&r.segment).is_some_and(|l| l.settled(tip + 1)) && !reg.registered(&block::replica_id(net, &r.segment, &me)))
         .take(block::MAX_BATCH)
         .collect();
     let now = std::time::Instant::now();

@@ -122,7 +122,10 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         }
         "wallet.send" => {
             let amount = req["amount"].as_u64().ok_or("amount required (satoshis)")?;
-            crate::coinsend::send(node, s("chain").as_deref(), &s("to").ok_or("to required")?, amount, s("from").as_deref(), req["send"] == true)
+            crate::coinsend::OWNER_CHANGE_OK.with(|c| c.set(req["owner_changed_ok"] == true));
+            let r = crate::coinsend::send(node, s("chain").as_deref(), &s("to").ok_or("to required")?, amount, s("from").as_deref(), req["send"] == true);
+            crate::coinsend::OWNER_CHANGE_OK.with(|c| c.set(false));
+            r
         }
         "wallet.link" => crate::links::link(node, &s("chain").ok_or("chain required")?, &s("wif").ok_or("wif required")?, &s("tag").ok_or("tag required")?),
         "wallet.unlink" => crate::links::unlink(node, &s("chain").ok_or("chain required")?, &s("address").ok_or("address required")?, &s("tag").ok_or("tag required")?),
@@ -331,8 +334,28 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         "mute.list" => Ok(json!(crate::msgsvc::mutes(node))),
         "mute.add" => crate::msgsvc::mute(node, &s("address").ok_or("address required")?, true),
         "mute.remove" => crate::msgsvc::mute(node, &s("address").ok_or("address required")?, false),
-        "tag.check" => Ok(json!(crate::claims::check(node, &s("tag").ok_or("tag required")?))),
-        "tag.claim" => Ok(json!(crate::claims::start(node, &s("tag").ok_or("tag required")?)?)),
+        // `chain`: the home chain (default) or the ARCADE chain (§15 step 7).
+        "tag.check" => Ok(json!(crate::claims::check_on(node, crate::claims::chain_for(node, s("chain").as_deref())?, &s("tag").ok_or("tag required")?))),
+        "tag.claim" => Ok(json!(crate::claims::start_on(node, crate::claims::chain_for(node, s("chain").as_deref())?, &s("tag").ok_or("tag required")?)?)),
+        // The ledger on the ARCADE chain (§15 step 7).
+        "ledger.announce" => crate::arcledger::announce(node),
+        "ledger.profile" => crate::arcledger::profile(node, &req),
+        "ledger.repo_push" => crate::arcledger::repo_push(node, &s("name").ok_or("name required")?, &s("manifest").ok_or("manifest required")?),
+        "ledger.repo_maintainer" => crate::arcledger::repo_maintainer(node, &s("name").ok_or("name required")?, &s("tag").ok_or("tag required")?, req["add"] != false),
+        "ledger.repo_fork" => crate::arcledger::repo_fork(node, &s("from").ok_or("from required")?, &s("name").ok_or("name required")?),
+        "ledger.item_open" => crate::arcledger::item_open(node, &req),
+        "ledger.item_comment" => crate::arcledger::item_comment(node, &req),
+        "ledger.item_state" => crate::arcledger::item_state(node, &req),
+        "ledger.items" => crate::arcledger::items(node, &req),
+        "ledger.repo" => crate::arcledger::repo(node, &s("name").ok_or("name required")?),
+        "ledger.repos" => crate::arcledger::repos(node, s("owner").as_deref()),
+        "ledger.tag_commit" => crate::arcledger::tag_commit(node, &s("tag").ok_or("tag required")?),
+        "ledger.tag_checkin" => crate::arcledger::tag_checkin(node),
+        "ledger.send" => {
+            let payload = hex::decode(s("hex").ok_or("hex required (the AnyData payload)")?.trim()).map_err(|_| "hex is not hex")?;
+            let (txid, fee) = crate::arcledger::send(node, &payload)?;
+            Ok(json!({"txid": txid, "fee": fee}))
+        }
         "tag.list" => Ok(json!(node.app.claims().map_err(|e| e.to_string())?)),
         "start.status" => Ok(crate::claims::start_status(node)),
         "faucet.ask" => {

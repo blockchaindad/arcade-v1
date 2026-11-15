@@ -27,9 +27,21 @@ fn sha1ish(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|c| c.is_ascii_hexdigit())
 }
 
-/// `rest` = `<manifest id>/<git path>`: the status line and body.
-pub fn serve(rest: &str) -> (&'static str, Vec<u8>) {
+/// `rest` = `<manifest id>/<git path>`, or `@owner/name/<git path>` for a repository under an @tag (§15 step 9: its
+/// manifest now, as the ARCADE chain's ledger says): the status line and body.
+pub fn serve(node: &crate::node::Node, rest: &str) -> (&'static str, Vec<u8>) {
+    if let Some(named) = rest.strip_prefix('@').or_else(|| rest.strip_prefix("%40")) {
+        let mut parts = named.splitn(3, '/');
+        let (owner, name, file) = (parts.next().unwrap_or(""), parts.next().unwrap_or("").trim_end_matches(".git"), parts.next().unwrap_or(""));
+        let Ok(full) = arcade_ledger::repos::full_name(&format!("{owner}/{name}"), None) else { return ("404 Not Found", b"not a repository name\n".to_vec()) };
+        let Some(m) = crate::arcledger::repo_manifest(node, &full) else { return ("404 Not Found", format!("no repository @{full} on the ARCADE chain\n").into_bytes()) };
+        return serve_manifest(&m, file);
+    }
     let (id, file) = rest.split_once('/').unwrap_or((rest, ""));
+    serve_manifest(id, file)
+}
+
+fn serve_manifest(id: &str, file: &str) -> (&'static str, Vec<u8>) {
     let Some(m) = manifest(id.trim_end_matches(".git")) else { return ("404 Not Found", b"no such repository manifest on the ARCADE chain\n".to_vec()) };
     let refs = m["refs"].as_object().cloned().unwrap_or_default();
     match file {

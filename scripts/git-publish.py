@@ -2,11 +2,16 @@
 """Push a git repository onto the ARCADE chain as blobs (crates/arcaded/src/arcgit.rs).
 
   git-publish.py --sock <arcade home>/arcaded.sock --repo DIR [--ref main] [--name arcade-v1] [--prev MANIFEST_ID]
+                 [--to @owner/name]
 
 Packs every object reachable from --ref that the manifest --prev doesn't reach yet (git pack-objects, pieces under
 3 MB so a pack and its index fit one block's 4 MB of blobs), publishes each pack and its index from the arcade's
 wallet (one transaction each, Permanent), then a manifest blob naming the refs and every pack so far. Prints the
 manifest's id: `git clone http://<arcade>/git/<id>` clones it from any arcade.
+
+With --to, the push goes to a repository under an @tag (§15 step 9): it carries on from the repository's manifest now
+(unless --prev says otherwise), and once the new manifest is in a block a signed push record points the repository at
+it, so `git clone http://<arcade>/git/@owner/name` follows it. Only the owner and its maintainers can push.
 """
 import argparse, glob, json, os, socket, subprocess, sys, tempfile, time
 
@@ -36,8 +41,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sock", required=True); ap.add_argument("--repo", required=True)
     ap.add_argument("--ref", default="main"); ap.add_argument("--name", default="")
-    ap.add_argument("--prev", default="")
+    ap.add_argument("--prev", default=""); ap.add_argument("--to", default="")
     a = ap.parse_args()
+    if a.to and not a.prev:
+        try:
+            a.prev = call(a.sock, {"cmd": "ledger.repo", "name": a.to})["manifest"]
+        except RuntimeError as e:
+            if "no repository" not in str(e):
+                raise
+    if a.to and not a.name:
+        a.name = a.to.lstrip("@")
     git = lambda *x, **k: subprocess.run(["git", "-C", a.repo, *x], check=True, capture_output=True, **k)
     head = git("rev-parse", f"{a.ref}^{{commit}}").stdout.decode().strip()
     prev = {"refs": {}, "packs": []}
@@ -61,7 +74,20 @@ def main():
         mpath = os.path.join(tmp, "manifest.json")
         json.dump(manifest, open(mpath, "w"), separators=(",", ":"))
         r = publish(a.sock, [{"path": mpath, "type": "application/json", "class": 0}])
-    print(json.dumps({"manifest": r["blobs"][0]["blob"], "head": head, "new_packs": len(packs), "packs": len(manifest["packs"])}))
+    out = {"manifest": r["blobs"][0]["blob"], "head": head, "new_packs": len(packs), "packs": len(manifest["packs"])}
+    if a.to:
+        for _ in range(360):
+            if call(a.sock, {"cmd": "arc.blob", "id": out["manifest"]})["on_chain"]:
+                break
+            time.sleep(5)
+        for _ in range(360):
+            try:
+                out["push"] = call(a.sock, {"cmd": "ledger.repo_push", "name": a.to, "manifest": out["manifest"]}); break
+            except RuntimeError as e:
+                if "not enough" not in str(e) and "could not build" not in str(e):
+                    raise
+                time.sleep(10)
+    print(json.dumps(out))
 
 
 main()

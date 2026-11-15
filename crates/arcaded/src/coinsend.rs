@@ -323,6 +323,11 @@ mod tests {
     }
 }
 
+thread_local! {
+    /// The send being made says it knows an @tag changed owner (its request's `owner_changed_ok`).
+    pub(crate) static OWNER_CHANGE_OK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// `to` as an @name (with or without the @, when it isn't an address of `p`): the claim's address on the home chain,
 /// with its key hash under `p`'s version byte. Only when `p` derives keys as the home chain does (the same BIP44 coin
 /// type: the ARCADE testnet beside Pepecoin testnet), so the address is one the name's own wallet holds; elsewhere the
@@ -334,6 +339,18 @@ fn to_of_tag(node: &Node, p: &ChainParams, to: &str) -> Result<Option<String>, S
     }
     if !(2..=24).contains(&t.len()) || !t.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
         return Ok(None);
+    }
+    // On the ARCADE chain, its own ledger's @tag first (§15 step 7); a released tag that changed hands lately warns,
+    // and the send is refused unless it says it knows (`owner_changed_ok`).
+    if crate::arcsvc::runs(p) {
+        if let Some((address, warn)) = crate::arcledger::tag_owner(node, &t) {
+            if let Some(w) = warn {
+                if !OWNER_CHANGE_OK.with(|c| c.get()) {
+                    return Err(format!("{w}: send again with owner_changed_ok if you mean the new owner"));
+                }
+            }
+            return Ok(Some(address));
+        }
     }
     let row = arcade_ledger::index::tag_row(&node.chain, node.params.chain_no, &t).map_err(|e| e.to_string())?
         .ok_or_else(|| format!("@{t} is not claimed"))?;

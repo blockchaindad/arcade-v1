@@ -3,3 +3,4 @@ target/
 *.mdbx-lck
 var/
 .claude/worktrees/
+__pycache__/

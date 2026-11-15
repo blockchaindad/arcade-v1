@@ -33,6 +33,19 @@ pub const ASK: &str = "ledger.v1.nft_ask"; // C|txid -> JSON
 pub const COLLECTION: &str = "ledger.v1.collection_item"; // C|txid -> JSON
 pub const META: &str = "ledger.v1.meta"; // C|name -> value
 pub const BY_NUMBER: &str = "ledger.v1.insc_by_number"; // C|number u64 -> txid
+// @tag expiry (tags::Expiry; chains that turn it on only):
+pub const TAG_SEEN: &str = "ledger.v1.tag_seen"; // C|tag -> {"t": last activity time, "h": height}
+pub const TAG_DUE: &str = "ledger.v1.tag_due"; // C|release time u64|tag -> ""
+pub const TAG_REL: &str = "ledger.v1.tag_released"; // C|tag -> {"h", "t", "a": the owner it had}
+pub const TAG_COMMIT: &str = "ledger.v1.tag_commit"; // C|commitment -> {"h", "p"}
+pub const TAG_PEND: &str = "ledger.v1.tag_pending"; // C|tag -> the earliest committed claim in its reveal window
+pub const TAG_WIN: &str = "ledger.v1.tag_window"; // C|window's end height u32|tag -> ""
+// @tag repositories (crate::repos; chains with the ARCADE rules only):
+pub const REPO: &str = "ledger.v1.repo"; // C|owner/name -> {"m": manifest hex, "fork", "n": pushes, "h", "txid", "by"}
+pub const REPO_MAINT: &str = "ledger.v1.repo_maintainer"; // C|owner/name|00|tag -> ""
+pub const REPO_LOG: &str = "ledger.v1.repo_log"; // C|owner/name|00|height u32|pos u32 -> {"m", "by", "txid"}
+pub const REPO_ITEM: &str = "ledger.v1.repo_item"; // C|owner/name|00|number u32 -> {"k", "by", "s", "b", "h", "txid"}
+pub const REPO_EVENT: &str = "ledger.v1.repo_event"; // C|owner/name|00|number u32|height u32|pos u32 -> {"by", "w", "v", "b"}
 
 pub const MAX_AMOUNT: u64 = 9_223_372_036_854_775_807;
 const PROPERTY_TYPES: &[u16] = &[1, 2, 65, 66, 129, 130, 5];
@@ -154,6 +167,8 @@ struct Engine<'a, 'b, 'db> {
     g: Gates,
     rows: RefCell<Vec<String>>,
     emptied: RefCell<HashMap<String, Value>>,
+    /// The block's time (tag expiry).
+    time: u64,
 }
 
 struct Rtx<'t> {
@@ -250,6 +265,167 @@ impl Engine<'_, '_, '_> {
     }
     fn meta_set(&self, name: &str, v: u64) -> Result<()> {
         self.l.put(META, &k(self.c).bytes(name.as_bytes()).done(), &v.to_be_bytes())
+    }
+
+    // ---------- @tag expiry (tags::Expiry) ----------
+    fn tkey(&self, t: &str) -> Vec<u8> {
+        k(self.c).bytes(t.as_bytes()).done()
+    }
+    /// Activity on `tag` at `time`: its release moves to `time` + idle + grace.
+    fn tag_touch(&self, x: &tags::Expiry, tag: &str, time: u64) -> Result<()> {
+        if let Some(old) = self.jget(TAG_SEEN, &self.tkey(tag))? {
+            let t = old["t"].as_u64().unwrap_or(0);
+            if t >= time {
+                return Ok(());
+            }
+            self.l.del(TAG_DUE, &k(self.c).u64(x.due(t)).bytes(tag.as_bytes()).done())?;
+        }
+        self.jput(TAG_SEEN, &self.tkey(tag), &json!({"t": time, "h": self.h}))?;
+        self.l.put(TAG_DUE, &k(self.c).u64(x.due(time)).bytes(tag.as_bytes()).done(), b"")
+    }
+    /// A tag gone from its owner (moved to another tag of theirs): its clock goes too.
+    fn tag_forget(&self, x: &tags::Expiry, tag: &str) -> Result<()> {
+        if let Some(old) = self.jget(TAG_SEEN, &self.tkey(tag))? {
+            self.l.del(TAG_DUE, &k(self.c).u64(x.due(old["t"].as_u64().unwrap_or(0))).bytes(tag.as_bytes()).done())?;
+            self.l.del(TAG_SEEN, &self.tkey(tag))?;
+        }
+        Ok(())
+    }
+    /// Release every tag whose time is up by this block's `time` (each second since the last block's, once).
+    fn tag_sweep(&self, x: &tags::Expiry, time: u64) -> Result<()> {
+        let from = match self.meta_u64("tag_swept")? {
+            Some(t) => t + 1,
+            None => time,
+        };
+        let mut due: Vec<String> = Vec::new();
+        if time >= from && time - from > 1_000_000 {
+            // A long gap between blocks: one walk of the whole table instead of a look-up a second.
+            for (key, _) in self.l.scan(TAG_DUE, &k(self.c).done())? {
+                let at = be_u64(&key, 2);
+                if at <= time {
+                    due.push(String::from_utf8_lossy(&key[10..]).into_owned());
+                }
+            }
+        } else {
+            for sec in from..=time {
+                for (key, _) in self.l.scan(TAG_DUE, &k(self.c).u64(sec).done())? {
+                    due.push(String::from_utf8_lossy(&key[10..]).into_owned());
+                }
+            }
+        }
+        for tag in due {
+            self.tag_release(x, &tag, time)?;
+        }
+        self.meta_set("tag_swept", time.max(from.saturating_sub(1)))
+    }
+    fn tag_release(&self, x: &tags::Expiry, tag: &str, time: u64) -> Result<()> {
+        self.tag_forget(x, tag)?;
+        let mut store = EngineTags { e: self };
+        let Some(row) = store.tag(tag)? else { return Ok(()) };
+        store.remove(tag, &row.address)?;
+        self.jput(TAG_REL, &self.tkey(tag), &json!({"h": self.h, "t": time, "a": row.address}))?;
+        self.l.put(TAG_WIN, &k(self.c).u32(self.h + x.reveal_blocks).bytes(tag.as_bytes()).done(), b"")?;
+        self.row(format!("tag_released|{tag}|{}|{}\n", row.address, self.h));
+        Ok(())
+    }
+    /// Reveal windows ending at this block: the earliest committed claim gets the tag.
+    fn tag_settle(&self, x: &tags::Expiry, time: u64) -> Result<()> {
+        for (key, _) in self.l.scan(TAG_WIN, &k(self.c).u32(self.h).done())? {
+            self.l.del(TAG_WIN, &key)?;
+            let tag = String::from_utf8_lossy(&key[6..]).into_owned();
+            let Some(p) = self.jget(TAG_PEND, &self.tkey(&tag))? else { continue };
+            self.l.del(TAG_PEND, &self.tkey(&tag))?;
+            let sender = p["a"].as_str().unwrap_or("").to_string();
+            let mut store = EngineTags { e: self };
+            let old = store.tag_of(&sender)?;
+            let txid = p["txid"].as_str().unwrap_or("").to_string();
+            if tags::apply(&mut store, &tags::TagOp::Claim(tag.clone()), &sender, None, &txid, self.h, p["p"].as_u64().unwrap_or(0) as u32)?.is_ok() {
+                if let Some(o) = old.filter(|o| *o != tag) {
+                    self.tag_forget(x, &o)?;
+                }
+                self.tag_touch(x, &tag, time)?;
+                self.row(format!("tag_awarded|{tag}|{sender}|{txid}|{}\n", self.h));
+            }
+        }
+        Ok(())
+    }
+    /// The fee a transaction pays (its inputs less its outputs).
+    fn fee_of(&self, r: &Rtx) -> u64 {
+        let ins: u64 = r.prev.iter().map(|p| p.value).sum();
+        let outs: u64 = r.tx.outputs.iter().map(|o| o.value).sum();
+        ins.saturating_sub(outs)
+    }
+    fn tag_expiry_op(&self, x: &tags::Expiry, r: &Rtx, op: tags::ExpiryOp) -> Result<Inv> {
+        match op {
+            tags::ExpiryOp::Commit(c) => {
+                let key = k(self.c).bytes(&c).done();
+                if self.l.get(TAG_COMMIT, &key)?.is_some() {
+                    return Ok(Err("that commitment is already on the chain".into()));
+                }
+                self.jput(TAG_COMMIT, &key, &json!({"h": self.h, "p": r.pos}))?;
+                Ok(Ok(()))
+            }
+            tags::ExpiryOp::CheckIn(t) => {
+                match (EngineTags { e: self }).tag(&t)? {
+                    Some(row) if row.address == r.atx.sender => {}
+                    _ => return Ok(Err("a check-in is for your own tag".into())),
+                }
+                if self.fee_of(r) < x.checkin_fee {
+                    return Ok(Err(format!("a check-in pays at least {} in fees", x.checkin_fee)));
+                }
+                self.tag_touch(x, &t, self.time())?;
+                Ok(Ok(()))
+            }
+        }
+    }
+    /// A claim of a released tag inside its reveal window: valid only with a commitment from an earlier block, and
+    /// kept if its commitment is the earliest so far (the window's end awards it).
+    fn tag_reveal(&self, r: &Rtx, tag: &str) -> Result<Option<Inv>> {
+        let Some(rel) = self.jget(TAG_REL, &self.tkey(tag))? else { return Ok(None) };
+        let x = tags::expiry(self.c).expect("expiry on");
+        let rel_h = rel["h"].as_u64().unwrap_or(0) as u32;
+        if self.h >= rel_h + x.reveal_blocks {
+            return Ok(None); // the window is over: first claim wins
+        }
+        let Some(salt) = tags::claim_salt(&r.atx.payload) else {
+            return Ok(Some(Err(format!("@{tag} was released at block {rel_h}: until block {} a claim needs a commitment made ahead", rel_h + x.reveal_blocks))));
+        };
+        let Some(c) = self.jget(TAG_COMMIT, &k(self.c).bytes(&tags::commitment(tag, &r.atx.sender, &salt)).done())? else {
+            return Ok(Some(Err("no commitment on the chain for this claim".into())));
+        };
+        let (ch, cp) = (c["h"].as_u64().unwrap_or(0), c["p"].as_u64().unwrap_or(0));
+        if ch >= self.h as u64 {
+            return Ok(Some(Err("the commitment must be in an earlier block than the claim".into())));
+        }
+        if let Some(best) = self.jget(TAG_PEND, &self.tkey(tag))? {
+            if (best["ch"].as_u64().unwrap_or(0), best["cp"].as_u64().unwrap_or(0)) <= (ch, cp) {
+                return Ok(Some(Err("an earlier commitment claims it".into())));
+            }
+        }
+        self.jput(TAG_PEND, &self.tkey(tag), &json!({"ch": ch, "cp": cp, "a": r.atx.sender, "txid": r.txid, "h": self.h, "p": r.pos}))?;
+        Ok(Some(Ok(())))
+    }
+    fn time(&self) -> u64 {
+        self.time
+    }
+    /// Any arcade record from a tag's owner is activity that keeps the tag.
+    fn activity(&self, x: Option<&tags::Expiry>, r: &Rtx) -> Result<()> {
+        let Some(x) = x else { return Ok(()) };
+        if let Some(t) = (EngineTags { e: self }).tag_of(&r.atx.sender)? {
+            self.tag_touch(x, &t, self.time)?;
+        }
+        Ok(())
+    }
+
+    fn repo(&self, r: &Rtx) -> Result<Inv> {
+        let op = match crate::repos::parse(&r.atx.payload) {
+            Some(Ok(op)) => op,
+            Some(Err(e)) => return Ok(Err(format!("malformed repository record: {e}"))),
+            None => return Ok(Err("malformed repository record".into())),
+        };
+        let me = (EngineTags { e: self }).tag_of(&r.atx.sender)?;
+        let mut st = EngineRepos { e: self, r };
+        Ok(crate::repos::apply(&mut st, &op, me.as_deref())?.map_err(String::from))
     }
 
     // ---------- process ----------
@@ -660,10 +836,18 @@ impl Engine<'_, '_, '_> {
 
     // ---------- AnyData / INSC ----------
     fn any_data(&self, r: &Rtx, data: &[u8]) -> Result<Inv> {
+        // @tag repositories (§15 step 9), on chains with the ARCADE rules.
+        if data.len() >= 6 && &data[..4] == crate::repos::MARKER && tags::expiry(self.c).is_some() {
+            return self.repo(r);
+        }
         if !(data.len() >= 6 && &data[..4] == b"INSC") {
             return Ok(Ok(())); // a valid no-op (messaging, other AnyData)
         }
         if data[5] == 3 || data[5] == 4 {
+            return self.tag(r);
+        }
+        // Check-ins and commitments (tag expiry), on chains that turn it on only.
+        if (data[5] == tags::KIND_CHECKIN || data[5] == tags::KIND_COMMIT) && tags::expiry(self.c).is_some() {
             return self.tag(r);
         }
         if data[4] != 1 {
@@ -689,14 +873,41 @@ impl Engine<'_, '_, '_> {
         if d[4] != 1 {
             return Ok(Err(format!("malformed tag: tag version {} is not readable here", d[4])));
         }
+        if let Some(x) = tags::expiry(self.c) {
+            match tags::parse_expiry_op(p) {
+                Some(Ok(op)) => return self.tag_expiry_op(&x, r, op),
+                Some(Err(e)) => return Ok(Err(format!("that tag record is not valid: {e}"))),
+                None => {}
+            }
+        }
         let op = match tags::parse(p) {
             Some(Ok(op)) => op,
             Some(Err(e)) => return Ok(Err(format!("that tag cannot be claimed: {e}"))),
             None => return Ok(Err("malformed tag: unknown tag kind".into())),
         };
+        let x = tags::expiry(self.c);
+        if let (Some(_), tags::TagOp::Claim(t)) = (&x, &op) {
+            if let Some(res) = self.tag_reveal(r, t)? {
+                return Ok(res);
+            }
+        }
         let mut store = EngineTags { e: self };
-        tags::apply(&mut store, &op, &r.atx.sender, r.atx.reference.as_deref(), &r.txid, self.h, r.pos)
-            .map(|x| x.map_err(String::from))
+        let had = store.tag_of(&r.atx.sender)?;
+        let res = tags::apply(&mut store, &op, &r.atx.sender, r.atx.reference.as_deref(), &r.txid, self.h, r.pos)?;
+        if let (Some(x), Ok(())) = (&x, &res) {
+            // A claim starts the tag's clock (and stops that of a tag it moved from); a transfer restarts it.
+            let t = match &op {
+                tags::TagOp::Claim(t) | tags::TagOp::Transfer(t) => t,
+            };
+            if let Some(o) = had.filter(|o| o != t) {
+                if matches!(op, tags::TagOp::Claim(_)) {
+                    self.tag_forget(x, &o)?;
+                }
+            }
+            self.tag_forget(x, t)?;
+            self.tag_touch(x, t, self.time())?;
+        }
+        Ok(res.map_err(String::from))
     }
 
     fn chunk(&self, r: &Rtx, d: &[u8]) -> Result<Inv> {
@@ -1237,6 +1448,68 @@ impl TagStore for EngineTags<'_, '_, '_, '_> {
     }
 }
 
+struct EngineRepos<'e, 'a, 'b, 'db, 't> {
+    e: &'e Engine<'a, 'b, 'db>,
+    r: &'e Rtx<'t>,
+}
+
+impl crate::repos::RepoStore for EngineRepos<'_, '_, '_, '_, '_> {
+    type E = StoreError;
+    fn next_number(&mut self, f: &str) -> Result<u32> {
+        let key = k(self.e.c).bytes(b"repo_items:").bytes(f.as_bytes()).done();
+        let n = self.e.l.get(META, &key)?.map(|v| be_u64(&v, 0)).unwrap_or(0) + 1;
+        self.e.l.put(META, &key, &n.to_be_bytes())?;
+        Ok(n as u32)
+    }
+    fn item(&self, f: &str, n: u32) -> Result<Option<crate::repos::Item>> {
+        Ok(self.e.jget(REPO_ITEM, &k(self.e.c).bytes(f.as_bytes()).u8(0).u32(n).done())?.and_then(|v| {
+            Some(crate::repos::Item {
+                kind: v["k"].as_u64()? as u8,
+                by: v["by"].as_str()?.into(),
+                state: v["s"].as_u64()? as u8,
+                body: hex::decode(v["b"].as_str()?).ok()?.try_into().ok()?,
+            })
+        }))
+    }
+    fn set_item(&mut self, f: &str, n: u32, it: &crate::repos::Item) -> Result<()> {
+        let key = k(self.e.c).bytes(f.as_bytes()).u8(0).u32(n).done();
+        let (h, txid) = match self.e.jget(REPO_ITEM, &key)? {
+            Some(old) => (old["h"].clone(), old["txid"].clone()),
+            None => (json!(self.e.h), json!(self.r.txid)),
+        };
+        self.e.jput(REPO_ITEM, &key, &json!({"k": it.kind, "by": it.by, "s": it.state, "b": hex::encode(it.body), "h": h, "txid": txid}))
+    }
+    fn event(&mut self, f: &str, n: u32, by: &str, what: &str, verdict: u8, hash: &[u8; 32]) -> Result<()> {
+        let key = k(self.e.c).bytes(f.as_bytes()).u8(0).u32(n).u32(self.e.h).u32(self.r.pos).done();
+        self.e.jput(REPO_EVENT, &key, &json!({"by": by, "w": what, "v": verdict, "b": hex::encode(hash), "txid": self.r.txid}))
+    }
+    fn repo(&self, f: &str) -> Result<Option<crate::repos::Repo>> {
+        Ok(self.e.jget(REPO, &k(self.e.c).bytes(f.as_bytes()).done())?.and_then(|v| {
+            Some(crate::repos::Repo {
+                manifest: hex::decode(v["m"].as_str()?).ok()?.try_into().ok()?,
+                fork: v["fork"].as_str().map(String::from),
+                pushes: v["n"].as_u64().unwrap_or(0),
+            })
+        }))
+    }
+    fn set_repo(&mut self, f: &str, r: &crate::repos::Repo, by: &str) -> Result<()> {
+        let m = hex::encode(r.manifest);
+        self.e.jput(REPO, &k(self.e.c).bytes(f.as_bytes()).done(), &json!({"m": m, "fork": r.fork, "n": r.pushes, "h": self.e.h, "txid": self.r.txid, "by": by}))?;
+        self.e.jput(REPO_LOG, &k(self.e.c).bytes(f.as_bytes()).u8(0).u32(self.e.h).u32(self.r.pos).done(), &json!({"m": m, "by": by, "txid": self.r.txid}))
+    }
+    fn is_maintainer(&self, f: &str, t: &str) -> Result<bool> {
+        Ok(self.e.l.get(REPO_MAINT, &k(self.e.c).bytes(f.as_bytes()).u8(0).bytes(t.as_bytes()).done())?.is_some())
+    }
+    fn set_maintainer(&mut self, f: &str, t: &str, on: bool) -> Result<()> {
+        let key = k(self.e.c).bytes(f.as_bytes()).u8(0).bytes(t.as_bytes()).done();
+        if on {
+            self.e.l.put(REPO_MAINT, &key, b"")
+        } else {
+            self.e.l.del(REPO_MAINT, &key)
+        }
+    }
+}
+
 /// The ledger indexer: tags, tokens, MetaDEx, INSC — the arcade ledger, block by block.
 pub struct LedgerIndexer;
 
@@ -1255,7 +1528,7 @@ impl Indexer for LedgerIndexer {
         vec![(arcade_chaindb::journal::LEDGER, self.tables().iter().map(|t| t.name).collect())]
     }
     fn tables(&self) -> Vec<TableDef> {
-        [ROWS, PROPERTY, PROPERTY_BY_BLOCK, BALANCE, BOOK, TAKE, INSCRIPTION, CHUNK, PIECE, OFFER, ASK, COLLECTION, META, BY_NUMBER, TAG, TAG_BY_ADDRESS]
+        [ROWS, PROPERTY, PROPERTY_BY_BLOCK, BALANCE, BOOK, TAKE, INSCRIPTION, CHUNK, PIECE, OFFER, ASK, COLLECTION, META, BY_NUMBER, TAG, TAG_BY_ADDRESS, TAG_SEEN, TAG_DUE, TAG_REL, TAG_COMMIT, TAG_PEND, TAG_WIN, REPO, REPO_MAINT, REPO_LOG, REPO_ITEM, REPO_EVENT]
             .iter()
             .map(|t| TableDef::plain(t))
             .collect()
@@ -1276,7 +1549,14 @@ impl Indexer for LedgerIndexer {
             g: gates(p),
             rows: RefCell::new(Vec::new()),
             emptied: RefCell::new(HashMap::new()),
+            time: ctx.block.header.time as u64,
         };
+        // Tag expiry, on chains that turn it on: releases due by this block's time, then reveal windows ending here.
+        let expiry = tags::expiry(p.chain_no);
+        if let Some(x) = &expiry {
+            e.tag_sweep(x, e.time)?;
+            e.tag_settle(x, e.time)?;
+        }
         let marker = class_b_marker(p);
         let cancels_last = on(e.g.cancels_last_from, ctx.height);
         let prev: Vec<Vec<Prevout>> = ctx.prevouts.iter().map(|v| v.iter().map(|x| Prevout { value: x.value, script: x.script.clone() }).collect()).collect();
@@ -1300,9 +1580,11 @@ impl Indexer for LedgerIndexer {
                 continue;
             }
             e.process(&r, &d)?;
+            e.activity(expiry.as_ref(), &r)?;
         }
         for (r, d) in later {
             e.process(&r, &d)?;
+            e.activity(expiry.as_ref(), &r)?;
         }
         let rows = e.rows.into_inner();
         if !rows.is_empty() {

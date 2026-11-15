@@ -24,6 +24,7 @@ mod arcserve;
 mod arcseg;
 mod arcblob;
 mod arcgit;
+mod arcledger;
 mod arccode;
 mod arcgenesis;
 mod arckeep;

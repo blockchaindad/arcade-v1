@@ -473,12 +473,32 @@ pub fn build_arcade(
     dust: u64,
     time: u32,
 ) -> Result<Tx, BuildError> {
+    build_arcade_with(p, payload, extra, key, coins, fee_per_kb, dust, time, 80)
+}
+
+/// Most bytes of an OP_RETURN record ("arcd" + payload) on the ARCADE chain (docs/ARCADECHAIN.md §15 step 7): one
+/// output however long the record, where a coin chain's 80 bytes send anything longer as Class B.
+pub const ARCADE_CLASS_C_MAX: usize = 4 + 1_024;
+
+/// As [`build_arcade`], with Class C used up to `class_c_max` bytes of OP_RETURN data.
+#[allow(clippy::too_many_arguments)]
+pub fn build_arcade_with(
+    p: &ChainParams,
+    payload: &[u8],
+    extra: Vec<TxOutSpec>,
+    key: &SecretKey,
+    coins: &[Utxo],
+    fee_per_kb: u64,
+    dust: u64,
+    time: u32,
+    class_c_max: usize,
+) -> Result<Tx, BuildError> {
     let pk = PublicKey::from_secret_key(SECP256K1, key);
     let h = arcade_ledger::address::hash160(&pk.serialize());
     let change_script = arcade_ledger::address::p2pkh_script(&h);
     let sender = arcade_ledger::address::base58check(p.p2pkh_version, &h);
     let mut outs: Vec<TxOutSpec> = Vec::new();
-    if MARKER.len() + payload.len() <= 80 {
+    if MARKER.len() + payload.len() <= class_c_max {
         let mut data = MARKER.to_vec();
         data.extend_from_slice(payload);
         outs.push(TxOutSpec { value: 0, script: op_return(&data) });

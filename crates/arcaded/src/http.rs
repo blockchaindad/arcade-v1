@@ -690,7 +690,7 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
     // A git repository from ARCADE blobs (§15 step 6), in git's "dumb" HTTP protocol, so any git client clones it:
     // /git/<manifest blob>/{HEAD, info/refs, objects/info/packs, objects/pack/pack-<name>.pack|.idx}.
     if path.starts_with("/git/") {
-        let (status, body) = crate::arcgit::serve(&path["/git/".len()..]);
+        let (status, body) = crate::arcgit::serve(node, &path["/git/".len()..]);
         let ctype = if status.starts_with("200") { "application/octet-stream" } else { "text/plain" };
         return respond(&mut s, status, ctype, &[("Cache-Control", "no-store".into())], if r.method == "HEAD" { &[] } else { &body });
     }

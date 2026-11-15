@@ -148,6 +148,9 @@ pub struct Settings {
     pub blob_window: u64,
     /// Seconds a Temporary blob is kept (local test chains: `blob_temporary`; 90 days).
     pub blob_temporary: u64,
+    /// @tag expiry on this chain's ledger (§15 step 8; local test chains: `tag_idle`, `tag_grace`, `tag_reveal_blocks`,
+    /// `tag_warn`).
+    pub tag_expiry: arcade_ledger::tags::Expiry,
 }
 
 /// A final genesis list as final.json writes it (crate::arcgenesis): entries as item bytes, owners with replicas.
@@ -261,7 +264,16 @@ impl Settings {
         let secs = |k: &str, d: u64| v[k].as_u64().filter(|x| *x >= 1).unwrap_or(d);
         let blob_window = secs("blob_window", params::BLOB_WINDOW);
         let blob_temporary = secs("blob_temporary", 90 * 24 * 3600);
-        Ok(Settings { genesis, holders, steps_per_second, segment_bytes, block_seconds, clock, audit_period, rules, list, blob_window, blob_temporary })
+        // 12 months of no activity, then 30 days' grace; a day of blocks to reveal committed claims; a check-in pays
+        // 0.1 ARCADE; sends warn for 90 days after a released tag changes hands (§15.1).
+        let tag_expiry = arcade_ledger::tags::Expiry {
+            idle: secs("tag_idle", 365 * 86_400),
+            grace: secs("tag_grace", 30 * 86_400),
+            reveal_blocks: secs("tag_reveal_blocks", 86_400 / params::BLOCK_SECONDS) as u32,
+            checkin_fee: params::COIN / 10,
+            warn: secs("tag_warn", 90 * 86_400),
+        };
+        Ok(Settings { genesis, holders, steps_per_second, segment_bytes, block_seconds, clock, audit_period, rules, list, blob_window, blob_temporary, tag_expiry })
     }
 }
 
@@ -930,7 +942,35 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
             while node.chain.remove_chain_batch(p.chain_no, 50_000).map_err(db_err)? > 0 {}
         }
     }
+    // The ledger on ARCADE (§15 step 7): tags, profiles and every arcade record, indexed in the same commit as each block
+    // the store takes; an arcade that stored blocks before it had them walks those once, below.
+    arcade_ledger::tags::set_expiry(p.chain_no, Some(s.tag_expiry));
+    let ledger: [Arc<dyn arcade_chaindb::Indexer>; 2] = [Arc::new(arcade_ledger::engine::LedgerIndexer), Arc::new(arcade_ledger::index::ProfileIndexer)];
+    let ledger_names: Vec<&'static str> = ledger.iter().map(|ix| ix.name()).collect();
+    for ix in ledger {
+        node.chain.add_indexer(p.chain_no, ix).map_err(db_err)?;
+    }
     reconcile(&node.chain, p, &chain)?;
+    {
+        let n = node.clone();
+        std::thread::Builder::new()
+            .name("arc ledger walk".into())
+            .spawn(move || {
+                for name in ledger_names {
+                    loop {
+                        match n.chain.backfill(p, name, 500) {
+                            Ok(0) => break,
+                            Ok(_) => std::thread::sleep(Duration::from_millis(30)),
+                            Err(e) => {
+                                eprintln!("arc: the {name} index: {e}");
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+            .map_err(|e| e.to_string())?;
+    }
     if old_log.exists() {
         // The store now holds every block of the branch whole: the old copy goes.
         let stored_whole = (1..=chain.tip().height).all(|h| {
@@ -1645,6 +1685,16 @@ pub fn blob(req: &Value) -> Result<Value, String> {
     // Fetched from the arcades this one is linked to when it isn't here (kept in the viewer cache).
     let bytes = crate::arcblob::view(&id).ok_or("no such blob here, nor at the arcades linked to this one")?;
     Ok(json!({"id": hex::encode(id), "bytes": bytes.len(), "on_chain": holds_blob(&id), "hex": hex::encode(&bytes)}))
+}
+
+/// Whether a coin is unspent on the running ARCADE chain's best branch.
+pub fn unspent(op: &OutPoint) -> bool {
+    svc().is_some_and(|s| s.st.lock().unwrap().chain.coins().contains_key(op))
+}
+
+/// Whether transaction `txid` waits in the ARCADE chain's pool.
+pub fn pooled(txid: &Hash256) -> bool {
+    svc().is_some_and(|s| s.st.lock().unwrap().pool.iter().any(|w| w.tx.txid == *txid))
 }
 
 pub fn send_raw(raw: &[u8]) -> Result<(Hash256, u64), String> {

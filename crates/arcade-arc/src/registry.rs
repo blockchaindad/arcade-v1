@@ -921,7 +921,10 @@ impl Registry {
         let (anchor_id, _) = self.block_at(c.anchor).ok_or(no("registration: no such anchor block"))?;
         let mut segs = BTreeSet::new();
         for (seg, _) in &c.replicas {
-            self.catalog.get(seg).ok_or(no("registration: a segment isn't listed"))?;
+            let l = self.catalog.get(seg).ok_or(no("registration: a segment isn't listed"))?;
+            if !l.settled(height) {
+                return Err(no("registration: the segment is still in its challenge window"));
+            }
             if !segs.insert(*seg) {
                 return Err(no("registration: a segment twice in one batch"));
             }
@@ -2141,6 +2144,37 @@ mod tests {
         r.items(&[item()], 3).unwrap();
         assert!(r.catalog.get(&seg).is_none() && r.catalog.was_removed(&seg));
         assert!(!r.registered(&id) && r.pay_weight(&k2) == 0);
+    }
+
+    #[test]
+    fn a_segment_listed_by_a_tenth_waits_out_its_window_and_a_fraud_proof_takes_it_out_inside_it() {
+        use crate::segment::{row_at, leaves_of, table, Rooter, Run};
+        const NET3: Net = Net { rules: &[(1, 0), (2, 1), (3, 2)], ..NET };
+        let ((s1, k1), (_, k2)) = (key(1), key(2));
+        // Arcade 1 holds a quarter of the weight: from rules version 3 its offer alone lists a segment of blocks.
+        let mut r = Registry::new(&NET3, &[(k1, 1 << 30, pay(1)), (k2, 3 << 30, pay(2))], 1).unwrap();
+        let blocks: Vec<Vec<u8>> = (0..RANGE).map(|h| { let mut b = vec![7u8; 90]; b[..8].copy_from_slice(&h.to_le_bytes()); b }).collect();
+        let mut data: Vec<u8> = blocks.concat();
+        let block_bytes = data.len() as u64;
+        data.extend(table(&blocks.iter().map(|b| b.len() as u64).collect::<Vec<_>>()));
+        let mut root = Rooter::new();
+        root.push(&data);
+        let (root, bytes) = root.finish().unwrap();
+        let mut e = CatalogEntry { chain: "peptest".into(), family: 0, first: 0, last: RANGE - 1, bytes, manifest: [0; 32], root, poster: k1, sig: [0; 64] };
+        e.sig = block::sign(&s1, &e.message(&NET3));
+        r.items(&[Item::CatalogEntry(e.clone())], 5).unwrap();
+        let seg = e.segment(&NET3);
+        let l = r.catalog.get(&seg).expect("listed by a quarter of the weight");
+        assert!(l.light && !l.settled(5 + catalog::CHALLENGE_WINDOW - 1) && l.settled(5 + catalog::CHALLENGE_WINDOW));
+        // Inside the window the source chain says height 77's header is another: the proof takes the segment out.
+        let h = 77u64;
+        let run = |at: u64, len: u64| { let (first, n) = leaves_of(at, len); Run::of(&data, first, n).unwrap() };
+        let row = run(row_at(block_bytes, 0, h), 8);
+        let start = row.row(row_at(block_bytes, 0, h)).unwrap();
+        let proof = BadHeader { segment: seg, height: h, row, header: run(start, 80) };
+        r.set_sources(std::sync::Arc::new(Src { chain: "peptest", tip: h + 500, at: h, hash: Hash256([1; 32]) }));
+        r.items(&[Item::BadHeader(Box::new(proof))], 5 + catalog::CHALLENGE_WINDOW / 2).unwrap();
+        assert!(r.catalog.get(&seg).is_none() && r.catalog.was_removed(&seg));
     }
 
     /// A plain legacy transaction (one input, one output): different for each `n`.
