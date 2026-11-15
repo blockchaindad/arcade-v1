@@ -144,6 +144,10 @@ pub struct Settings {
     /// The final genesis list block 0 starts from (§10, §14.24: `"list"`, as the bulletin's final.json writes it);
     /// its hash must be `genesis.final_list`.
     pub list: Option<arcade_arc::genesis::FinalList>,
+    /// Seconds after which an old block may travel without its blobs' bytes (local test chains: `blob_window`).
+    pub blob_window: u64,
+    /// Seconds a Temporary blob is kept (local test chains: `blob_temporary`; 90 days).
+    pub blob_temporary: u64,
 }
 
 /// A final genesis list as final.json writes it (crate::arcgenesis): entries as item bytes, owners with replicas.
@@ -254,7 +258,10 @@ impl Settings {
         if holders.is_empty() && list.is_none() {
             return Err("settings: no holders and no genesis list: nobody could write block 1".into());
         }
-        Ok(Settings { genesis, holders, steps_per_second, segment_bytes, block_seconds, clock, audit_period, rules, list })
+        let secs = |k: &str, d: u64| v[k].as_u64().filter(|x| *x >= 1).unwrap_or(d);
+        let blob_window = secs("blob_window", params::BLOB_WINDOW);
+        let blob_temporary = secs("blob_temporary", 90 * 24 * 3600);
+        Ok(Settings { genesis, holders, steps_per_second, segment_bytes, block_seconds, clock, audit_period, rules, list, blob_window, blob_temporary })
     }
 }
 
@@ -442,7 +449,7 @@ fn take(node: &Node, svc: &Svc, block: Block) -> Result<Accepted, ChainError> {
     }
     // Its blobs' bytes (checked by the chain) into the store, on any branch: a block taken on a side branch may yet be
     // joined, and handed on.
-    crate::arcblob::keep_block(&block);
+    crate::arcblob::keep_block(&svc.net, &block);
     if let Accepted::Tip { undone, .. } = &got {
         crate::arcseg::forget(&block.items);
         new_tip(node, svc, &mut st, undone);
@@ -801,7 +808,7 @@ pub fn define(node: &Arc<Node>, settings: &std::path::Path) -> Result<(), String
 /// [`define`] from the settings' text (the built-in testnet's, or a file's).
 pub fn define_text(node: &Arc<Node>, text: &str) -> Result<(), String> {
     let s = Settings::parse(&params::TESTNET, text)?;
-    let net = Net { block_seconds: s.block_seconds, audit_period: s.audit_period, rules: s.rules.unwrap_or(params::TESTNET.rules), ..params::TESTNET };
+    let net = Net { block_seconds: s.block_seconds, audit_period: s.audit_period, rules: s.rules.unwrap_or(params::TESTNET.rules), blob_window: s.blob_window, ..params::TESTNET };
     registry_of(&net, &s)?;
     let genesis = s.genesis.id(&net);
     let def = Def { net, params: store::chain_params(&net, &genesis), genesis, settings: s };
@@ -875,6 +882,11 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
     let dir = node.home.join("arc").join(net.key);
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     crate::arcblob::init(dir.join("blobs"));
+    {
+        // A dropped plain copy is read back from this arcade's sealed replica of the blob family.
+        let (n, net2) = (Arc::downgrade(node), net);
+        crate::arcblob::set_sealed_reader(Box::new(move |h| { let node = n.upgrade()?; crate::arcseal::sealed_unit(&node, &net2, net2.key, arcade_arc::segment::FAMILY_BLOBS, h) }));
+    }
     let t0 = Instant::now();
     let mut refused = 0;
     // The chain's one copy on disk is the store's (docs/ARCADECHAIN.md §14.17): its best branch
@@ -998,7 +1010,23 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
     // (its ticket is None while it has none).
     {
         let n = node.clone();
+        let svc = svc.clone();
         std::thread::Builder::new().name("arc writer".into()).spawn(move || run_writer(n, svc)).map_err(|e| e.to_string())?;
+    }
+    // The blob pruner (§15 step 3): plain copies the classes say may go, unless this arcade is an archive.
+    {
+        let (n, svc2, temporary) = (node.clone(), svc.clone(), s.blob_temporary);
+        std::thread::Builder::new()
+            .name("arc blob pruner".into())
+            .spawn(move || loop {
+                let every = (svc2.net.blob_window / 4).clamp(5, 300);
+                std::thread::sleep(Duration::from_secs(every));
+                if svc2.stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                prune_blobs(&n, &svc2, temporary);
+            })
+            .map_err(|e| e.to_string())?;
     }
     // The time keeper (crate::arckeep): one thread for the arcade's life, idle unless turned on.
     static KEEPER: std::sync::Once = std::sync::Once::new();
@@ -1655,7 +1683,12 @@ pub fn blobs_unit_at(h: u64) -> Option<Vec<u8>> {
         if h == 0 {
             Vec::new()
         } else {
-            st.chain.blob_ids(&st.chain.id_at(h)?)
+            // Temporary blobs aren't kept by the storage network (§15 step 3): not in the family.
+            let id = st.chain.id_at(h)?;
+            let b = st.chain.block(&id)?;
+            let temporary: std::collections::HashSet<arcade_arc::merkle::Hash> = b.txs.iter().flat_map(arcade_arc::blob::records)
+                .filter(|r| r.class == arcade_arc::blob::Class::Temporary).map(|r| r.id(&svc.net)).collect();
+            b.blob_ids.iter().filter(|i| !temporary.contains(*i)).copied().collect()
         }
     };
     let mut out = Vec::new();
@@ -1666,6 +1699,71 @@ pub fn blobs_unit_at(h: u64) -> Option<Vec<u8>> {
         out.extend_from_slice(&b);
     }
     Some(out)
+}
+
+/// Replicas the network holds of the blob-family segment covering ARCADE height `h` (0 while none is listed), and
+/// whether this arcade holds one itself.
+fn blob_copies(node: &Node, svc: &Svc, h: u64) -> (u64, bool) {
+    use arcade_arc::segment::FAMILY_BLOBS;
+    let here = crate::arcseal::replicas(node, &svc.net).iter().any(|r| r.chain == svc.net.key && r.family == FAMILY_BLOBS && r.first <= h && h <= r.last);
+    let st = svc.st.lock().unwrap();
+    let reg = st.chain.storage();
+    let copies = reg
+        .catalog()
+        .spans(svc.net.key, FAMILY_BLOBS)
+        .filter(|(first, last, _)| *first <= h && h <= *last)
+        .find_map(|(_, _, listed)| listed.map(|l| reg.holders_of(&l.id)))
+        .unwrap_or(0);
+    (copies, here)
+}
+
+/// Whether this arcade keeps every blob's plain copy (`arc.archive`).
+pub fn archive(node: &Node) -> bool {
+    node.app.store.read(|r| r.get(arcade_app::META, b"arc_archive")).ok().flatten().is_some_and(|v| v == b"1")
+}
+
+/// One round of the blob classes (§15.1): a Temporary blob goes `temporary` seconds after its block; a Permanent or
+/// Release blob's plain copy goes once its block is older than the window and the storage network holds it (5
+/// replicas, or one here: reads unseal it), but the newest 5 of each release line stay plain.
+fn prune_blobs(node: &Node, svc: &Svc, temporary: u64) {
+    if archive(node) {
+        return;
+    }
+    use arcade_arc::blob::Class;
+    let now = arcade_app::now();
+    let known = crate::arcblob::known();
+    let mut newest: HashMap<String, Vec<(u64, arcade_arc::merkle::Hash)>> = HashMap::new();
+    for (id, m) in &known {
+        if m.class == Class::Release as u8 {
+            newest.entry(m.line.clone()).or_default().push((m.height, *id));
+        }
+    }
+    let mut keep_plain: HashSet<arcade_arc::merkle::Hash> = HashSet::new();
+    for list in newest.values_mut() {
+        list.sort_by(|a, b| b.0.cmp(&a.0));
+        keep_plain.extend(list.iter().take(5).map(|x| x.1));
+    }
+    let (mut dropped, mut freed) = (0, 0u64);
+    for (id, m) in known {
+        if m.class == Class::Temporary as u8 {
+            if m.time.saturating_add(temporary) <= now {
+                freed += crate::arcblob::forget(&id);
+                dropped += 1;
+            }
+            continue;
+        }
+        if keep_plain.contains(&id) || !crate::arcblob::plain_here(&id) || m.time.saturating_add(svc.net.blob_window) > now {
+            continue;
+        }
+        let (copies, here) = blob_copies(node, svc, m.height);
+        if here || copies >= 5 {
+            freed += crate::arcblob::drop_plain(&id);
+            dropped += 1;
+        }
+    }
+    if dropped > 0 {
+        eprintln!("arc: blob classes: {dropped} plain copies dropped ({freed} bytes)");
+    }
 }
 
 /// The ARCADE chain's height here.

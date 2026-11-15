@@ -622,6 +622,11 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
             return Ok(Accepted::Known);
         }
         block.check(&self.net)?;
+        // A blob may come without its bytes only in a block older than the window: when it was new, the network had
+        // them and checked them; full nodes may have dropped them since (§15 step 3).
+        if !block.blobs_whole() && block.header.time.saturating_add(self.net.blob_window) > now {
+            return Err(ChainError::Block(BlockError::Blobs("a recent block came without a blob's bytes")));
+        }
         let entry = self.enter(&block.header, now)?;
 
         let mut split = &self.entries[&entry.prev];
@@ -1431,6 +1436,10 @@ pub(crate) mod tests {
         ticket.seal_with_blobs(&NET3, &secret(who), next_time(c), all, Vec::new(), StandIn.prove(&ticket.challenge, ticket.steps), draw_seed, new)
     }
 
+    fn good_id_time(b: &Block) -> u64 {
+        b.header.time.max(LATE)
+    }
+
     #[test]
     fn a_blob_is_brought_once_paid_for_and_named_freely_after() {
         use crate::blob::{self, Class, Encoding, Record};
@@ -1470,8 +1479,15 @@ pub(crate) mod tests {
         assert_eq!(c.accept(short, LATE), Err(ChainError::Block(BlockError::Blobs("a transaction doesn't pay the blob fee for the blobs it brings"))));
         assert!(!c.holds_blob(&id));
 
-        // Brought and paid for: the chain holds it, keeps its id, and the block it keeps has no bytes.
+        // Sent without the blob's bytes (the form an old block travels in once its blobs are dropped): it reads back
+        // with its id, and while the block is recent it is refused.
         let good = block3(&c, who, vec![spend.clone()], &new);
+        let mut bare_bytes = good.clone();
+        bare_bytes.blobs = vec![Vec::new()];
+        let back = Block::decode(&bare_bytes.encode()).unwrap().with_blob_ids(&NET3);
+        assert_eq!((back.blob_ids.clone(), back.blobs_whole()), (vec![id], false));
+        assert_eq!(c.accept(back, good.header.time + 10), Err(ChainError::Block(BlockError::Blobs("a recent block came without a blob's bytes"))));
+        // Brought and paid for: the chain holds it, keeps its id, and the block it keeps has no bytes.
         assert_eq!(good.blob_ids, vec![id]);
         let good_id = good.id();
         assert!(matches!(c.accept(good, LATE), Ok(Accepted::Tip { .. })));
@@ -1491,6 +1507,14 @@ pub(crate) mod tests {
         let b2 = block3(&c, who, vec![again.clone()], &unheld);
         assert!(b2.blob_ids.is_empty(), "a blob the chain holds isn't brought again");
         assert!(matches!(c.accept(b2, LATE), Ok(Accepted::Tip { .. })));
+
+        // An arcade starting later takes the old block without the blob's bytes (they may be gone everywhere by then).
+        let mut late = chain3();
+        for h in 1..=c.tip().height {
+            let kept = c.block(&c.id_at(h).unwrap()).unwrap().clone();
+            assert!(late.accept(Block::decode(&kept.encode()).unwrap(), good_id_time(&kept) + NET3.blob_window + 1).is_ok(), "height {h}");
+        }
+        assert!(late.holds_blob(&id), "named by the old block, held without its bytes");
 
         // Taken back by a heavier branch without it: the chain no longer holds it.
         let mut other = chain3();

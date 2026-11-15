@@ -514,7 +514,7 @@ pub(crate) mod tests {
             Item::CatalogEntry(e)
         };
         assert_eq!(refused(&mut c, resigned(&|e| e.chain = "mine".into())), no("catalog entry: not a listed chain"));
-        assert_eq!(refused(&mut c, resigned(&|e| e.family = 10)), no("catalog entry: no such family"));
+        assert_eq!(refused(&mut c, resigned(&|e| e.family = 11)), no("catalog entry: no such family"));
         for change in [(|e| e.first = 1) as fn(&mut CatalogEntry), |e| e.last -= 1, |e| e.last = u64::MAX, |e| (e.first, e.last) = (RANGE, RANGE - 1)] {
             assert_eq!(refused(&mut c, resigned(&change)), no("catalog entry: not whole ranges"));
         }

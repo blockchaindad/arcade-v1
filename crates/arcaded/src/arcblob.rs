@@ -68,9 +68,88 @@ pub fn hold(net: &Net, bytes: Vec<u8>) -> Option<Hash> {
     })
 }
 
-/// A blob's bytes: from the store, else from those waiting.
+/// What the store knows of a blob it was brought (kept beside its bytes, and after they go): its class, type, the
+/// height and time of the block that brought it, and its release line (its type and its publisher's script).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Meta {
+    pub class: u8,
+    pub kind: String,
+    pub encoding: u8,
+    pub height: u64,
+    pub time: u64,
+    pub line: String,
+}
+
+fn meta_path(id: &Hash) -> PathBuf {
+    dir().join(format!("{}.meta", hex::encode(id)))
+}
+
+pub fn meta(id: &Hash) -> Option<Meta> {
+    serde_json::from_slice(&std::fs::read(meta_path(id)).ok()?).ok()
+}
+
+/// Reads a sealed blob-family unit at a height (this arcade's own replica), set when the chain starts.
+type SealedUnit = Box<dyn Fn(u64) -> Option<Vec<u8>> + Send + Sync>;
+static SEALED: std::sync::OnceLock<SealedUnit> = std::sync::OnceLock::new();
+
+pub fn set_sealed_reader(f: SealedUnit) {
+    let _ = SEALED.set(f);
+}
+
+/// A blob's bytes: from the store, else from those waiting, else unsealed from this arcade's replica of the blob
+/// family (its plain copy dropped, §15 step 3).
 pub fn get(id: &Hash) -> Option<Vec<u8>> {
-    std::fs::read(path(id)).ok().or_else(|| with(|w| w.blobs.get(id).cloned()))
+    if let Some(b) = std::fs::read(path(id)).ok().or_else(|| with(|w| w.blobs.get(id).cloned())) {
+        return Some(b);
+    }
+    let m = meta(id)?;
+    let unit = SEALED.get()?(m.height)?;
+    let net = crate::arcsvc::svc_net()?;
+    split_unit(&unit).into_iter().find(|b| arcade_arc::blob::id_of_bytes(&net, b) == *id)
+}
+
+/// A blob-family unit's blobs (segment::FAMILY_BLOBS: a varint count, then each varint length + bytes).
+pub fn split_unit(unit: &[u8]) -> Vec<Vec<u8>> {
+    let mut r = arcade_chain::Reader::new(unit);
+    let Ok(n) = r.len() else { return Vec::new() };
+    let mut out = Vec::new();
+    for _ in 0..n {
+        let Ok(k) = r.len() else { break };
+        let Ok(b) = r.bytes(k) else { break };
+        out.push(b.to_vec());
+    }
+    out
+}
+
+/// Whether a blob's plain copy is here (not only sealed).
+pub fn plain_here(id: &Hash) -> bool {
+    path(id).exists()
+}
+
+/// Drop a blob's plain copy (its meta stays, so a sealed copy here is still found).
+pub fn drop_plain(id: &Hash) -> u64 {
+    let n = std::fs::metadata(path(id)).map(|m| m.len()).unwrap_or(0);
+    let _ = std::fs::remove_file(path(id));
+    n
+}
+
+/// Forget a blob altogether (a Temporary one past its time).
+pub fn forget(id: &Hash) -> u64 {
+    let n = drop_plain(id);
+    let _ = std::fs::remove_file(meta_path(id));
+    n
+}
+
+/// Every blob the store knows (by its meta).
+pub fn known() -> Vec<(Hash, Meta)> {
+    let Ok(rd) = std::fs::read_dir(dir()) else { return Vec::new() };
+    rd.flatten()
+        .filter_map(|e| {
+            let n = e.file_name().to_string_lossy().to_string();
+            let id: Hash = hex::decode(n.strip_suffix(".meta")?).ok()?.try_into().ok()?;
+            Some((id, meta(&id)?))
+        })
+        .collect()
 }
 
 /// Whether the bytes of `id` are here (stored or waiting).
@@ -79,12 +158,31 @@ pub fn here(id: &Hash) -> bool {
 }
 
 /// A block was taken: its blobs into the store (checked by the chain already), out of those waiting.
-pub fn keep_block(block: &Block) {
-    if block.blobs.is_empty() {
+pub fn keep_block(net: &Net, block: &Block) {
+    if block.blob_ids.is_empty() {
         return;
     }
     let _ = std::fs::create_dir_all(dir());
+    // Each brought blob's record (the first naming it in the block) for its meta.
+    let mut recs: HashMap<Hash, (arcade_arc::blob::Record, Vec<u8>)> = HashMap::new();
+    for tx in block.txs.iter().skip(1) {
+        let publisher = tx.outputs.iter().find(|o| !arcade_arc::script::unspendable(&o.script_pubkey)).map(|o| o.script_pubkey.clone()).unwrap_or_default();
+        for r in arcade_arc::blob::records(tx) {
+            recs.entry(r.id(net)).or_insert((r, publisher.clone()));
+        }
+    }
+    for (id, (r, publisher)) in &recs {
+        if block.blob_ids.contains(id) && !meta_path(id).exists() {
+            use sha2::Digest;
+            let line = hex::encode(&sha2::Sha256::digest([r.kind.as_bytes(), b"\0", publisher].concat())[..16]);
+            let m = Meta { class: r.class as u8, kind: r.kind.clone(), encoding: r.encoding as u8, height: block.header.height, time: block.header.time, line };
+            let _ = std::fs::write(meta_path(id), serde_json::to_vec(&m).unwrap_or_default());
+        }
+    }
     for (id, bytes) in block.blob_ids.iter().zip(&block.blobs) {
+        if bytes.is_empty() {
+            continue; // an old block's blob that came without its bytes
+        }
         let p = path(id);
         if !p.exists() {
             let tmp = p.with_extension("in");
@@ -100,11 +198,21 @@ pub fn keep_block(block: &Block) {
     }
 }
 
-/// A block as the chain keeps it, with its blobs' bytes again, to hand on. None when one isn't here (pruned).
+/// A block as the chain keeps it, with its blobs' bytes again, to hand on. A blob gone from here goes without its bytes
+/// when the block is older than the window (the chain allows that); in a recent block it can't: None.
 pub fn attach(block: &Block) -> Option<Block> {
     let mut b = block.clone();
     if b.blobs.is_empty() && !b.blob_ids.is_empty() {
-        b.blobs = b.blob_ids.iter().map(get).collect::<Option<Vec<_>>>()?;
+        let old = crate::arcsvc::svc_net().is_some_and(|n| b.header.time.saturating_add(n.blob_window) <= arcade_app::now());
+        let mut blobs = Vec::with_capacity(b.blob_ids.len());
+        for id in &b.blob_ids {
+            match get(id) {
+                Some(x) => blobs.push(x),
+                None if old => blobs.push(Vec::new()),
+                None => return None,
+            }
+        }
+        b.blobs = blobs;
     }
     Some(b)
 }

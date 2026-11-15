@@ -600,6 +600,13 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         "arc.keeper" => crate::arckeep::api(node, req),
         "arc.genesis" => crate::arcgenesis::status(node),
         "arc.blob" => crate::arcsvc::blob(req),
+        // Keep every blob's plain copy (an archive node), or let the classes drop them (§15 step 3).
+        "arc.archive" => {
+            if let Some(on) = req["on"].as_bool() {
+                node.app.store.write(|w| w.put(arcade_app::META, b"arc_archive", if on { b"1" } else { b"0" })).map_err(|e| e.to_string())?;
+            }
+            Ok(serde_json::json!({"archive": crate::arcsvc::archive(node)}))
+        }
         // A blob from this arcade's wallet: `path` (a file here) or `hex`, its `type`, `class` (0 permanent, 1 release,
         // 2 temporary), `gzip`; `send` to put it in the pool (without: only what it would cost).
         "arc.blob_publish" => {

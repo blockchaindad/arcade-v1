@@ -991,10 +991,26 @@ impl Block {
             item.encode(&mut o);
         }
         if self.header.version >= 3 {
-            write_varint(&mut o, self.blobs.len() as u64);
-            for b in &self.blobs {
-                write_varint(&mut o, b.len() as u64);
-                o.extend_from_slice(b);
+            // Each blob as its length and bytes; a blob whose bytes aren't sent (an old block, §15 step 3) as the
+            // length 0 and its id.
+            write_varint(&mut o, self.blob_ids.len().max(self.blobs.len()) as u64);
+            for (i, id) in self.blob_ids.iter().enumerate() {
+                match self.blobs.get(i).filter(|b| !b.is_empty()) {
+                    Some(b) => {
+                        write_varint(&mut o, b.len() as u64);
+                        o.extend_from_slice(b);
+                    }
+                    None => {
+                        write_varint(&mut o, 0);
+                        o.extend_from_slice(id);
+                    }
+                }
+            }
+            if self.blob_ids.is_empty() {
+                for b in &self.blobs {
+                    write_varint(&mut o, b.len() as u64);
+                    o.extend_from_slice(b);
+                }
             }
         }
         o
@@ -1004,8 +1020,22 @@ impl Block {
     pub fn with_blob_ids(mut self, net: &Net) -> Block {
         if self.blob_ids.is_empty() && !self.blobs.is_empty() {
             self.blob_ids = self.blobs.iter().map(|b| crate::blob::id_of_bytes(net, b)).collect();
+        } else if self.blob_ids.len() == self.blobs.len() {
+            // Some not sent: their ids came with the block; the others' from their bytes.
+            // Only the placeholders decoding left for blobs that came with their bytes: an id a block declares is
+            // checked against its bytes, never replaced by them.
+            for (id, b) in self.blob_ids.iter_mut().zip(&self.blobs) {
+                if !b.is_empty() && *id == [0; 32] {
+                    *id = crate::blob::id_of_bytes(net, b);
+                }
+            }
         }
         self
+    }
+
+    /// Whether every blob's bytes are here (not an old block sent without some).
+    pub fn blobs_whole(&self) -> bool {
+        self.blob_ids.is_empty() || (self.blobs.len() == self.blob_ids.len() && self.blobs.iter().all(|b| !b.is_empty()))
     }
 
     /// The block as a chain keeps it: its blob ids but not their bytes.
@@ -1071,23 +1101,35 @@ impl Block {
         for _ in 0..m {
             items.push(Item::decode(r)?);
         }
-        let mut blobs = Vec::new();
+        let (mut blobs, mut blob_ids) = (Vec::new(), Vec::new());
         if header.version >= 3 {
             let k = r.len()?;
             let mut total = 0usize;
+            let mut absent = false;
             for _ in 0..k {
                 let n = r.len()?;
+                if n == 0 {
+                    // Not sent: its id (an old block's dropped blob).
+                    absent = true;
+                    blobs.push(Vec::new());
+                    blob_ids.push(r.array()?);
+                    continue;
+                }
                 total = total.saturating_add(n);
-                if n == 0 || n > crate::blob::MAX_BLOB_BYTES || total > crate::blob::MAX_BLOB_BYTES {
+                if n > crate::blob::MAX_BLOB_BYTES || total > crate::blob::MAX_BLOB_BYTES {
                     return Err(BlockError::TooBig("blobs"));
                 }
                 blobs.push(r.bytes(n)?.to_vec());
+                blob_ids.push([0; 32]);
+            }
+            if !absent {
+                blob_ids.clear();
             }
         }
         if !r.is_empty() {
             return Err(BlockError::Trailing("the block"));
         }
-        Ok(Block { header, txs, items, blob_ids: Vec::new(), blobs })
+        Ok(Block { header, txs, items, blob_ids, blobs })
     }
 
     /// Everything about a block (1 or later) that can be checked without the chain.
@@ -1123,6 +1165,10 @@ impl Block {
             let mut total = 0usize;
             for (id, bytes) in self.blob_ids.iter().zip(&self.blobs) {
                 total += bytes.len();
+                // A blob sent without its bytes (an old block) is the chain's to allow (Chain::accept).
+                if bytes.is_empty() {
+                    continue;
+                }
                 if crate::blob::id_of_bytes(net, bytes) != *id {
                     return Err(BlockError::Blobs("a blob's bytes aren't its id's"));
                 }
