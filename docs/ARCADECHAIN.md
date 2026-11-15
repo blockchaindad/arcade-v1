@@ -990,7 +990,12 @@ mainnet. Marked *(default)* where Martin has not said yes.
 | 12 | built: BadCoins; chain unit test passes (inflated entry taken out; right entry, forged leaf, foreign header refused); watcher posts it |
 | 13 | built for ord: BadOrd (one-piece inscription rows); chain unit test passes; watcher posts it; pieced inscriptions and the other journals rest on more than half the weight |
 | 14 | done: §13 written as settled |
-| 15–22 | todo |
+| 15 | built: "light" mode (headers only) and Bitcoin added by every ARCADE arcade; a fresh arcade reached Bitcoin's tip (975,881 headers) in about 3½ minutes |
+| 16 | built; gennet2 passes: the assembler leaves B's receipted commit out of its signed list, every arcade corrects it, the final list and the chain are as with an honest one |
+| 17 | built: Genesis::code; crates/arcaded/arcmain-genesis.json (timetable, the GX10 assembling); gennet3, the timetable shortened to minutes, makes a block 0 naming a release and starts the chain. To fill in before 12-21: the release id and the first difficulty |
+| 18 | built; cpnet passes: a fresh arcade with the right checkpoint syncs to the tip, with a wrong one it stops below it; the testnet ships block 1,000's |
+| 19 | built: the ledger snapshot (322 tags, 121 tokens, 462 balances of the testnet at Pepecoin testnet block 1,569,080, hash 3d0e902c…) named in block 0 and carried in; mignet under way |
+| 20–22 | the testnet rehearsal (mid-December), the genesis window (12-21 to 12-31), launch (2027-01-01): dates, not code |
 | 23 | Martin |
 | 24 | todo |
 | 25 | running (waits for block 1,165) |
