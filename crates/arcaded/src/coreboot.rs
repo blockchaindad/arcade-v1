@@ -718,6 +718,7 @@ pub fn chain_status(node: &Node, key: &str) -> Value {
 pub fn start(node: &Arc<Node>, key: &str, what: &str) -> Result<Value, String> {
     let p = arcade_chain::params::by_key(key).ok_or_else(|| format!("unknown chain {key}"))?;
     let key = p.key;
+    crate::chaindrive::not_moving(key)?;
     if !matches!(what, "coins" | "all") {
         return Err("what must be coins (the coin set; missing blocks from the network) or all (blocks too)".into());
     }

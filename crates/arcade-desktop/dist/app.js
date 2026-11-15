@@ -117,7 +117,8 @@ async function drawStart() {
     } }, "Claim");
     s3 = [h("div", { class: "hint" }, failed ? `@${failed.tag} didn't work (${failed.note}); pick another.` : "Your name on the arcade (2–24 characters: a–z, 0–9 and _). It's published on the chain, so every arcade sees it."),
       h("div", { class: "row start-claim" }, h("span", { class: "at" }, "@"), input, check, claim),
-      START.msg ? h("p", { class: "msg " + (START.checked ? "ok" : "bad") }, START.msg) : null];
+      START.msg ? h("p", { class: "msg " + (START.checked ? "ok" : "bad") }, START.msg) : null,
+      catchUp() ? h("div", { class: "hint" }, "Restored a wallet that already has a name? It comes back here by itself once it's found on the chain; no need to claim a new one.") : null];
   }
 
   const steps = [
@@ -133,7 +134,7 @@ async function drawStart() {
 // Restore a wallet from its words right on Home (the same as the Wallet tab's Restore).
 let restoring = false;
 function restoreBox() {
-  const ta = h("textarea", { rows: "2", placeholder: "or: your 12 words, separated by spaces", autocomplete: "off", spellcheck: "false", class: "start-words" });
+  const ta = h("textarea", { rows: "2", placeholder: "or: your 12 words, separated by spaces", autocomplete: "off", spellcheck: "false", autocapitalize: "off", autocorrect: "off", class: "start-words" });
   const m = h("p", { class: "msg" });
   const b = h("button", { onclick: async () => {
     if (restoring) return;
@@ -147,7 +148,8 @@ function restoreBox() {
     } catch (e) { msg(m, e.message, "bad"); }
     finally { restoring = false; b.disabled = false; }
   } }, "Restore my wallet");
-  return h("div", { class: "start-restore" }, ta, h("div", { class: "row" }, b), m);
+  const web = IN_BROWSER ? h("p", { class: "hint" }, "In a browser, your words go through your tunnel to this arcade only. Do it on a computer you trust: browser extensions can read what a page shows.") : null;
+  return h("div", { class: "start-restore" }, ta, web, h("div", { class: "row" }, b), m);
 }
 
 // Home: every arcade linked or heard lately, who runs it, and what it offers per chain.
@@ -545,7 +547,7 @@ async function refresh() {
     if (tab === "wallet") await refreshWallet();
     if (tab === "mine") await refreshMine();
     if (tab === "activity") await refreshActivity();
-    if (tab === "options") await refreshOptions();
+    if (tab === "options") { await refreshOptions(); refreshWebUi(); }
   } catch (e) {
     $("conn").textContent = "service not running"; $("conn").className = "pill bad";
   }
@@ -562,7 +564,7 @@ $("w-create").addEventListener("click", async () => {
 $("w-saved").addEventListener("change", (e) => { $("w-done").disabled = !e.target.checked; });
 $("w-done").addEventListener("click", () => { $("w-phrase-words").textContent = ""; $("w-phrase").hidden = true; refresh(); });
 $("w-restore").addEventListener("click", async () => {
-  try { await api("wallet.create", { phrase: $("w-words").value }); $("w-words").value = ""; msg($("w-msg"), "Wallet restored.", "ok"); refresh(); }
+  try { const r = await api("wallet.create", { phrase: $("w-words").value }); $("w-words").value = ""; msg($("w-msg"), r && r.tag ? `Wallet restored: you're @${r.tag} again.` : "Wallet restored. If it had a name, it shows here once this arcade or another can read it from the chain.", "ok"); refresh(); }
   catch (e) { msg($("w-msg"), e.message, "bad"); }
 });
 $("w-more").addEventListener("toggle", () => { if ($("w-more").open) { drawAccounts(); drawLinks(picked()); } });

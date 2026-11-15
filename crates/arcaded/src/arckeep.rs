@@ -15,7 +15,8 @@
 //! Nothing depends on a keeper. A writer whose score could be the height's best (§6.2: under 3 times the best one
 //! expected from the whole network's weight, about 19 heights in 20) says so with a `cand` and also runs its own proof
 //! as before; it writes with whichever proof is ready first. A writer that can't be the best doesn't announce and runs
-//! its own proof at the lowest CPU priority only, so the chain still moves if every likely writer is away.
+//! its own proof as before, at normal priority while it is for the tip (at the lowest priority a busy machine never
+//! finished it, and with few writers every draw can look unlikely: the testnet stalled so at block 1,061).
 //! Being a keeper costs a core; an arcade turns it on with `arc.keeper {on: true}`.
 
 use crate::arcsvc::{self, Clock};

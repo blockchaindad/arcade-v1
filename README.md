@@ -2,7 +2,7 @@
 
 A from-scratch Rust rebuild of Dogecoin Arcade, wire-compatible with the existing arcades. Pepecoin testnet first; other chains are add-ons. See [docs/PLAN.md](docs/PLAN.md).
 
-> **v0.1.67 is the last release published on GitHub.** From here on, Arcade V1 carries and updates itself: every arcade keeps the arcade's own code (the whole repository with its history, every dependency so it rebuilds offline, and the prebuilt programs) and hands new releases to the arcades it is linked to. Releases are signed with Strawberry's release key, and an arcade with automatic updates on (Options tab) installs them from the network, with no website involved. The install command below still works: it installs v0.1.67, which then updates itself from the network. See [docs/ARCADECHAIN.md §14.25](docs/ARCADECHAIN.md).
+> **Arcade V1 carries and updates itself.** Every arcade keeps the arcade's own code (the whole repository with its history, every dependency so it rebuilds offline, and the prebuilt programs) and hands new releases to the arcades it is linked to. Releases are signed with Strawberry's release key, and an arcade with automatic updates on (Options tab) installs them from the network, with no website involved (since v0.1.67). Releases are still published here on GitHub as well for now. See [docs/ARCADECHAIN.md §14.25](docs/ARCADECHAIN.md).
 
 ![Dogecoin image inscriptions in the Explorer](docs/img/screens/inscriptions-dogecoin.png)
 
@@ -97,6 +97,10 @@ Set these in the service's environment, for example with `systemctl --user edit 
 | `ARCADE_SYNC_TIMES` | Any value: log how long each part of every sync batch takes. |
 
 Stopping the service writes the coin cache to disk first, which can take a few minutes while a chain is catching up. The service units allow 300 s for that (`TimeoutStopSec=300`). A unit written by an older installer lacks this line, so systemd kills the service after 90 s and the next start redoes the unsaved blocks. Re-run the installer, or add `TimeoutStopSec=300` under `[Service]` with `systemctl --user edit arcaded`.
+
+### The app's window in a browser
+
+No screen on the arcade's computer, or using it from another one? `arcade web` prints a link that opens the same window in a browser, on that computer or through an SSH tunnel (`ssh -N -L 8420:127.0.0.1:8420 you@that-computer`). It answers only that computer and needs the key in the link. See [docs/WEBUI.md](docs/WEBUI.md).
 
 ### Uninstall
 

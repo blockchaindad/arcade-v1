@@ -53,6 +53,8 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
     let p = node.params;
     let c = p.chain_no;
     match req["cmd"].as_str().unwrap_or("") {
+        // The link that opens the desktop app's window in a browser (crate::webui; `arcade web`).
+        "ui.link" => crate::webui::link(node, node.http_port.get().copied().unwrap_or(8420)),
         "status" => {
             let tip = node.chain.tip(c).map_err(|e| e.to_string())?;
             use arcade_ledger::index;
@@ -85,16 +87,20 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         "peers" => Ok(json!(node.links.lock().unwrap().values().map(|l| json!({"addr": l.addr, "node_id": l.node_id, "since": l.since})).collect::<Vec<_>>())),
         "wallet.create" => {
             let phrase = node.app.create_wallet(s("phrase").as_deref()).map_err(|e| e.to_string())?;
+            let restored = s("phrase").is_some();
+            // A restored wallet's @handle, found on chain right away (else after a later sync round).
+            let tag = if restored { crate::claims::find_own_tag(node, true) } else { None };
             // Test coins for the first handle come by themselves: asked for now, so they are
             // usually here by the time a handle is picked (a restored wallet may have some).
-            if let Ok((k, _)) = node.app.tag_key(p, 0) {
-                let script = arcade_wallet::keys::p2pkh_script_for(&arcade_wallet::secp256k1::PublicKey::from_slice(&hex::decode(&k.pubkey).unwrap()).unwrap());
-                if crate::claims::coins(node, &script).is_empty() {
-                    let _ = crate::faucet::ask_if_needed(node, &k.address, "");
+            if tag.is_none() {
+                if let Ok((k, _)) = node.app.tag_key(p, 0) {
+                    let script = arcade_wallet::keys::p2pkh_script_for(&arcade_wallet::secp256k1::PublicKey::from_slice(&hex::decode(&k.pubkey).unwrap()).unwrap());
+                    if crate::claims::coins(node, &script).is_empty() {
+                        let _ = crate::faucet::ask_if_needed(node, &k.address, "");
+                    }
                 }
             }
-            let restored = s("phrase").is_some();
-            Ok(json!({"phrase": if restored { Value::Null } else { json!(phrase) }, "restored": restored}))
+            Ok(json!({"phrase": if restored { Value::Null } else { json!(phrase) }, "restored": restored, "tag": tag}))
         }
         "wallet.phrase" => Ok(json!({"phrase": node.app.phrase().map_err(|e| e.to_string())?})),
         "wallet.keys" => {
@@ -235,7 +241,8 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             let keys: Vec<String> = req["members"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
             crate::grpsvc::remove(node, &s("id").ok_or("id required")?, &keys)
         }
-        "apps.store" => Ok(crate::appsvc::store(node, &s("sort").unwrap_or_else(|| "popular".into()), &s("q").unwrap_or_default(), req["flagged"] == true)),
+        "apps.store" => Ok(crate::appsvc::store(node, &s("sort").unwrap_or_else(|| "popular".into()), &s("q").unwrap_or_default(), req["flagged"] == true, &s("category").unwrap_or_default())),
+        "apps.categories" => Ok(crate::appsvc::categories()),
         "apps.installed" => Ok(crate::appsvc::installed(node)),
         "apps.install" => crate::appsvc::install(node, &s("chain").ok_or("chain required")?, &s("txid").ok_or("txid required")?),
         "apps.uninstall" => crate::appsvc::uninstall(node, &s("id").ok_or("id required")?),
@@ -555,7 +562,18 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             *node.my_sizes.lock().unwrap() = m.clone();
             Ok(json!({"measured": m, "chains": crate::chains::list(node)}))
         }
-        "chains.status" => crate::chains::status(node, &s("key").ok_or("key required")?),
+        "chains.status" => {
+            let key = s("key").ok_or("key required")?;
+            let mut st = crate::chains::status(node, &key)?;
+            // Where its file is, and a move to another drive (crate::chaindrive).
+            if let Some(p) = crate::chains::find(&key).filter(|_| st["installed"] != false && st.is_object()) {
+                st["place"] = crate::chaindrive::place(node, p.chain_no);
+                st["move"] = crate::chaindrive::status(p.key);
+            }
+            Ok(st)
+        }
+        "chains.drives" => Ok(crate::chaindrive::drives(node)),
+        "chains.move" => crate::chaindrive::start(&node.self_arc(), &s("key").ok_or("key required")?, &s("drive").unwrap_or_else(|| "home".into())),
         "arc.status" => crate::arcsvc::status(node),
         "arc.block" => crate::arcsvc::block(req),
         "arc.submit" => crate::arcsvc::submit(req),
@@ -603,7 +621,9 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         "arc.earn" => crate::arcsvc::earn(node, req),
         "chains.add" => {
             let with: Vec<String> = req["with"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
-            crate::chains::add(&node.self_arc(), &s("key").ok_or("key required")?, &s("mode").unwrap_or_else(|| "full".into()), with)
+            let key = s("key").ok_or("key required")?;
+            // The drive chosen for it, else this arcade's own (crate::chaindrive): its file starts there.
+            crate::chaindrive::add(node, &key, &s("drive").unwrap_or_default(), || crate::chains::add(&node.self_arc(), &key, &s("mode").unwrap_or_else(|| "full".into()), with))
         }
         "chains.unqueue" => crate::chains::unqueue(node, &s("key").ok_or("key required")?),
         "chains.pause" => crate::chains::set_paused(node, &s("key").ok_or("key required")?, true),

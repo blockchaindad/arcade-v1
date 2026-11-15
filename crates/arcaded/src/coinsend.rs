@@ -100,6 +100,9 @@ pub fn send(node: &Node, key: Option<&str>, to: &str, amount: u64, from: Option<
     if !node.chain.addresses_on(p.chain_no).map_err(|e| e.to_string())? {
         return Err(format!("{} keeps no address index here, so its coins can't be found to send", p.name));
     }
+    // An @name instead of an address: its key's address on this chain, where that is sure to be theirs.
+    let named = to_of_tag(node, p, to)?;
+    let to = named.as_deref().unwrap_or(to);
     let to_script = script_for_address(p, to).ok_or_else(|| format!("{to} is not a {} address", p.name))?;
     let tip = node.chain.tip(p.chain_no).map_err(|e| e.to_string())?.map(|t| t.height).unwrap_or(0);
     // The key with the most to spend.
@@ -212,4 +215,25 @@ mod tests {
         assert!(warning(&DOGECOIN_MAIN, &doge[0].0).is_none());
         assert_eq!(key_scripts(&PEPECOIN_TEST, &pk).len(), 1);
     }
+}
+
+/// `to` as an @name (with or without the @, when it isn't an address of `p`): the claim's address on the home chain,
+/// with its key hash under `p`'s version byte. Only when `p` derives keys as the home chain does (the same BIP44 coin
+/// type: the ARCADE testnet beside Pepecoin testnet), so the address is one the name's own wallet holds; elsewhere the
+/// sender is asked for their address. None when `to` isn't a name.
+fn to_of_tag(node: &Node, p: &ChainParams, to: &str) -> Result<Option<String>, String> {
+    let t = to.strip_prefix('@').unwrap_or(to).to_lowercase();
+    if p.chain_no == node.params.chain_no || script_for_address(p, to).is_some() {
+        return Ok(None);
+    }
+    if !(2..=24).contains(&t.len()) || !t.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
+        return Ok(None);
+    }
+    let row = arcade_ledger::index::tag_row(&node.chain, node.params.chain_no, &t).map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("@{t} is not claimed"))?;
+    if p.bip44_coin_type != node.params.bip44_coin_type {
+        return Err(format!("@{t}'s {} address can't be worked out from their name here: paste their address", p.name));
+    }
+    let (_, hash) = decode_base58check(&row.address).filter(|(_, h)| h.len() == 20).ok_or_else(|| format!("@{t}'s address doesn't read"))?;
+    Ok(Some(base58check(p.p2pkh_version, &hash)))
 }
