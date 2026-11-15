@@ -590,6 +590,17 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
                 return respond(&mut s, status_line(a.code), a.ctype, &cors, &a.body);
             }
         }
+        // The ARCADE chain's git repositories (/r/git/..., arcgit::page_read): public data, with or without a pass, so an
+        // app can show them as a code host does.
+        if matches!(r.method.as_str(), "GET" | "HEAD") {
+            if let Some(a) = crate::arcgit::page_read(node, &path, &query_fields(&r.query)) {
+                let mut extra = cors.clone();
+                if a.gzip {
+                    extra.push(("Content-Encoding", "gzip".into()));
+                }
+                return respond(&mut s, status_line(a.code), a.ctype, &extra, if r.method == "HEAD" { &[] } else { &a.body });
+            }
+        }
         // The explorer's public reads (/r/explorer/<name>, explorer::page_read): what Arcade V1.0's own
         // Explorer shows, for an app that shows it too. Public data, with or without a pass.
         if matches!(r.method.as_str(), "GET" | "HEAD") {

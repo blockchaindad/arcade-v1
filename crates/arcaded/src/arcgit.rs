@@ -82,3 +82,64 @@ fn serve_manifest(id: &str, file: &str) -> (&'static str, Vec<u8>) {
         _ => ("404 Not Found", Vec::new()),
     }
 }
+
+/// One answer of the git page reads: (status code, content type, whether the body is gzipped, body).
+pub struct PageAnswer {
+    pub code: u16,
+    pub ctype: &'static str,
+    pub gzip: bool,
+    pub body: Vec<u8>,
+}
+
+fn json_answer(r: Result<Value, String>) -> PageAnswer {
+    let (code, v) = match r {
+        Ok(v) => (200, serde_json::json!({"ok": true, "result": v})),
+        Err(e) => (if e.contains("no repository") { 404 } else { 400 }, serde_json::json!({"ok": false, "error": e})),
+    };
+    PageAnswer { code, ctype: "application/json", gzip: false, body: v.to_string().into_bytes() }
+}
+
+/// The repositories of the ARCADE chain for apps (GET, public data, no page pass needed), so an app can show them as a
+/// code host does:
+/// - `/r/git/repos?owner=<tag>`: every repository (ledger.repos);
+/// - `/r/git/repo?name=@owner/name`: one, with its maintainers and push history (ledger.repo);
+/// - `/r/git/items?repo=@owner/name&number=<n>`: its issues and pull requests with their texts (ledger.items);
+/// - `/r/git/blob/<id>`: a blob the ARCADE chain holds, as stored (a manifest, a pack, an index, a text), which the app
+///   reads git objects from itself.
+///
+/// None for any other path.
+pub fn page_read(node: &crate::node::Node, path: &str, q: &serde_json::Map<String, Value>) -> Option<PageAnswer> {
+    let rest = path.strip_prefix("/r/git/")?;
+    let s = |k: &str| q.get(k).and_then(|v| match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }).filter(|s| !s.is_empty());
+    Some(match rest {
+        "repos" => json_answer(crate::arcledger::repos(node, s("owner").as_deref())),
+        "repo" => match s("name") {
+            Some(n) => json_answer(crate::arcledger::repo(node, &n)),
+            None => json_answer(Err("name required (@owner/name)".into())),
+        },
+        "items" => {
+            let mut req = serde_json::json!({"repo": s("repo")});
+            if let Some(n) = s("number").and_then(|n| n.parse::<u64>().ok()) {
+                req["number"] = serde_json::json!(n);
+            }
+            if req["repo"].is_null() {
+                json_answer(Err("repo required (@owner/name)".into()))
+            } else {
+                json_answer(crate::arcledger::items(node, &req))
+            }
+        }
+        r if r.starts_with("blob/") => {
+            let id = &r["blob/".len()..];
+            let bid: Option<[u8; 32]> = hex::decode(id).ok().and_then(|b| b.try_into().ok());
+            match bid.filter(crate::arcsvc::holds_blob).and_then(|b| crate::arcblob::view(&b).map(|bytes| (b, bytes))) {
+                Some((b, body)) => PageAnswer { code: 200, ctype: "application/octet-stream", gzip: crate::arcblob::gzipped(&b), body },
+                None => PageAnswer { code: 404, ctype: "text/plain", gzip: false, body: b"no such blob on the ARCADE chain here nor at the arcades linked to this one\n".to_vec() },
+            }
+        }
+        _ => PageAnswer { code: 404, ctype: "application/json", gzip: false, body: br#"{"ok":false,"error":"no such git read"}"#.to_vec() },
+    })
+}
