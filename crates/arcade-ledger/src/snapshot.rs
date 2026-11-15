@@ -92,8 +92,8 @@ pub struct Imported {
     pub balances: usize,
 }
 
-/// Write the snapshot's rows into chain `to`'s ledger tables, under its address versions (before block 1: nothing is
-/// journaled, as block 0 changes nothing).
+/// Write the snapshot's rows into chain `to`'s ledger tables, under its address versions (nothing is journaled: it is
+/// block 0's state). Only rows not there yet: a tag claimed or moved on the chain since, or a balance it changed, stays.
 pub fn import(db: &arcade_chaindb::ChainDb, to: &ChainParams, snap: &Value) -> Result<Imported> {
     let c = to.chain_no;
     let k = || KeyBuf::new().u16(c);
@@ -102,18 +102,27 @@ pub fn import(db: &arcade_chaindb::ChainDb, to: &ChainParams, snap: &Value) -> R
         for (i, t) in snap["tags"].as_array().into_iter().flatten().enumerate() {
             let (Some(tag), Some(kind), Some(h)) = (t[0].as_str(), t[1].as_u64(), t[2].as_str()) else { continue };
             let Some(a) = address_of(to, kind, h) else { continue };
+            if w.get(TAG, &k().bytes(tag.as_bytes()).done())?.is_some() || w.get(TAG_BY_ADDRESS, &k().bytes(a.as_bytes()).done())?.is_some() {
+                continue;
+            }
             w.put(TAG, &k().bytes(tag.as_bytes()).done(), json!({"a": a, "t": "snapshot", "h": 0, "p": i}).to_string().as_bytes())?;
             w.put(TAG_BY_ADDRESS, &k().bytes(a.as_bytes()).done(), tag.as_bytes())?;
             n.tags += 1;
         }
         for t in snap["tokens"].as_array().into_iter().flatten() {
             let Some(id) = t[0].as_u64() else { continue };
+            if w.get(PROPERTY, &k().u32(id as u32).done())?.is_some() {
+                continue;
+            }
             w.put(PROPERTY, &k().u32(id as u32).done(), t[1].to_string().as_bytes())?;
             n.tokens += 1;
         }
         for b in snap["balances"].as_array().into_iter().flatten() {
             let (Some(kind), Some(h), Some(id)) = (b[0].as_u64(), b[1].as_str(), b[2].as_u64()) else { continue };
             let Some(a) = address_of(to, kind, h) else { continue };
+            if w.get(BALANCE, &k().bytes(a.as_bytes()).u8(0).u32(id as u32).done())?.is_some() {
+                continue;
+            }
             let mut v = Vec::with_capacity(32);
             for i in 0..4 {
                 v.extend_from_slice(&b[3][i].as_u64().unwrap_or(0).to_be_bytes());

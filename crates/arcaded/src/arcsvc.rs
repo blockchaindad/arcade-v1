@@ -1057,9 +1057,12 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
     for ix in ledger {
         node.chain.add_indexer(p.chain_no, ix).map_err(db_err)?;
     }
-    // The home chain's ledger, carried in (§15 step 19): once, before block 1, when block 0 names a snapshot.
+    reconcile(&node.chain, p, &chain)?;
+    // The home chain's ledger, carried in (§15 step 19): once, after the store is settled on this block 0 (a store
+    // made again for a new block 0 drops every table of the chain: an import before it was wiped on the GX10 and the
+    // JB20B, 2026-11-15), only rows not there yet. The flag's _v2 repairs the arcades that lost it so.
     if let Some(want) = s.genesis.ledger {
-        let done = node.app.store.read(|r| r.get(arcade_app::META, b"arc_ledger_snapshot")).ok().flatten().is_some();
+        let done = node.app.store.read(|r| r.get(arcade_app::META, b"arc_ledger_snapshot_v2")).ok().flatten().is_some();
         if !done {
             // A file the settings name (local test chains), else the one built in with the testnet's settings.
             let text = match &s.ledger_snapshot {
@@ -1072,11 +1075,10 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
                 return Err("the ledger snapshot isn't the one block 0 names".into());
             }
             let n = arcade_ledger::snapshot::import(&node.chain, p, &snap).map_err(db_err)?;
-            node.app.store.write(|w| w.put(arcade_app::META, b"arc_ledger_snapshot", &want)).map_err(|e| e.to_string())?;
+            node.app.store.write(|w| w.put(arcade_app::META, b"arc_ledger_snapshot_v2", &want)).map_err(|e| e.to_string())?;
             eprintln!("arc: the ledger snapshot of {} at block {} carried in: {} tags, {} tokens, {} balances", snap["chain"], snap["height"], n.tags, n.tokens, n.balances);
         }
     }
-    reconcile(&node.chain, p, &chain)?;
     {
         let n = node.clone();
         std::thread::Builder::new()
