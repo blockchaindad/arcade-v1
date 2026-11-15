@@ -4,6 +4,7 @@ use crate::node::Node;
 use arcade_app::{Claim, ClaimStatus};
 use arcade_chain::OutPoint;
 use arcade_ledger::tags;
+use arcade_chain::params::ChainParams;
 use arcade_wallet::tx::{build_claim, Utxo};
 
 /// 0.01 coin per kB, the Dogecoin-family default.
@@ -17,13 +18,59 @@ pub struct Check {
     pub reason: Option<String>,
 }
 
-pub fn check(node: &Node, tag: &str) -> Check {
+/// The chain a claim is on: the home chain, or the ARCADE chain running here (§15 step 7: the ledger on ARCADE).
+pub fn chain_of(node: &Node, c: u16) -> Option<&'static ChainParams> {
+    if c == node.params.chain_no {
+        return Some(node.params);
+    }
+    crate::arcsvc::defined().filter(|p| p.chain_no == c && crate::arcsvc::runs(p))
+}
+
+/// A chain asked for by key (none: the home chain), if claims can be made on it.
+pub fn chain_for(node: &Node, key: Option<&str>) -> Result<&'static ChainParams, String> {
+    match key.filter(|k| !k.is_empty() && !k.eq_ignore_ascii_case(node.params.key)) {
+        None => Ok(node.params),
+        Some(k) => crate::arcsvc::params_for(k).filter(|p| crate::arcsvc::runs(p)).ok_or_else(|| format!("@tags are claimed on {} or on the ARCADE chain (installed here); not on {k}", node.params.name)),
+    }
+}
+
+fn is_home(node: &Node, p: &ChainParams) -> bool {
+    p.chain_no == node.params.chain_no
+}
+
+/// The claim transaction's fee rate and dust for `p`.
+fn fees_of(node: &Node, p: &ChainParams) -> (u64, u64) {
+    if is_home(node, p) {
+        (FEE_PER_KB, DUST)
+    } else {
+        (2 * arcade_arc::params::MIN_FEE_PER_KB, arcade_arc::params::DUST)
+    }
+}
+
+pub fn check_on(node: &Node, p: &'static ChainParams, tag: &str) -> Check {
     let tag = tag.trim().trim_start_matches('@').to_lowercase();
     if let Some(p) = tags::tag_problem(&tag) {
         return Check { tag, available: false, reason: Some(p.into()) };
     }
-    if let Ok(Some(row)) = arcade_ledger::index::tag_row(&node.chain, node.params.chain_no, &tag) {
+    if let Ok(Some(row)) = arcade_ledger::index::tag_row(&node.chain, p.chain_no, &tag) {
         return Check { tag, available: false, reason: Some(format!("taken by {} at block {}", row.address, row.block_height)) };
+    }
+    if !is_home(node, p) {
+        // The ARCADE chain: this arcade keeps it whole (no borrowed copy), and its pool's claims are the chain's
+        // business (the first in a block wins).
+        let pending = node.app.claims().unwrap_or_default().into_iter().any(|c| {
+            c.chain == p.chain_no && c.tag == tag && matches!(c.status, ClaimStatus::Sent | ClaimStatus::Funding | ClaimStatus::Checking)
+        });
+        if pending {
+            return Check { tag, available: false, reason: Some("you already have a claim for it in progress".into()) };
+        }
+        // A released tag in its reveal window (§15 step 8): only a claim committed ahead counts.
+        if let Some((rel, end)) = crate::arcledger::reveal_window(node, &tag) {
+            if crate::arcledger::committed_salt(node, &tag).is_none() {
+                return Check { tag, available: false, reason: Some(format!("released at block {rel}: until block {end} only claims committed ahead count (ledger.tag_commit first)")) };
+            }
+        }
+        return Check { tag, available: true, reason: None };
     }
     // This arcade's own tag index still catching up (a fresh install): every @tag would look
     // free here, and a claim for a taken one is paid for and then refused by the chain (first
@@ -101,6 +148,27 @@ pub(crate) fn unconfirmed_coins(node: &Node, script: &[u8]) -> Vec<Utxo> {
     out
 }
 
+/// A key's spendable coins on the ARCADE chain: confirmed, mature, and not spent by a transaction in its pool.
+pub(crate) fn arc_coins(node: &Node, p: &ChainParams, script: &[u8]) -> Vec<Utxo> {
+    let tip = node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height).unwrap_or(0);
+    let mut out = Vec::new();
+    for (op, value, _h) in node.chain.coins_for_script(p, script).unwrap_or_default() {
+        // Not spent by a waiting transaction, and still unspent on the chain itself (its store copy follows a moment
+        // after a block is taken).
+        if crate::arcsvc::spender(&op).is_some() || !crate::arcsvc::unspent(&op) {
+            continue;
+        }
+        if let Ok(Some(coin)) = node.chain.coin(p, &op) {
+            if coin.coinbase && coin.height + p.coinbase_maturity > tip {
+                continue;
+            }
+        }
+        out.push(Utxo { outpoint: op, value, script: script.to_vec() });
+    }
+    out.sort_by(|a, b| b.value.cmp(&a.value));
+    out
+}
+
 fn confirmed_coins(node: &Node, script: &[u8]) -> Vec<Utxo> {
     let p = node.params;
     let c = p.chain_no;
@@ -126,27 +194,26 @@ fn confirmed_coins(node: &Node, script: &[u8]) -> Vec<Utxo> {
     out
 }
 
-pub fn start(node: &Node, tag: &str) -> Result<Claim, String> {
-    let ck = check(node, tag);
+pub fn start_on(node: &Node, p: &'static ChainParams, tag: &str) -> Result<Claim, String> {
+    let ck = check_on(node, p, tag);
     if !ck.available {
         return Err(format!("@{} is not available: {}", ck.tag, ck.reason.unwrap_or_default()));
     }
     if !node.app.has_wallet().map_err(|e| e.to_string())? {
         return Err("create a wallet first (arcade wallet create)".into());
     }
-    // One @handle per wallet (Martin 2026-11-10: no claiming more than one).
-    let p = node.params;
+    // One @handle per wallet (Martin 2026-11-10: no claiming more than one), on each chain.
     if let Some(t) = node.app.tag_keys(p.chain_no).unwrap_or_default().into_iter().find_map(|k| k.tag) {
         return Err(format!("this wallet already has @{t}; one @handle per wallet"));
     }
     if let Some(c) = node.app.claims().unwrap_or_default().into_iter().find(|c| c.chain == p.chain_no && c.status != ClaimStatus::Failed) {
         return Err(format!("this wallet already has a claim for @{} in progress", c.tag));
     }
-    let index = node.app.free_tag_index(node.params.chain_no).map_err(|e| e.to_string())?;
+    let index = node.app.free_tag_index(p.chain_no).map_err(|e| e.to_string())?;
     let now = arcade_app::now();
     let claim = Claim {
-        id: format!("{}:{}:{now}", node.params.net, ck.tag),
-        chain: node.params.chain_no,
+        id: format!("{}:{}:{now}", p.net, ck.tag),
+        chain: p.chain_no,
         tag: ck.tag.clone(),
         key_index: index,
         status: ClaimStatus::Checking,
@@ -162,7 +229,9 @@ pub fn start(node: &Node, tag: &str) -> Result<Claim, String> {
 
 /// Move one claim forward as far as it can go right now.
 fn advance_one(node: &Node, mut c: Claim) -> Result<Claim, String> {
-    let p = node.params;
+    // A claim on a chain not running here (the ARCADE chain removed) waits for it.
+    let Some(p) = chain_of(node, c.chain) else { return Ok(c) };
+    let home = is_home(node, p);
     let (key, sk) = node.app.tag_key(p, c.key_index).map_err(|e| e.to_string())?;
     let script = arcade_wallet::keys::p2pkh_script_for(
         &arcade_wallet::secp256k1::PublicKey::from_slice(&hex::decode(&key.pubkey).unwrap()).unwrap(),
@@ -183,7 +252,7 @@ fn advance_one(node: &Node, mut c: Claim) -> Result<Claim, String> {
                 }
             }
             // ... and while this arcade's own tag index is behind, another arcade's word.
-            if lagging(node) && arcade_ledger::index::tag_row(&node.chain, p.chain_no, &c.tag).ok().flatten().is_none() {
+            if home && lagging(node) && arcade_ledger::index::tag_row(&node.chain, p.chain_no, &c.tag).ok().flatten().is_none() {
                 match owner_while_lagging(node, &c.tag) {
                     Ok(Some(by)) if by != key.address => {
                         set(&mut c, ClaimStatus::Failed, "taken by someone else first");
@@ -200,8 +269,28 @@ fn advance_one(node: &Node, mut c: Claim) -> Result<Claim, String> {
                     }
                 }
             }
-            let have = coins(node, &script);
-            match build_claim(p, &tags::claim_payload(&c.tag), &sk, &have, FEE_PER_KB, DUST, arcade_app::now() as u32) {
+            let have = if home { coins(node, &script) } else { arc_coins(node, p, &script) };
+            let (fee, dust) = fees_of(node, p);
+            // On ARCADE a claim this wallet committed to ahead carries the salt (a released tag's reveal window).
+            let payload = match (!home).then(|| crate::arcledger::committed_salt(node, &c.tag)).flatten() {
+                Some(salt) => tags::claim_payload_salted(&c.tag, &salt),
+                None => tags::claim_payload(&c.tag),
+            };
+            match build_claim(p, &payload, &sk, &have, fee, dust, arcade_app::now() as u32) {
+                Ok(tx) if !home => {
+                    // The ARCADE chain: into its pool, from where it goes to the other arcades.
+                    match crate::arcsvc::send_raw(&tx.raw) {
+                        Ok(_) => {
+                            c.txid = Some(tx.txid.to_hex());
+                            set(&mut c, ClaimStatus::Sent, "claim sent; waiting for a block");
+                            node.app.event("tag", &format!("claim for @{} sent on {} in {}", c.tag, p.name, tx.txid)).ok();
+                        }
+                        Err(e) => set(&mut c, ClaimStatus::Funding, &format!("the claim wasn't taken ({e}); trying again")),
+                    }
+                }
+                Err(e) if !home => {
+                    set(&mut c, ClaimStatus::Funding, &format!("waiting for ARCADE at {} ({e})", key.address));
+                }
                 Ok(tx) => {
                     crate::claims::mark_spent(node, &tx);
                     crate::resend::send(node, p, &tx);
@@ -227,7 +316,7 @@ fn advance_one(node: &Node, mut c: Claim) -> Result<Claim, String> {
             // This arcade's own tag index still catching up: the mesh's word decides
             // (ThinkPad 2026-11-09: @test14 was claimed on chain, but the local index was at
             // block 54,000, so the card waited for the test coin for good).
-            let lagging = local.is_none() && (crate::borrow::is_borrowed(p.key) || crate::borrow::home_lag(node).0 > 10);
+            let lagging = home && local.is_none() && (crate::borrow::is_borrowed(p.key) || crate::borrow::home_lag(node).0 > 10);
             let mesh = if lagging { mesh_owner(node, &c.tag) } else { None };
             let confirmed = local.or(mesh.as_ref().map(|a| *a == key.address));
             match confirmed {
@@ -243,8 +332,12 @@ fn advance_one(node: &Node, mut c: Claim) -> Result<Claim, String> {
                     // Neither confirmed nor waiting any more (its parent was replaced, or it
                     // was dropped): after 10 minutes the claim is built again.
                     let Some(txid) = c.txid.as_deref().and_then(|t| arcade_chain::Hash256::from_hex(t).ok()) else { return Ok(c) };
-                    let pooled = node.chain.mempool(p.chain_no).unwrap_or_default().iter()
-                        .any(|(_, raw)| arcade_chain::Tx::parse_with(raw, &p.format).map(|t| t.txid == txid).unwrap_or(false));
+                    let pooled = if home {
+                        node.chain.mempool(p.chain_no).unwrap_or_default().iter()
+                            .any(|(_, raw)| arcade_chain::Tx::parse_with(raw, &p.format).map(|t| t.txid == txid).unwrap_or(false))
+                    } else {
+                        crate::arcsvc::pooled(&txid)
+                    };
                     let mined = node.chain.tx_raw(p, &txid).ok().flatten().is_some();
                     // Only rebuilt when this arcade can tell (a lagging one may not hold the block yet).
                     if !pooled && !mined && !lagging && c.updated + 600 < arcade_app::now() {

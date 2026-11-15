@@ -1248,6 +1248,30 @@ impl ChainDb {
         self.store(c).read(|r| Ok(r.get(STATE, &k_state(c, "tip"))?.map(|v| decode_tip(&v))))
     }
 
+    /// The id of the header at `height` on the best header branch (a chain followed by headers only, §15 step 15),
+    /// with the best header's height. Among several headers at that height the best branch's is found by walking back
+    /// from the best header (rare: only near a fork).
+    pub fn header_hash_at(&self, params: &ChainParams, height: u32) -> Result<Option<Hash256>> {
+        let c = params.chain_no;
+        let Some(best) = self.best_header(c)? else { return Ok(None) };
+        let Some(top) = self.header(c, &best)? else { return Ok(None) };
+        if height > top.height {
+            return Ok(None);
+        }
+        let rows = self.store(c).read(|r| r.scan(HDR, &k_height(c, height)))?;
+        let ids: Vec<Hash256> = rows.iter().map(|(_, d)| params.block_id(&Header::parse(d[..80].try_into().unwrap()))).collect();
+        if ids.len() == 1 {
+            return Ok(Some(ids[0]));
+        }
+        let (mut at, mut rec) = (best, top);
+        while rec.height > height {
+            at = rec.header.prev;
+            let Some(r) = self.header(c, &at)? else { return Ok(None) };
+            rec = r;
+        }
+        Ok(Some(at))
+    }
+
     /// Best known header (most work), which may be ahead of the tip.
     pub fn best_header(&self, c: u16) -> Result<Option<Hash256>> {
         self.store(c).read(|r| Ok(r.get(STATE, &k_state(c, "best"))?.map(|v| Hash256(v[..32].try_into().unwrap()))))

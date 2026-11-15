@@ -1,6 +1,7 @@
 //! The ARCADE chain (docs/ARCADECHAIN.md): a coin paid for keeping and serving the mesh's
 //! chains and indexes. This crate holds the rules every arcade must agree on.
 
+pub mod blob;
 pub mod block;
 pub mod catalog;
 pub mod chain;

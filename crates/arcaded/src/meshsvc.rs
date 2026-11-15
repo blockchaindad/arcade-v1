@@ -628,6 +628,8 @@ fn serve_loop(
             "ka" => {} // TCP keepalive while frames go over UDP
             "cb" => crate::coreboot::on_frame(node, link, &f)?,
             "vx" => crate::vxshare::on_frame(node, link, &f)?,
+            // A blob piece we asked for over this link (crate::arcblob, crvia), else the ARCADE chain's own frames.
+            "ac" if crate::crvia::on_answer(peer, &f) => {}
             "ac" => crate::arcsvc::on_frame(node, link, &f)?,
             // The arcade's own code (crate::arccode): a piece we asked for over this link, or a record, a list, an ask.
             "co" if crate::crvia::on_answer(peer, &f) => {}

@@ -685,6 +685,46 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
             };
         }
     }
+    // A git repository from ARCADE blobs (§15 step 6), in git's "dumb" HTTP protocol, so any git client clones it:
+    // /git/<manifest blob>/{HEAD, info/refs, objects/info/packs, objects/pack/pack-<name>.pack|.idx}.
+    if path.starts_with("/git/") {
+        let (status, body) = crate::arcgit::serve(node, &path["/git/".len()..]);
+        let ctype = if status.starts_with("200") { "application/octet-stream" } else { "text/plain" };
+        return respond(&mut s, status, ctype, &[("Cache-Control", "no-store".into())], if r.method == "HEAD" { &[] } else { &body });
+    }
+    // A blob of the ARCADE chain by its id (§15 step 5: apps and games load their parts from here), when the chain holds a
+    // blob of that id: fetched from linked arcades if it isn't here, and kept in the viewer cache.
+    if let ["content", id] = seg.as_slice() {
+        if let Some(bid) = (id.len() == 64).then(|| hex::decode(id).ok()).flatten().and_then(|b| <[u8; 32]>::try_from(b).ok()).filter(crate::arcsvc::holds_blob) {
+            // A file of many blobs (a film): played as one file, with byte ranges so a video seeks; `?raw` shows its
+            // manifest.
+            if r.query != "raw" {
+                if let Some(f) = crate::arcblob::file_manifest(&bid) {
+                    serve_file(&mut s, &r, id, &f, ord_csp(node));
+                    return;
+                }
+            }
+            return match crate::arcblob::view(&bid) {
+                Some(bytes) => {
+                    let mut head = vec![
+                        ("ETag", format!("\"{id}\"")),
+                        ("Cache-Control", "public, max-age=31536000, immutable".into()),
+                        // As an ord inscription: a game's launcher runs its inline scripts and loads its parts from here.
+                        ("Content-Security-Policy", ord_csp(node)),
+                        ("Access-Control-Allow-Origin", "*".into()),
+                        ("X-Content-Type-Options", "nosniff".into()),
+                    ];
+                    // A gzipped blob (its record says so): the browser undoes it.
+                    if crate::arcblob::gzipped(&bid) {
+                        head.push(("Content-Encoding", "gzip".into()));
+                    }
+                    let kind = crate::arcblob::kind_of(&bid).filter(|k| !k.is_empty()).unwrap_or_else(|| "application/octet-stream".into());
+                    respond(&mut s, "200 OK", &kind, &head, if r.method == "HEAD" { &[] } else { &bytes })
+                }
+                None => respond(&mut s, "404 Not Found", "text/plain", &[], b"that blob is on the ARCADE chain, but no arcade linked to this one has it\n"),
+            };
+        }
+    }
     match seg.as_slice() {
         // An ord inscription by its id (the pictures and pages a site names; the arcade ledger's
         // own content is asked by txid or number below).
@@ -795,6 +835,35 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
 /// index that has it (the home chain first).
 /// How an ord inscription is served: sandboxed (opaque origin, scripts only), loading only
 /// from this arcade, so recursive inscriptions can ask /content/<id> for their parts.
+/// A blob file, streamed part by part (whole, or one `Range: bytes=a-b`).
+fn serve_file(s: &mut TcpStream, r: &Req, id: &str, f: &crate::arcblob::FileManifest, csp: String) {
+    let range = r.headers.get("range").and_then(|v| v.as_str()).and_then(|v| v.strip_prefix("bytes=")).and_then(|v| {
+        let (a, b) = v.split_once('-')?;
+        let (a, b) = match (a.trim().parse::<u64>().ok(), b.trim().parse::<u64>().ok()) {
+            (Some(a), Some(b)) => (a, b.min(f.size.saturating_sub(1))),
+            (Some(a), None) => (a, f.size.saturating_sub(1)),
+            (None, Some(n)) => (f.size.saturating_sub(n), f.size.saturating_sub(1)),
+            _ => return None,
+        };
+        (a <= b && b < f.size).then_some((a, b))
+    });
+    if f.size == 0 {
+        return respond(s, "200 OK", &f.kind, &[], &[]);
+    }
+    let (from, to) = range.unwrap_or((0, f.size - 1));
+    let status = if range.is_some() { "206 Partial Content" } else { "200 OK" };
+    let mut h = format!("HTTP/1.1 {status}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\nAccept-Ranges: bytes\r\nETag: \"{id}\"\r\nCache-Control: public, max-age=31536000, immutable\r\nAccess-Control-Allow-Origin: *\r\nContent-Security-Policy: {csp}\r\n", f.kind, to - from + 1);
+    if range.is_some() {
+        h.push_str(&format!("Content-Range: bytes {from}-{to}/{}\r\n", f.size));
+    }
+    h.push_str("\r\n");
+    use std::io::Write;
+    if s.write_all(h.as_bytes()).is_err() || r.method == "HEAD" {
+        return;
+    }
+    crate::arcblob::file_range(f, from, to, |b| s.write_all(b).is_ok());
+}
+
 fn ord_csp(node: &Node) -> String {
     let me = format!("http://127.0.0.1:{}", node.http_port.get().copied().unwrap_or(8420));
     format!("sandbox allow-scripts allow-pointer-lock; default-src 'self' {me} data: blob:; script-src 'self' {me} 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'self' {me} 'unsafe-inline' data:; img-src 'self' {me} data: blob:; media-src 'self' {me} data: blob:; font-src 'self' {me} data:; connect-src 'self' {me} data: blob:; frame-src 'self' {me}; object-src 'none'; base-uri 'none'; form-action 'none'")
