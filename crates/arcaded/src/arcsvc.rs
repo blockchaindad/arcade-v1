@@ -883,6 +883,8 @@ fn installed_key(net: &Net) -> Vec<u8> {
 /// main"): its block 0 and genesis list, built in. `--arc-local <settings>` replaces it with a
 /// local test chain (closed test networks only).
 pub const TESTNET_SETTINGS: &str = include_str!("../arctest.json");
+/// The home chain's ledger the testnet's block 0 names (§15 step 19), built in with its settings.
+pub const TESTNET_LEDGER: &str = include_str!("../arctest-ledger.json");
 
 /// Read the settings of the chain this arcade can install, and start it if it is installed.
 pub fn define(node: &Arc<Node>, settings: &std::path::Path) -> Result<(), String> {
@@ -1028,8 +1030,13 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
     if let Some(want) = s.genesis.ledger {
         let done = node.app.store.read(|r| r.get(arcade_app::META, b"arc_ledger_snapshot")).ok().flatten().is_some();
         if !done {
-            let path = s.ledger_snapshot.clone().ok_or("block 0 names a ledger snapshot: the settings' ledger_snapshot must say where it is")?;
-            let snap: Value = serde_json::from_slice(&std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?).map_err(|e| format!("ledger snapshot: {e}"))?;
+            // A file the settings name (local test chains), else the one built in with the testnet's settings.
+            let text = match &s.ledger_snapshot {
+                Some(path) => std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?,
+                None if !LOCAL.load(Ordering::Relaxed) => TESTNET_LEDGER.as_bytes().to_vec(),
+                None => return Err("block 0 names a ledger snapshot: the settings' ledger_snapshot must say where it is".into()),
+            };
+            let snap: Value = serde_json::from_slice(&text).map_err(|e| format!("ledger snapshot: {e}"))?;
             if arcade_ledger::snapshot::hash(&snap) != want {
                 return Err("the ledger snapshot isn't the one block 0 names".into());
             }
