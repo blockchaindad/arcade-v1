@@ -255,8 +255,13 @@ fn retry<T>(stop: std::time::Instant, mut f: impl FnMut() -> Result<T, String>) 
     }
 }
 
+/// The request's progress, beside its status (which only the wallet's approval sets: a note never puts a request back
+/// to pending, so it can't be approved twice).
 fn note(node: &Node, id: &str, state: &str, step: &str, txids: &[String], err: Option<&str>) {
     if let Some(mut r) = crate::walletsvc::get_request(node, id) {
+        if r["status"] == "pending" {
+            r["status"] = json!("sent");
+        }
         r["repo"] = json!({"state": state, "step": step, "txids": txids, "error": err});
         crate::walletsvc::put_request(node, &r);
     }
@@ -268,6 +273,14 @@ pub fn start(node: &Node, r: &Value) -> Result<(String, u64, Vec<Value>), String
     let r = r.clone();
     std::thread::spawn(move || {
         let id = s(&r, "id").to_string();
+        // The approval saves the request as sent once this returns: wait for that, so what this thread notes isn't
+        // written over by it.
+        for _ in 0..200 {
+            if crate::walletsvc::get_request(&n, &id).is_some_and(|x| x["status"] != "pending") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         let a = &r["args"];
         let stop = std::time::Instant::now() + std::time::Duration::from_secs(WAIT_SECS);
         let mut txids: Vec<String> = Vec::new();
