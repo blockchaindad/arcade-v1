@@ -373,3 +373,220 @@ pub fn balances(node: &Node, address: &str) -> Result<Value, String> {
     }).collect();
     Ok(json!({"address": address, "balances": list}))
 }
+
+// ---------------- A:// (profiles, follows, the address book, posts) ----------------
+
+fn scan(node: &Node, c: u16, table: &str, pre: &[u8]) -> Vec<(Vec<u8>, Value)> {
+    node.chain.store(c).read(|r| r.scan_prefix(table, pre)).unwrap_or_default().into_iter()
+        .filter_map(|(k, v)| Some((k, serde_json::from_slice::<Value>(&v).ok()?))).collect()
+}
+
+/// The address an A:// call is about: `address`, else `tag`'s owner, else this wallet's.
+fn who(node: &Node, req: &Value) -> Result<String, String> {
+    let p = chain()?;
+    if let Some(a) = req["address"].as_str().filter(|a| !a.is_empty()) {
+        return Ok(a.to_string());
+    }
+    if let Some(t) = req["tag"].as_str().filter(|t| !t.is_empty()) {
+        let t = t.trim_start_matches('@').to_lowercase();
+        return arcade_ledger::index::tag_row(&node.chain, p.chain_no, &t).map_err(|e| e.to_string())?.map(|r| r.address).ok_or_else(|| format!("@{t} isn't claimed on the ARCADE chain"));
+    }
+    Ok(sender(node, p)?.0)
+}
+
+fn card(node: &Node, c: u16, address: &str) -> Value {
+    let tag = arcade_ledger::index::tag_of(&node.chain, c, address).ok().flatten();
+    let prof = node.chain.store(c).read(|r| r.get(arcade_ledger::engine::A_PROFILE, &arcade_store::KeyBuf::new().u16(c).bytes(address.as_bytes()).done())).ok().flatten()
+        .and_then(|v| serde_json::from_slice::<Value>(&v).ok());
+    let followers = tag.as_ref().map_or(0, |t| scan(node, c, arcade_ledger::engine::A_FOLLOWER, &arcade_store::KeyBuf::new().u16(c).bytes(t.as_bytes()).u8(0).done()).len());
+    let following = scan(node, c, arcade_ledger::engine::A_FOLLOW, &arcade_store::KeyBuf::new().u16(c).bytes(address.as_bytes()).u8(0).done()).len();
+    json!({"address": address, "tag": tag, "profile": prof.as_ref().map(|p| p["v"].clone()), "height": prof.as_ref().map(|p| p["h"].clone()),
+           "versions": prof.as_ref().map_or(json!(0), |p| p["n"].clone()), "followers": followers, "following": following})
+}
+
+/// `a.profile {tag | address}`: a profile card as the ARCADE chain's ledger holds it (this wallet's when neither).
+pub fn a_profile(node: &Node, req: &Value) -> Result<Value, String> {
+    let p = chain()?;
+    let c = p.chain_no;
+    let a = who(node, req)?;
+    let mut v = card(node, c, &a);
+    let mine = a == sender(node, p)?.0;
+    v["mine"] = json!(mine);
+    // No A:// profile yet: the one published on the home chain under the same key (Martin 2026-11-15: keep the name
+    // people published; they republish on ARCADE once they have test ARCADE).
+    if v["profile"].is_null() {
+        if let Some((_, h160)) = arcade_ledger::address::decode_base58check(&a).filter(|(_, h)| h.len() == 20) {
+            let home = arcade_ledger::address::base58check(node.params.p2pkh_version, &h160);
+            if let Ok(Some(old)) = arcade_ledger::index::profile(&node.chain, node.params.chain_no, &home) {
+                let mut pv = serde_json::Map::new();
+                for (from, to) in [("name", "n"), ("bio", "b"), ("url", "u")] {
+                    if let Some(x) = old[from].as_str().filter(|x| !x.is_empty()) {
+                        pv.insert(to.into(), json!(x));
+                    }
+                }
+                v["profile"] = Value::Object(pv);
+                v["from_home"] = json!({"chain": node.params.name, "address": home, "height": old["height"], "picture": old["pfp"]});
+            }
+        }
+    }
+    if mine {
+        // What publishing costs and whether the wallet can pay it (test ARCADE, e.g. from the faucet).
+        let (_, _, sk) = sender(node, p)?;
+        let pk = arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
+        let have: u64 = crate::claims::arc_coins(node, p, &arcade_wallet::keys::p2pkh_script_for(&pk)).iter().map(|u| u.value).sum();
+        v["spendable"] = json!(have);
+        v["can_publish"] = json!(have >= arcade_arc::params::DUST + 100_000);
+    }
+    Ok(v)
+}
+
+/// `a.profile_set {name, bio, url, picture, addresses}`: publish this wallet's profile (one A:// record).
+pub fn a_profile_set(node: &Node, req: &Value) -> Result<Value, String> {
+    let mut v = serde_json::Map::new();
+    for (from, to) in [("name", "n"), ("bio", "b"), ("url", "u"), ("picture", "p")] {
+        if let Some(s) = req[from].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+            v.insert(to.into(), json!(s));
+        }
+    }
+    if let Some(a) = req["addresses"].as_object().filter(|a| !a.is_empty()) {
+        v.insert("a".into(), json!(a.iter().filter(|(_, x)| x.as_str().is_some_and(|s| !s.is_empty())).map(|(k, x)| (k.clone(), x.clone())).collect::<serde_json::Map<_, _>>()));
+    }
+    let v = Value::Object(v);
+    if let Some(p) = arcade_ledger::aproto::profile_problem(&v) {
+        return Err(p.into());
+    }
+    let body = v.to_string();
+    if body.len() > arcade_ledger::aproto::MAX_PROFILE {
+        return Err(format!("the profile is {} bytes; 1,000 at most", body.len()));
+    }
+    let (txid, fee) = send(node, &arcade_ledger::aproto::payload(arcade_ledger::aproto::OP_PROFILE, body.as_bytes()))?;
+    Ok(json!({"txid": txid, "fee": fee, "bytes": body.len()}))
+}
+
+/// `a.follow {tag}` / `a.unfollow {tag}`.
+pub fn a_follow(node: &Node, tag: &str, on: bool) -> Result<Value, String> {
+    let p = chain()?;
+    let t = tag.trim().trim_start_matches('@').to_lowercase();
+    if arcade_ledger::index::tag_row(&node.chain, p.chain_no, &t).map_err(|e| e.to_string())?.is_none() {
+        return Err(format!("@{t} isn't claimed on the ARCADE chain"));
+    }
+    let me = sender(node, p)?.0;
+    let following = node.chain.store(p.chain_no).read(|r| r.get(arcade_ledger::engine::A_FOLLOW, &arcade_store::KeyBuf::new().u16(p.chain_no).bytes(me.as_bytes()).u8(0).bytes(t.as_bytes()).done())).ok().flatten().is_some();
+    if on == following {
+        return Err(if on { format!("you already follow @{t}") } else { format!("you don't follow @{t}") });
+    }
+    let op = if on { arcade_ledger::aproto::OP_FOLLOW } else { arcade_ledger::aproto::OP_UNFOLLOW };
+    let (txid, fee) = send(node, &arcade_ledger::aproto::payload(op, t.as_bytes()))?;
+    Ok(json!({"txid": txid, "fee": fee, "tag": t, "following": on}))
+}
+
+/// `a.follows {tag | address}`: who it follows and who follows it, each with their card.
+pub fn a_follows(node: &Node, req: &Value) -> Result<Value, String> {
+    let c = chain()?.chain_no;
+    let a = who(node, req)?;
+    let pre = arcade_store::KeyBuf::new().u16(c).bytes(a.as_bytes()).u8(0).done();
+    let following: Vec<Value> = scan(node, c, arcade_ledger::engine::A_FOLLOW, &pre).into_iter().filter_map(|(k, v)| {
+        let t = String::from_utf8(k[pre.len()..].to_vec()).ok()?;
+        let owner = arcade_ledger::index::tag_row(&node.chain, c, &t).ok().flatten()?.address;
+        let mut x = card(node, c, &owner);
+        x["since"] = v["h"].clone();
+        Some(x)
+    }).collect();
+    let tag = arcade_ledger::index::tag_of(&node.chain, c, &a).ok().flatten();
+    let followers: Vec<Value> = tag.map(|t| {
+        let fpre = arcade_store::KeyBuf::new().u16(c).bytes(t.as_bytes()).u8(0).done();
+        let mut f: Vec<Value> = scan(node, c, arcade_ledger::engine::A_FOLLOWER, &fpre).into_iter().filter_map(|(k, v)| {
+            let addr = String::from_utf8(k[fpre.len()..].to_vec()).ok()?;
+            let mut x = card(node, c, &addr);
+            x["since"] = v["h"].clone();
+            x["you_follow"] = json!(following.iter().any(|g| g["address"] == addr.as_str()));
+            Some(x)
+        }).collect();
+        f.sort_by_key(|x| std::cmp::Reverse(x["since"].as_u64().unwrap_or(0)));
+        f
+    }).unwrap_or_default();
+    Ok(json!({"address": a, "following": following, "followers": followers}))
+}
+
+const CONTACT_BOUND: &[u8] = b"arcade A:// contact v1";
+
+/// `a.contacts`: this wallet's address book, opened with its own key.
+pub fn a_contacts(node: &Node) -> Result<Value, String> {
+    let p = chain()?;
+    let me = sender(node, p)?.0;
+    let k = crate::msgsvc::keys(node)?;
+    let pre = arcade_store::KeyBuf::new().u16(p.chain_no).bytes(me.as_bytes()).u8(0).done();
+    let mut out: Vec<Value> = scan(node, p.chain_no, arcade_ledger::engine::A_CONTACT, &pre).into_iter().filter_map(|(key, v)| {
+        let sealed = hex::decode(v["c"].as_str()?).ok()?;
+        let (_, plain) = arcade_msg::envelope::open(&k.secret, CONTACT_BOUND, &sealed).ok()?;
+        let mut e: Value = serde_json::from_slice(&plain).ok()?;
+        e["id"] = json!(hex::encode(&key[pre.len()..]));
+        e["height"] = v["h"].clone();
+        Some(e)
+    }).collect();
+    out.sort_by(|a, b| a["name"].as_str().unwrap_or("").to_lowercase().cmp(&b["name"].as_str().unwrap_or("").to_lowercase()));
+    Ok(json!({"contacts": out}))
+}
+
+/// `a.contact_save {id?, name, tag?, addresses, note?}`: one entry, sealed to this wallet's own key.
+pub fn a_contact_save(node: &Node, req: &Value) -> Result<Value, String> {
+    let name = req["name"].as_str().map(str::trim).filter(|s| !s.is_empty()).ok_or("a contact needs a name")?;
+    let id: [u8; 8] = match req["id"].as_str() {
+        Some(h) => hex::decode(h).ok().and_then(|b| b.try_into().ok()).ok_or("id is 16 hex")?,
+        None => {
+            let mut b = [0u8; 8];
+            rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut b);
+            b
+        }
+    };
+    let entry = json!({"name": name, "tag": req["tag"].as_str().map(|t| t.trim().trim_start_matches('@').to_lowercase()).filter(|t| !t.is_empty()),
+                       "addresses": req["addresses"].as_object().cloned().unwrap_or_default(), "note": req["note"].as_str().unwrap_or("")});
+    let k = crate::msgsvc::keys(node)?;
+    let sealed = arcade_msg::envelope::seal(&k.secret, &k.public, CONTACT_BOUND, entry.to_string().as_bytes());
+    let mut body = id.to_vec();
+    body.extend_from_slice(&sealed);
+    if body.len() > arcade_ledger::aproto::MAX_CONTACT {
+        return Err("that entry is too long (about 850 bytes of names, addresses and note at most)".into());
+    }
+    let (txid, fee) = send(node, &arcade_ledger::aproto::payload(arcade_ledger::aproto::OP_CONTACT, &body))?;
+    Ok(json!({"txid": txid, "fee": fee, "id": hex::encode(id)}))
+}
+
+/// `a.contact_delete {id}`.
+pub fn a_contact_delete(node: &Node, id: &str) -> Result<Value, String> {
+    let id: [u8; 8] = hex::decode(id).ok().and_then(|b| b.try_into().ok()).ok_or("id is 16 hex")?;
+    let (txid, fee) = send(node, &arcade_ledger::aproto::payload(arcade_ledger::aproto::OP_CONTACT_DEL, &id))?;
+    Ok(json!({"txid": txid, "fee": fee}))
+}
+
+/// `a.post {text}`.
+pub fn a_post(node: &Node, text: &str) -> Result<Value, String> {
+    let t = text.trim();
+    if t.is_empty() || t.len() > arcade_ledger::aproto::MAX_POST {
+        return Err("a post is 1 to 1,000 bytes".into());
+    }
+    let (txid, fee) = send(node, &arcade_ledger::aproto::payload(arcade_ledger::aproto::OP_POST, t.as_bytes()))?;
+    Ok(json!({"txid": txid, "fee": fee}))
+}
+
+/// `a.posts {tag | address | following: true, limit?}`: posts, newest first (`following`: of everyone this wallet follows).
+pub fn a_posts(node: &Node, req: &Value) -> Result<Value, String> {
+    let c = chain()?.chain_no;
+    let authors: Vec<String> = if req["following"] == true {
+        a_follows(node, &json!({}))?["following"].as_array().map(|v| v.iter().filter_map(|x| x["address"].as_str().map(String::from)).collect()).unwrap_or_default()
+    } else {
+        vec![who(node, req)?]
+    };
+    let mut posts = Vec::new();
+    for a in authors {
+        let pre = arcade_store::KeyBuf::new().u16(c).bytes(a.as_bytes()).u8(0).done();
+        let tag = arcade_ledger::index::tag_of(&node.chain, c, &a).ok().flatten();
+        for (k, v) in scan(node, c, arcade_ledger::engine::A_POST, &pre) {
+            let h = k.get(pre.len()..pre.len() + 4).and_then(|b| b.try_into().ok()).map(u32::from_be_bytes).unwrap_or(0);
+            posts.push(json!({"address": a, "tag": tag, "text": v["t"], "txid": v["txid"], "height": h}));
+        }
+    }
+    posts.sort_by_key(|p| std::cmp::Reverse(p["height"].as_u64().unwrap_or(0)));
+    posts.truncate(req["limit"].as_u64().unwrap_or(100) as usize);
+    Ok(json!({"posts": posts}))
+}

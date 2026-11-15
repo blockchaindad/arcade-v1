@@ -46,6 +46,12 @@ pub const REPO_MAINT: &str = "ledger.v1.repo_maintainer"; // C|owner/name|00|tag
 pub const REPO_LOG: &str = "ledger.v1.repo_log"; // C|owner/name|00|height u32|pos u32 -> {"m", "by", "txid"}
 pub const REPO_ITEM: &str = "ledger.v1.repo_item"; // C|owner/name|00|number u32 -> {"k", "by", "s", "b", "h", "txid"}
 pub const REPO_EVENT: &str = "ledger.v1.repo_event"; // C|owner/name|00|number u32|height u32|pos u32 -> {"by", "w", "v", "b"}
+// A:// (crate::aproto; chains with the ARCADE rules only):
+pub const A_PROFILE: &str = "ledger.v1.a_profile"; // C|address -> {"v": profile, "h", "txid", "n": versions}
+pub const A_FOLLOW: &str = "ledger.v1.a_follow"; // C|follower address|00|tag -> {"h"}
+pub const A_FOLLOWER: &str = "ledger.v1.a_follower"; // C|tag|00|follower address -> {"h"}
+pub const A_CONTACT: &str = "ledger.v1.a_contact"; // C|address|00|id (8) -> {"c": sealed hex, "h"}
+pub const A_POST: &str = "ledger.v1.a_post"; // C|address|00|height u32|pos u32 -> {"t", "txid"}
 
 pub const MAX_AMOUNT: u64 = 9_223_372_036_854_775_807;
 const PROPERTY_TYPES: &[u16] = &[1, 2, 65, 66, 129, 130, 5];
@@ -415,6 +421,56 @@ impl Engine<'_, '_, '_> {
             self.tag_touch(x, &t, self.time)?;
         }
         Ok(())
+    }
+
+    fn aproto(&self, r: &Rtx) -> Result<Inv> {
+        use crate::aproto::AOp;
+        let op = match crate::aproto::parse(&r.atx.payload) {
+            Some(Ok(op)) => op,
+            Some(Err(e)) => return Ok(Err(format!("A:// record not valid: {e}"))),
+            None => return Ok(Err("malformed A:// record".into())),
+        };
+        let me = r.atx.sender.as_str();
+        let at = |t: &str| k(self.c).bytes(me.as_bytes()).u8(0).bytes(t.as_bytes()).done();
+        let rev = |t: &str| k(self.c).bytes(t.as_bytes()).u8(0).bytes(me.as_bytes()).done();
+        match op {
+            AOp::Profile(v) => {
+                let key = k(self.c).bytes(me.as_bytes()).done();
+                let n = self.jget(A_PROFILE, &key)?.and_then(|o| o["n"].as_u64()).unwrap_or(0) + 1;
+                self.jput(A_PROFILE, &key, &json!({"v": v, "h": self.h, "txid": r.txid, "n": n}))?;
+            }
+            AOp::Follow(t) => {
+                if (EngineTags { e: self }).tag(&t)?.is_none() {
+                    return Ok(Err(format!("@{t} isn't claimed on this chain")));
+                }
+                if self.l.get(A_FOLLOW, &at(&t))?.is_some() {
+                    return Ok(Err(format!("already following @{t}")));
+                }
+                self.jput(A_FOLLOW, &at(&t), &json!({"h": self.h}))?;
+                self.jput(A_FOLLOWER, &rev(&t), &json!({"h": self.h}))?;
+            }
+            AOp::Unfollow(t) => {
+                if self.l.get(A_FOLLOW, &at(&t))?.is_none() {
+                    return Ok(Err(format!("not following @{t}")));
+                }
+                self.l.del(A_FOLLOW, &at(&t))?;
+                self.l.del(A_FOLLOWER, &rev(&t))?;
+            }
+            AOp::Contact(id, sealed) => {
+                self.jput(A_CONTACT, &k(self.c).bytes(me.as_bytes()).u8(0).bytes(&id).done(), &json!({"c": hex::encode(sealed), "h": self.h}))?;
+            }
+            AOp::ContactDel(id) => {
+                let key = k(self.c).bytes(me.as_bytes()).u8(0).bytes(&id).done();
+                if self.l.get(A_CONTACT, &key)?.is_none() {
+                    return Ok(Err("no such contact".into()));
+                }
+                self.l.del(A_CONTACT, &key)?;
+            }
+            AOp::Post(t) => {
+                self.jput(A_POST, &k(self.c).bytes(me.as_bytes()).u8(0).u32(self.h).u32(r.pos).done(), &json!({"t": t, "txid": r.txid}))?;
+            }
+        }
+        Ok(Ok(()))
     }
 
     fn repo(&self, r: &Rtx) -> Result<Inv> {
@@ -836,6 +892,10 @@ impl Engine<'_, '_, '_> {
 
     // ---------- AnyData / INSC ----------
     fn any_data(&self, r: &Rtx, data: &[u8]) -> Result<Inv> {
+        // A:// (crate::aproto), on chains with the ARCADE rules.
+        if data.len() >= 5 && &data[..4] == crate::aproto::MARKER && tags::expiry(self.c).is_some() {
+            return self.aproto(r);
+        }
         // @tag repositories (§15 step 9), on chains with the ARCADE rules.
         if data.len() >= 6 && &data[..4] == crate::repos::MARKER && tags::expiry(self.c).is_some() {
             return self.repo(r);
@@ -1528,7 +1588,7 @@ impl Indexer for LedgerIndexer {
         vec![(arcade_chaindb::journal::LEDGER, self.tables().iter().map(|t| t.name).collect())]
     }
     fn tables(&self) -> Vec<TableDef> {
-        [ROWS, PROPERTY, PROPERTY_BY_BLOCK, BALANCE, BOOK, TAKE, INSCRIPTION, CHUNK, PIECE, OFFER, ASK, COLLECTION, META, BY_NUMBER, TAG, TAG_BY_ADDRESS, TAG_SEEN, TAG_DUE, TAG_REL, TAG_COMMIT, TAG_PEND, TAG_WIN, REPO, REPO_MAINT, REPO_LOG, REPO_ITEM, REPO_EVENT]
+        [ROWS, PROPERTY, PROPERTY_BY_BLOCK, BALANCE, BOOK, TAKE, INSCRIPTION, CHUNK, PIECE, OFFER, ASK, COLLECTION, META, BY_NUMBER, TAG, TAG_BY_ADDRESS, TAG_SEEN, TAG_DUE, TAG_REL, TAG_COMMIT, TAG_PEND, TAG_WIN, REPO, REPO_MAINT, REPO_LOG, REPO_ITEM, REPO_EVENT, A_PROFILE, A_FOLLOW, A_FOLLOWER, A_CONTACT, A_POST]
             .iter()
             .map(|t| TableDef::plain(t))
             .collect()
