@@ -549,7 +549,7 @@ async function refresh() {
     if (tab === "activity") await refreshActivity();
     if (tab === "options") { await refreshOptions(); refreshWebUi(); }
   } catch (e) {
-    $("conn").textContent = "service not running"; $("conn").className = "pill bad";
+    $("conn").textContent = e && e.starting ? "starting the service…" : "service not running"; $("conn").className = "pill bad";
   }
 }
 

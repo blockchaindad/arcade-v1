@@ -86,7 +86,7 @@ async function webInvoke(name, args = {}) {
 // Everything goes through arcaded's local API (one JSON request each).
 async function api(cmd, args = {}) {
   const r = await invoke("api", { req: { cmd, ...args } });
-  if (!r.ok) throw new Error(r.error || "failed");
+  if (!r.ok) { const e = new Error(r.error || "failed"); e.starting = !!r.starting; throw e; }
   return r.result;
 }
 
