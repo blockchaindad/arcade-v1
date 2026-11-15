@@ -5,8 +5,8 @@
 //! the transaction's sender (its signing key: no registrar; the fee joins the pot). Ops:
 //! - 1 **profile**: a JSON object of at most [`MAX_PROFILE`] bytes: `n` name (≤ 64), `b` about (≤ 400), `u` link (≤ 200),
 //!   `p` picture (a blob id, 64 hex), `a` addresses on other coins (≤ 12, chain → address). The newest wins.
-//! - 2 **follow** / 3 **unfollow**: an @tag (claimed on this chain). Unfollows are on chain, so every arcade counts
-//!   the same followers.
+//! - 2 **follow** / 3 **unfollow**: an @tag (claimed on this chain), or a key hash (40 hex) for someone known only by
+//!   a name on another chain (kept as `#<hex>`). Unfollows are on chain, so every arcade counts the same followers.
 //! - 4 **contact**: an address book entry: id (8) ‖ a sealed box only its author can open. 5 **contact delete**: id (8).
 //! - 6 **post**: UTF-8 text of at most [`MAX_POST`] bytes, for its author's followers' feed.
 
@@ -88,6 +88,9 @@ pub fn parse(payload: &[u8]) -> Option<Result<AOp, &'static str>> {
         let body = &d[5..];
         let tag = |b: &[u8]| -> Result<String, &'static str> {
             let t = std::str::from_utf8(b).map_err(|_| "not utf-8")?.trim_start_matches('@').to_lowercase();
+            if t.len() == 40 && t.bytes().all(|c| c.is_ascii_hexdigit()) {
+                return Ok(format!("#{t}"));
+            }
             if let Some(p) = crate::tags::tag_problem(&t) {
                 return Err(p);
             }
@@ -150,6 +153,7 @@ mod tests {
         assert_eq!(parse(&p), Some(Ok(AOp::Profile(prof))));
         assert_eq!(parse(&payload(OP_FOLLOW, b"@Shoe")), Some(Ok(AOp::Follow("shoe".into()))));
         assert_eq!(parse(&payload(OP_UNFOLLOW, b"shoe")), Some(Ok(AOp::Unfollow("shoe".into()))));
+        assert_eq!(parse(&payload(OP_FOLLOW, "AB".repeat(20).as_bytes())), Some(Ok(AOp::Follow(format!("#{}", "ab".repeat(20))))));
         assert_eq!(parse(&payload(OP_CONTACT, b"12345678sealed")), Some(Ok(AOp::Contact(*b"12345678", b"sealed".to_vec()))));
         assert_eq!(parse(&payload(OP_CONTACT_DEL, b"12345678")), Some(Ok(AOp::ContactDel(*b"12345678"))));
         assert_eq!(parse(&payload(OP_POST, "gm ☀".as_bytes())), Some(Ok(AOp::Post("gm ☀".into()))));

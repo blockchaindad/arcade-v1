@@ -234,6 +234,7 @@
           <label class="k" for="pp-pic">Picture</label>
           <div class="row"><input type="file" id="pp-pic" accept="image/*"><span class="s" id="pp-picnote">An image is kept as a blob on the ARCADE chain (0.01 ARCADE a kB).</span></div>
           <label class="k">Addresses shown on your card</label>
+          <p class="s" style="margin:0 0 6px">Filled in from your wallet: every coin here and your imported wallets. Clear any you'd rather not show.</p>
           <div id="pp-addrs" class="pp-addrs"></div>
           <div class="pp-fee"><span class="s" id="pp-cost"></span><button class="primary" id="pp-publish">Publish profile</button></div>
         </div>
@@ -244,7 +245,7 @@
     <div class="pp-view" id="pp-follows" hidden>
       <h1>Following · Followers</h1>
       <p class="s">Follows and unfollows are records on the ARCADE chain, so every arcade counts the same followers.</p>
-      <div class="row"><input id="pp-followtag" placeholder="@tag to follow"><button class="primary" id="pp-follow">Follow</button></div>
+      <div class="card pp-find"><input id="pp-fsearch" placeholder="Find people to follow: a name or @tag" autocomplete="off"><div id="pp-fresults" class="pp-results"></div></div>
       <div class="pp-two">
         <div class="card"><h2 class="pp-h2">Following <span class="s" id="pp-nfollowing"></span></h2><div id="pp-following"></div></div>
         <div class="card"><h2 class="pp-h2">Followers <span class="s" id="pp-nfollowers"></span></h2><div id="pp-followers"></div></div>
@@ -256,16 +257,9 @@
       <p class="s">The people you send to, with their addresses on every coin. It follows your wallet to any device you sign in on.</p>
       <div class="pp-lock"><b>Only you can read it.</b> Each entry is encrypted to your wallet's key before it goes on the chain. Others see that you keep an address book, not who is in it.</div>
       <div class="card">
-        <div class="row"><input id="pp-search" placeholder="Search names, @tags, addresses"><button class="primary" id="pp-add">Add contact</button></div>
-        <div class="pp-form" id="pp-form" hidden>
-          <input id="pp-cid" type="hidden">
-          <div class="pp-two"><div><label class="k" for="pp-cname">Name</label><input id="pp-cname" maxlength="60"></div><div><label class="k" for="pp-ctag">@tag (optional)</label><input id="pp-ctag" maxlength="25"></div></div>
-          <label class="k">Addresses</label><div id="pp-caddrs" class="pp-addrs"></div>
-          <label class="k" for="pp-cnote">Note</label><input id="pp-cnote" maxlength="120">
-          <div class="row"><button class="primary" id="pp-csave">Save</button><button id="pp-ccancel">Cancel</button><span class="s">One record, about 0.0008 ARCADE.</span></div>
-        </div>
-        <div class="tablewrap"><table class="pp-table"><thead><tr><th>Name</th><th>@tag</th><th>Addresses</th><th>Note</th><th></th></tr></thead><tbody id="pp-crows"></tbody></table></div>
-        <p class="s" id="pp-cempty" hidden>No contacts yet. Add the people you send to.</p>
+        <div class="pp-find"><input id="pp-search" placeholder="Find someone to add: a name or @tag" autocomplete="off"><div id="pp-cresults" class="pp-results"></div></div>
+        <div class="tablewrap"><table class="pp-table"><thead><tr><th>Name</th><th>@tag</th><th>Addresses</th><th>About</th><th></th></tr></thead><tbody id="pp-crows"></tbody></table></div>
+        <p class="s" id="pp-cempty" hidden>No contacts yet. Search for someone above and add them.</p>
       </div>
     </div>
   </section>

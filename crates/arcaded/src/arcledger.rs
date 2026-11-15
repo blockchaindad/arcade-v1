@@ -398,7 +398,9 @@ fn card(node: &Node, c: u16, address: &str) -> Value {
     let tag = arcade_ledger::index::tag_of(&node.chain, c, address).ok().flatten();
     let prof = node.chain.store(c).read(|r| r.get(arcade_ledger::engine::A_PROFILE, &arcade_store::KeyBuf::new().u16(c).bytes(address.as_bytes()).done())).ok().flatten()
         .and_then(|v| serde_json::from_slice::<Value>(&v).ok());
-    let followers = tag.as_ref().map_or(0, |t| scan(node, c, arcade_ledger::engine::A_FOLLOWER, &arcade_store::KeyBuf::new().u16(c).bytes(t.as_bytes()).u8(0).done()).len());
+    let count = |t: &str| scan(node, c, arcade_ledger::engine::A_FOLLOWER, &arcade_store::KeyBuf::new().u16(c).bytes(t.as_bytes()).u8(0).done()).len();
+    let followers = tag.as_ref().map_or(0, |t| count(t))
+        + arcade_ledger::address::decode_base58check(address).filter(|(_, h)| h.len() == 20).map_or(0, |(_, h)| count(&format!("#{}", hex::encode(h))));
     let following = scan(node, c, arcade_ledger::engine::A_FOLLOW, &arcade_store::KeyBuf::new().u16(c).bytes(address.as_bytes()).u8(0).done()).len();
     json!({"address": address, "tag": tag, "profile": prof.as_ref().map(|p| p["v"].clone()), "height": prof.as_ref().map(|p| p["h"].clone()),
            "versions": prof.as_ref().map_or(json!(0), |p| p["n"].clone()), "followers": followers, "following": following})
@@ -430,6 +432,7 @@ pub fn a_profile(node: &Node, req: &Value) -> Result<Value, String> {
         }
     }
     if mine {
+        v["wallet_addresses"] = json!(wallet_addresses(node));
         // What publishing costs and whether the wallet can pay it (test ARCADE, e.g. from the faucet).
         let (_, _, sk) = sender(node, p)?;
         let pk = arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
@@ -467,7 +470,9 @@ pub fn a_profile_set(node: &Node, req: &Value) -> Result<Value, String> {
 pub fn a_follow(node: &Node, tag: &str, on: bool) -> Result<Value, String> {
     let p = chain()?;
     let t = tag.trim().trim_start_matches('@').to_lowercase();
-    if arcade_ledger::index::tag_row(&node.chain, p.chain_no, &t).map_err(|e| e.to_string())?.is_none() {
+    // A key hash (someone known by a name on another chain, no ARCADE @tag yet) is followed as #<hex>.
+    let t = if t.len() == 40 && t.bytes().all(|b| b.is_ascii_hexdigit()) { format!("#{t}") } else { t };
+    if !t.starts_with('#') && arcade_ledger::index::tag_row(&node.chain, p.chain_no, &t).map_err(|e| e.to_string())?.is_none() {
         return Err(format!("@{t} isn't claimed on the ARCADE chain"));
     }
     let me = sender(node, p)?.0;
@@ -476,7 +481,8 @@ pub fn a_follow(node: &Node, tag: &str, on: bool) -> Result<Value, String> {
         return Err(if on { format!("you already follow @{t}") } else { format!("you don't follow @{t}") });
     }
     let op = if on { arcade_ledger::aproto::OP_FOLLOW } else { arcade_ledger::aproto::OP_UNFOLLOW };
-    let (txid, fee) = send(node, &arcade_ledger::aproto::payload(op, t.as_bytes()))?;
+    let body = t.trim_start_matches('#');
+    let (txid, fee) = send(node, &arcade_ledger::aproto::payload(op, body.as_bytes()))?;
     Ok(json!({"txid": txid, "fee": fee, "tag": t, "following": on}))
 }
 
@@ -487,24 +493,36 @@ pub fn a_follows(node: &Node, req: &Value) -> Result<Value, String> {
     let pre = arcade_store::KeyBuf::new().u16(c).bytes(a.as_bytes()).u8(0).done();
     let following: Vec<Value> = scan(node, c, arcade_ledger::engine::A_FOLLOW, &pre).into_iter().filter_map(|(k, v)| {
         let t = String::from_utf8(k[pre.len()..].to_vec()).ok()?;
-        let owner = arcade_ledger::index::tag_row(&node.chain, c, &t).ok().flatten()?.address;
-        let mut x = card(node, c, &owner);
+        let h = match t.strip_prefix('#') {
+            Some(hx) => hex::decode(hx).ok()?,
+            None => h160_of(&arcade_ledger::index::tag_row(&node.chain, c, &t).ok().flatten()?.address)?,
+        };
+        let mut x = directory_card(node, &h)?;
         x["since"] = v["h"].clone();
+        x["follow_key"] = json!(t);
         Some(x)
     }).collect();
+    // Followers: those following our @tag, and those following our key hash.
     let tag = arcade_ledger::index::tag_of(&node.chain, c, &a).ok().flatten();
-    let followers: Vec<Value> = tag.map(|t| {
+    let mut targets: Vec<String> = tag.into_iter().collect();
+    if let Some(h) = h160_of(&a) {
+        targets.push(format!("#{}", hex::encode(h)));
+    }
+    let mut followers: Vec<Value> = Vec::new();
+    for t in targets {
         let fpre = arcade_store::KeyBuf::new().u16(c).bytes(t.as_bytes()).u8(0).done();
-        let mut f: Vec<Value> = scan(node, c, arcade_ledger::engine::A_FOLLOWER, &fpre).into_iter().filter_map(|(k, v)| {
-            let addr = String::from_utf8(k[fpre.len()..].to_vec()).ok()?;
-            let mut x = card(node, c, &addr);
+        for (k, v) in scan(node, c, arcade_ledger::engine::A_FOLLOWER, &fpre) {
+            let Ok(addr) = String::from_utf8(k[fpre.len()..].to_vec()) else { continue };
+            if followers.iter().any(|f| f["address"] == addr.as_str()) {
+                continue;
+            }
+            let Some(mut x) = h160_of(&addr).and_then(|h| directory_card(node, &h)) else { continue };
             x["since"] = v["h"].clone();
             x["you_follow"] = json!(following.iter().any(|g| g["address"] == addr.as_str()));
-            Some(x)
-        }).collect();
-        f.sort_by_key(|x| std::cmp::Reverse(x["since"].as_u64().unwrap_or(0)));
-        f
-    }).unwrap_or_default();
+            followers.push(x);
+        }
+    }
+    followers.sort_by_key(|x| std::cmp::Reverse(x["since"].as_u64().unwrap_or(0)));
     Ok(json!({"address": a, "following": following, "followers": followers}))
 }
 
@@ -522,6 +540,25 @@ pub fn a_contacts(node: &Node) -> Result<Value, String> {
         let mut e: Value = serde_json::from_slice(&plain).ok()?;
         e["id"] = json!(hex::encode(&key[pre.len()..]));
         e["height"] = v["h"].clone();
+        // Someone added from their profile shows it as it is now: a new name, bio or address is seen at once.
+        let addr = e["addresses"]["arcade"].as_str().map(String::from)
+            .or_else(|| e["tag"].as_str().and_then(|t| arcade_ledger::index::tag_row(&node.chain, p.chain_no, t).ok().flatten()).map(|r| r.address));
+        if let Some(live) = addr.as_deref().and_then(h160_of).and_then(|h| directory_card(node, &h)) {
+            if let Some(n) = live["profile"]["n"].as_str() {
+                e["name"] = json!(n);
+            }
+            if let Some(b) = live["profile"]["b"].as_str() {
+                e["note"] = json!(b);
+            }
+            if let Some(m) = live["profile"]["a"].as_object() {
+                for (k, x) in m {
+                    e["addresses"][k] = x.clone();
+                }
+            }
+            e["tag"] = live["tag"].clone();
+            e["home"] = live["home"].clone();
+            e["profile_picture"] = live["profile"]["p"].clone();
+        }
         Some(e)
     }).collect();
     out.sort_by(|a, b| a["name"].as_str().unwrap_or("").to_lowercase().cmp(&b["name"].as_str().unwrap_or("").to_lowercase()));
@@ -540,7 +577,7 @@ pub fn a_contact_save(node: &Node, req: &Value) -> Result<Value, String> {
         }
     };
     let entry = json!({"name": name, "tag": req["tag"].as_str().map(|t| t.trim().trim_start_matches('@').to_lowercase()).filter(|t| !t.is_empty()),
-                       "addresses": req["addresses"].as_object().cloned().unwrap_or_default(), "note": req["note"].as_str().unwrap_or("")});
+                       "addresses": req["addresses"].as_object().cloned().unwrap_or_default(), "note": req["note"].as_str().unwrap_or(""), "home": req["home"].clone()});
     let k = crate::msgsvc::keys(node)?;
     let sealed = arcade_msg::envelope::seal(&k.secret, &k.public, CONTACT_BOUND, entry.to_string().as_bytes());
     let mut body = id.to_vec();
@@ -589,4 +626,186 @@ pub fn a_posts(node: &Node, req: &Value) -> Result<Value, String> {
     posts.sort_by_key(|p| std::cmp::Reverse(p["height"].as_u64().unwrap_or(0)));
     posts.truncate(req["limit"].as_u64().unwrap_or(100) as usize);
     Ok(json!({"posts": posts}))
+}
+
+/// Every address this wallet has to show on a profile (Martin 2026-11-15: "automatically get all your addresses from
+/// your vault including imported wallets"): its own on each coin installed here, then each imported wallet's (a second
+/// one on a coin as `doge-2` ...). At most 12, as a profile holds.
+pub fn wallet_addresses(node: &Node) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    if !node.app.has_wallet().unwrap_or(false) {
+        return out;
+    }
+    let mut chains: Vec<&'static ChainParams> = vec![node.params];
+    let extra: Vec<String> = node.extra.lock().unwrap().keys().map(|k| k.to_string()).collect();
+    chains.extend(extra.iter().filter_map(|k| crate::chains::find(k)));
+    for cp in chains {
+        if crate::arcsvc::runs(cp) || out.contains_key(cp.key) {
+            continue;
+        }
+        let key = node.app.tag_keys(cp.chain_no).ok().and_then(|ks| ks.into_iter().find(|k| k.tag.is_some()).or_else(|| node.app.tag_keys(cp.chain_no).ok()?.into_iter().next()))
+            .or_else(|| node.app.tag_key(cp, 0).ok().map(|x| x.0));
+        let Some(k) = key else { continue };
+        let Some(pk) = hex::decode(&k.pubkey).ok().and_then(|b| arcade_wallet::secp256k1::PublicKey::from_slice(&b).ok()) else { continue };
+        if let Some((addr, _)) = crate::coinsend::key_scripts(cp, &pk).into_iter().next() {
+            out.insert(cp.key.to_string(), json!(addr));
+        }
+    }
+    for e in crate::importsvc::list_raw(node) {
+        let (Some(chain), Some(addr)) = (e["chain"].as_str(), e["address"].as_str()) else { continue };
+        if out.values().any(|v| v == addr) {
+            continue;
+        }
+        let mut name = chain.to_string();
+        let mut n = 2;
+        while out.contains_key(&name) {
+            name = format!("{chain}-{n}");
+            n += 1;
+        }
+        out.insert(name, json!(addr));
+    }
+    let keep: Vec<String> = out.keys().take(12).cloned().collect();
+    out.retain(|k, _| keep.contains(k));
+    out
+}
+
+// ---------------- the directory: everyone who published a name anywhere this arcade reads ----------------
+//
+// Martin 2026-11-15: ARCADE is the home chain, but the arcade ledgers of the other chains are read too, with a home
+// chain marked on each card, and DogeFeed's names (D://, `.dogefeed` names on Dogecoin). One key, one person: the same
+// key hash is the same wallet on every chain, so an ARCADE address follows from any of them.
+
+fn h160_of(address: &str) -> Option<Vec<u8>> {
+    arcade_ledger::address::decode_base58check(address).filter(|(_, h)| h.len() == 20).map(|(_, h)| h)
+}
+
+/// The chains whose arcade ledger is read here, besides ARCADE: the home chain and every chain installed with its
+/// ledger or profiles index.
+fn ledger_chains(node: &Node) -> Vec<&'static ChainParams> {
+    let mut out = vec![node.params];
+    let extra: Vec<String> = node.extra.lock().unwrap().keys().map(|k| k.to_string()).collect();
+    for k in extra {
+        if let Some(cp) = crate::chains::find(&k) {
+            let ix = node.chain.indexers_for(cp.chain_no);
+            if !crate::arcsvc::runs(cp) && (ix.contains(&"ledger.v1") || ix.contains(&"profiles.v1")) && !out.iter().any(|o| o.chain_no == cp.chain_no) {
+                out.push(cp);
+            }
+        }
+    }
+    out
+}
+
+/// One person's card by their key hash: their ARCADE profile and @tag first; else the first chain whose arcade ledger
+/// holds a profile or @tag of theirs; else their DogeFeed name. `home` says where the name was published.
+fn directory_card(node: &Node, h: &[u8]) -> Option<Value> {
+    let p = chain().ok()?;
+    let c = p.chain_no;
+    let arc_addr = arcade_ledger::address::base58check(p.p2pkh_version, h);
+    let mut v = card(node, c, &arc_addr);
+    v["key"] = json!(hex::encode(h));
+    if !v["profile"].is_null() || !v["tag"].is_null() {
+        v["home"] = json!({"chain": p.name, "key": p.key, "via": if v["profile"].is_null() { "@tag" } else { "A://" }});
+        return Some(v);
+    }
+    for cp in ledger_chains(node) {
+        let a = arcade_ledger::address::base58check(cp.p2pkh_version, h);
+        let tag = arcade_ledger::index::tag_of(&node.chain, cp.chain_no, &a).ok().flatten();
+        let prof = arcade_ledger::index::profile(&node.chain, cp.chain_no, &a).ok().flatten();
+        if tag.is_none() && prof.is_none() {
+            continue;
+        }
+        let mut pv = serde_json::Map::new();
+        if let Some(n) = prof.as_ref().and_then(|x| x["name"].as_str()).filter(|n| !n.is_empty()).map(String::from).or_else(|| tag.as_ref().map(|t| format!("@{t}"))) {
+            pv.insert("n".into(), json!(n));
+        }
+        for (from, to) in [("bio", "b"), ("url", "u")] {
+            if let Some(x) = prof.as_ref().and_then(|x| x[from].as_str()).filter(|x| !x.is_empty()) {
+                pv.insert(to.into(), json!(x));
+            }
+        }
+        pv.insert("a".into(), json!({cp.key: a}));
+        v["profile"] = Value::Object(pv);
+        v["other_tag"] = json!(tag);
+        v["home"] = json!({"chain": cp.name, "key": cp.key, "via": if prof.is_some() { "profile" } else { "@tag" }});
+        return Some(v);
+    }
+    let doge = crate::chains::find("doge")?;
+    let da = arcade_ledger::address::base58check(doge.p2pkh_version, h);
+    let name = crate::dproto::handle_of(node, &da)?;
+    v["profile"] = json!({"n": name, "a": {"doge": da}});
+    v["home"] = json!({"chain": "Dogecoin", "key": "doge", "via": "DogeFeed"});
+    Some(v)
+}
+
+/// `a.search {q}`: everyone whose published name or @tag holds `q`, on ARCADE, on the other chains' arcade ledgers read
+/// here, and on DogeFeed, one card a person (Martin 2026-11-15: "a simple search and click to add someone").
+pub fn a_search(node: &Node, q: &str) -> Result<Value, String> {
+    let p = chain()?;
+    let c = p.chain_no;
+    let q = q.trim().trim_start_matches('@').to_lowercase();
+    if q.len() < 2 {
+        return Ok(json!({"results": []}));
+    }
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    let mut add = |a: &str| {
+        if let Some(h) = h160_of(a) {
+            if !keys.contains(&h) {
+                keys.push(h);
+            }
+        }
+    };
+    let pre = arcade_store::KeyBuf::new().u16(c).done();
+    for (k, v) in scan(node, c, arcade_ledger::engine::A_PROFILE, &pre) {
+        if v["v"]["n"].as_str().is_some_and(|n| n.to_lowercase().contains(&q)) {
+            add(&String::from_utf8_lossy(&k[2..]));
+        }
+    }
+    for cp in std::iter::once(p).chain(ledger_chains(node)) {
+        for (tag, row) in arcade_ledger::index::read_tags(&node.chain, cp.chain_no).unwrap_or_default() {
+            if tag.contains(&q) {
+                add(&row.address);
+            }
+        }
+        let ppre = arcade_store::KeyBuf::new().u16(cp.chain_no).done();
+        for (k, v) in scan(node, cp.chain_no, arcade_ledger::index::PROFILE, &ppre) {
+            if v["name"].as_str().is_some_and(|n| n.to_lowercase().contains(&q)) {
+                add(&String::from_utf8_lossy(&k[2..]));
+            }
+        }
+    }
+    for (a, _) in crate::dproto::handles_matching(&q, 25) {
+        add(&a);
+    }
+    let me = h160_of(&sender(node, p)?.0);
+    let out: Vec<Value> = keys.iter().filter(|h| Some(*h) != me.as_ref()).take(25).filter_map(|h| directory_card(node, h)).collect();
+    Ok(json!({"results": out}))
+}
+
+/// The key hash a call names: `key` (40 hex), an ARCADE or other chain's `address`, or an @`tag` on ARCADE.
+fn key_of(node: &Node, req: &Value) -> Result<Vec<u8>, String> {
+    if let Some(k) = req["key"].as_str() {
+        return hex::decode(k).ok().filter(|h| h.len() == 20).ok_or_else(|| "key is a key hash (40 hex)".to_string());
+    }
+    h160_of(&who(node, req)?).ok_or_else(|| "not an address".into())
+}
+
+/// `a.contact_add {key | tag | address}`: add someone from what they published (their name, @tag, addresses and bio,
+/// wherever it was published), sealed to this wallet's key like any entry; the same person again replaces it.
+pub fn a_contact_add(node: &Node, req: &Value) -> Result<Value, String> {
+    let h = key_of(node, req)?;
+    let card = directory_card(node, &h).ok_or("they haven't published a name anywhere this arcade reads")?;
+    let prof = card["profile"].clone();
+    let tag = card["tag"].as_str().map(String::from);
+    let name = prof["n"].as_str().map(String::from).or_else(|| tag.as_ref().map(|t| format!("@{t}"))).ok_or("they have no published name")?;
+    let a = card["address"].as_str().unwrap_or("").to_string();
+    let mut addrs = serde_json::Map::new();
+    addrs.insert("arcade".into(), json!(a));
+    if let Some(m) = prof["a"].as_object() {
+        for (k, v) in m {
+            addrs.insert(k.clone(), v.clone());
+        }
+    }
+    let existing = a_contacts(node)?["contacts"].as_array().cloned().unwrap_or_default().into_iter().find(|e| e["addresses"]["arcade"] == a.as_str());
+    a_contact_save(node, &json!({"id": existing.as_ref().map(|e| e["id"].clone()), "name": name, "tag": tag, "addresses": addrs,
+                                 "note": prof["b"].as_str().unwrap_or(""), "home": card["home"]}))
 }

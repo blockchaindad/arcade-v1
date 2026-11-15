@@ -721,10 +721,13 @@ fn order_and_cap(mut items: Vec<arcade_arc::block::Item>, work: impl Fn(&arcade_
 fn run_writer(node: Arc<Node>, svc: Arc<Svc>) {
     let file = node.home.join("arc").join(svc.net.key).join("wrote");
     let mut wrote: VecDeque<Hash256> = std::fs::read_to_string(&file).unwrap_or_default().lines().filter_map(|l| Hash256::from_hex(l.trim()).ok()).collect();
+    let blocks = wrote_blocks_dir(&node, &svc);
     let mut remember = |wrote: &mut VecDeque<Hash256>, parent: Hash256| {
         wrote.push_back(parent);
         while wrote.len() > WROTE_KEEP {
-            wrote.pop_front();
+            if let Some(old) = wrote.pop_front() {
+                let _ = std::fs::remove_file(blocks.join(old.to_hex()));
+            }
         }
         let text: String = wrote.iter().map(|h| h.to_hex() + "\n").collect();
         let _ = std::fs::create_dir_all(file.parent().expect("a folder"));
@@ -738,6 +741,22 @@ fn run_writer(node: Arc<Node>, svc: Arc<Svc>) {
 
 /// Parents the writer remembers having written on.
 const WROTE_KEEP: usize = 1_000;
+
+/// Where the writer keeps the block it wrote on each parent (`<home>/arc/<net>/wrote-blocks/<parent>`): after a
+/// restart, a parent it wrote on gets that same block offered again (never a second one), so a block lost before it
+/// reached anyone doesn't close its parent for good. All the writers of a test net stopped so, each having written on
+/// the tip, and none ever wrote again (2026-11-15).
+fn wrote_blocks_dir(node: &Node, svc: &Svc) -> std::path::PathBuf {
+    node.home.join("arc").join(svc.net.key).join("wrote-blocks")
+}
+
+fn save_written(dir: &std::path::Path, parent: &Hash256, b: &Block) {
+    let _ = std::fs::create_dir_all(dir);
+    let (file, tmp) = (dir.join(parent.to_hex()), dir.join(format!("{}.new", parent.to_hex())));
+    if std::fs::write(&tmp, b.encode()).and_then(|_| std::fs::rename(&tmp, &file)).is_err() {
+        eprintln!("arc: couldn't keep the block this arcade wrote");
+    }
+}
 /// Rule-breaking blocks from one peer in an hour before its ARCADE frames are ignored for an hour.
 const STRIKES: usize = 5;
 
@@ -768,6 +787,14 @@ fn run_writer_on(node: Arc<Node>, svc: Arc<Svc>, wrote: &mut VecDeque<Hash256>, 
                 on = Some(tip);
                 let seed = seed_proof(&st.chain);
                 // Written on before: never a second block on it.
+                // Written on before: our own block for it, offered again if the chain lacks it (lost before it went out).
+                if wrote.contains(&tip) && written.is_none() {
+                    let saved = std::fs::read(wrote_blocks_dir(&node, &svc).join(tip.to_hex())).ok().and_then(|raw| Block::decode(&raw).ok());
+                    if let Some(b) = saved.filter(|b| st.chain.entry(&b.id()).is_none()) {
+                        eprintln!("arc: offering again the block this arcade wrote on {} (it never reached the chain)", &tip.to_hex()[..16]);
+                        written = Some(b);
+                    }
+                }
                 ticket = if wrote.contains(&tip) { None } else { st.chain.ticket(&secret, seed.as_ref()).map(|t| (t, seed)) }.map(|(t, seed)| {
                     let likely = crate::arckeep::plausible(t.score, st.chain.storage().total_weight());
                     // A draw that could win the height: the keepers hear of it (one serving every candidate, §6.2).
@@ -853,7 +880,10 @@ fn run_writer_on(node: Arc<Node>, svc: Arc<Svc>, wrote: &mut VecDeque<Hash256>, 
                 ticket = None;
                 continue;
             }
-            written = Some(write_block(&st.chain, &st.pool, &secret, t, pot, seed.clone(), arcade_app::now()));
+            let b = write_block(&st.chain, &st.pool, &secret, t, pot, seed.clone(), arcade_app::now());
+            // The block first, then its parent: a parent is never remembered without the block that was written on it.
+            save_written(&wrote_blocks_dir(&node, &svc), &tip, &b);
+            written = Some(b);
             ticket = None;
             remember(wrote, tip);
         }
@@ -1027,9 +1057,12 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
     for ix in ledger {
         node.chain.add_indexer(p.chain_no, ix).map_err(db_err)?;
     }
-    // The home chain's ledger, carried in (§15 step 19): once, before block 1, when block 0 names a snapshot.
+    reconcile(&node.chain, p, &chain)?;
+    // The home chain's ledger, carried in (§15 step 19): once, after the store is settled on this block 0 (a store
+    // made again for a new block 0 drops every table of the chain: an import before it was wiped on the GX10 and the
+    // JB20B, 2026-11-15), only rows not there yet. The flag's _v2 repairs the arcades that lost it so.
     if let Some(want) = s.genesis.ledger {
-        let done = node.app.store.read(|r| r.get(arcade_app::META, b"arc_ledger_snapshot")).ok().flatten().is_some();
+        let done = node.app.store.read(|r| r.get(arcade_app::META, b"arc_ledger_snapshot_v2")).ok().flatten().is_some();
         if !done {
             // A file the settings name (local test chains), else the one built in with the testnet's settings.
             let text = match &s.ledger_snapshot {
@@ -1042,11 +1075,10 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
                 return Err("the ledger snapshot isn't the one block 0 names".into());
             }
             let n = arcade_ledger::snapshot::import(&node.chain, p, &snap).map_err(db_err)?;
-            node.app.store.write(|w| w.put(arcade_app::META, b"arc_ledger_snapshot", &want)).map_err(|e| e.to_string())?;
+            node.app.store.write(|w| w.put(arcade_app::META, b"arc_ledger_snapshot_v2", &want)).map_err(|e| e.to_string())?;
             eprintln!("arc: the ledger snapshot of {} at block {} carried in: {} tags, {} tokens, {} balances", snap["chain"], snap["height"], n.tags, n.tokens, n.balances);
         }
     }
-    reconcile(&node.chain, p, &chain)?;
     {
         let n = node.clone();
         std::thread::Builder::new()

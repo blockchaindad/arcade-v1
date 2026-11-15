@@ -162,6 +162,8 @@ cmds! {
     "a.follows" Read "tag? | address?" "Who it follows and who follows it (yours when neither).";
     "a.contacts" Wallet "" "Your address book, opened with your key.";
     "a.contact_save" Wallet "id?, name, tag?, addresses, note?" "Save an address book entry (encrypted to your own key).";
+    "a.search" Read "q" "Published profiles and @tags matching a name or @tag, for the address book.";
+    "a.contact_add" Wallet "tag | address" "Add someone to your address book from their published profile.";
     "a.contact_delete" Wallet "id" "Remove an address book entry.";
     "a.post" Wallet "text" "Post to your followers on the ARCADE chain.";
     "a.posts" Read "tag? | address? | following?, limit?" "Posts, newest first.";

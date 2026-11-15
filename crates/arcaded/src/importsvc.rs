@@ -72,7 +72,7 @@ fn key_of(p: &ChainParams, secret: &str, kind: &str) -> Result<(SecretKey, bool,
     Ok((sk, compressed, "wif"))
 }
 
-fn list_raw(node: &Node) -> Vec<Value> {
+pub(crate) fn list_raw(node: &Node) -> Vec<Value> {
     node.app.imported_key(LIST).ok().flatten().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
 
