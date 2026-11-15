@@ -40,9 +40,13 @@ pub fn list(node: &Node) -> Value {
     let mut out = vec![json!({"id": "", "own": true, "active": active.is_empty(), "tag": own_tag(node)})];
     for a in list_raw(node) {
         let mut a = a;
+        // Its @handle, read from the chain by its address. Never by switching to the account for a moment
+        // (with_account): the list is drawn on every refresh, and a send or a sync running meanwhile would act
+        // on the wrong account.
         if a["tag"].is_null() {
-            let id = a["id"].as_str().unwrap_or("").to_string();
-            a["tag"] = json!(with_account(node, &id, || crate::msgsvc::sender_key(node).ok().and_then(|(_, t, _)| t)));
+            if let Some(addr) = a["address"].as_str() {
+                a["tag"] = json!(arcade_ledger::index::tag_of(&node.chain, node.params.chain_no, addr).ok().flatten());
+            }
         }
         a["active"] = json!(a["id"] == active.as_str());
         a["own"] = json!(false);
