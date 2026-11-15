@@ -256,8 +256,9 @@ impl Settings {
                     .map(|x| Some((x[0].as_u64().filter(|v| (1..=params::RULES_KNOWN as u64).contains(v))? as u32, x[1].as_u64()?)))
                     .collect::<Option<_>>()
                     .ok_or("settings: rules must be [version, height] pairs of versions this arcade knows")?;
-                if list.first() != Some(&(1, 0)) || list.windows(2).any(|w| w[1].0 <= w[0].0 || w[1].1 <= w[0].1) {
-                    return Err("settings: rules start with [1, 0], versions and heights rising".into());
+                // From block 0 (any version: the testnet restarted 2026-11-15 on version 3 from 0), rising.
+                if list.first().map(|f| f.1) != Some(0) || list.windows(2).any(|w| w[1].0 <= w[0].0 || w[1].1 <= w[0].1) {
+                    return Err("settings: rules start at height 0, versions and heights rising".into());
                 }
                 // Read once per arcade; the rules are 'static as the built-in networks' are.
                 Some(&*Box::leak(list.into_boxed_slice()))
@@ -2374,7 +2375,8 @@ mod tests {
     use arcade_ledger::address::base58check;
     use secp256k1::{PublicKey, Secp256k1, SecretKey};
 
-    const NET: Net = params::TESTNET;
+    // The testnet as it ran before its 2026-11-15 restart (rules 1, then 2 from 1,065): what these tests were written for.
+    const NET: Net = Net { rules: &[(1, 0), (2, 1_065)], ..params::TESTNET };
 
     /// The testnet built into V1.0 reads, and its genesis list holds.
     #[test]

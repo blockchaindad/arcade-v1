@@ -184,9 +184,9 @@ pub const TESTNET: Net = Net {
     // The main network's, and the other test chains: small, so cheap to try things on.
     listed: &["arctest", "pep", "peptest", "doge", "dgb", "dgbtest", "flop", "wjk", "kot", "ltc", "ltctest", "btc"],
     block_seconds: BLOCK_SECONDS,
-    // Version 2 (time keepers, the writer's share) from block 1,065 (Martin 2026-11-14: "we need this stuff now",
-    // "1065"; was 2,200).
-    rules: &[(1, 0), (2, 1_065)],
+    // Restarted 2026-11-15 (Martin: "restart + carry ledger"): version 3 (blobs, the tenth with its challenge window, on
+    // top of version 2's time keepers and writer's share) from block 0. The chain before ran 1 from 0 and 2 from 1,065.
+    rules: &[(3, 0)],
     audit_period: AUDIT_PERIOD_BLOCKS,
     blob_window: BLOB_WINDOW,
 };
