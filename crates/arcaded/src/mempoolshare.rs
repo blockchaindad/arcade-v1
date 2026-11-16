@@ -6,6 +6,10 @@
 //!
 //!   {"t": "mp", "net": <net>, "tx": <raw hex>}
 //!
+//! The frame carries the transaction as hex in its head, so one over about 32 KB can't be sent
+//! on a link (MAX_FRAME): it is pooled here and goes to the coin's own peers, but is not passed
+//! between arcades.
+//!
 //! Checks before pooling (a peer can't fill others' pools with junk): parses on that chain, not
 //! a coinbase, at most MAX_TX bytes, not already known, room in the pool (POOL_TXS, POOL_BYTES),
 //! every input spends an unspent coin or a pooled output, no input already spent in the pool, at
@@ -58,8 +62,7 @@ pub fn add(node: &Node, p: &ChainParams, tx: &Tx) -> bool {
     if new && p.chain_no == node.params.chain_no {
         crate::msgsvc::WAKE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    if new && keeps(node, p) && tx.raw.len() <= MAX_TX {
-        let f = json!({"t": "mp", "net": p.net, "tx": hex::encode(&tx.raw)});
+    if let Some(f) = (new && keeps(node, p)).then(|| frame(p.net, &tx.raw)).flatten() {
         with(|r| {
             r.frames.push_back((r.next, f));
             r.next += 1;
@@ -69,6 +72,12 @@ pub fn add(node: &Node, p: &ChainParams, tx: &Tx) -> bool {
         });
     }
     new
+}
+
+/// The `mp` frame for `raw`, or None when it is too big to send on a link (see the top).
+fn frame(net: &str, raw: &[u8]) -> Option<Value> {
+    let f = Frame::new(json!({"t": "mp", "net": net, "tx": hex::encode(raw)}));
+    arcade_mesh::link::fits(&f).then_some(f.head)
 }
 
 /// An `mp` frame from a link.
@@ -277,8 +286,8 @@ pub fn tick(node: &Node, peer: &str, link: &mut Link) -> Result<(), LinkError> {
             let mut pool = node.chain.mempool(p.chain_no).unwrap_or_default();
             // Oldest first, so parents arrive before their children.
             pool.sort_by_key(|x| x.0);
-            for (_, raw) in pool.into_iter().filter(|x| x.1.len() <= MAX_TX).take(SNAPSHOT) {
-                link.send(&Frame::new(json!({"t": "mp", "net": p.net, "tx": hex::encode(raw)})))?;
+            for f in pool.into_iter().filter_map(|x| frame(p.net, &x.1)).take(SNAPSHOT) {
+                link.send(&Frame::new(f))?;
             }
         }
     }
@@ -390,6 +399,24 @@ pub(crate) mod tests {
         let bad = sign_keyhash(t.p, 1, &coins, &[TxOutSpec { value: 2800, script: p2pkh(6) }], &key(), 0).unwrap();
         on_frame(&t.node, &json!({"t": "mp", "net": t.p.net, "tx": hex::encode(&bad.raw)}));
         assert_eq!(t.node.tx_outbox.lock().unwrap().len(), 1, "a double spend of a pooled coin is not sent");
+    }
+
+    #[test]
+    fn a_transaction_too_big_to_send_is_pooled_but_not_shared() {
+        let t = setup_with(|_| {});
+        // The ring is shared by every test here: look for these transactions only.
+        let shared = |raw: &[u8]| with(|r| r.frames.iter().any(|f| f.1["tx"] == hex::encode(raw)));
+        // About 40 KB: under MAX_TX, but its hex is over the frame limit.
+        let big = tx(&[(Hash256([0xb1; 32]), 0)], &[(1, vec![0x6a; 40_000])], 0);
+        assert!(big.raw.len() <= MAX_TX && frame(t.p.net, &big.raw).is_none());
+        assert!(add(&t.node, t.p, &big));
+        assert!(!shared(&big.raw));
+        let pool = t.node.chain.mempool(t.p.chain_no).unwrap();
+        assert!(pool.iter().any(|x| x.1 == big.raw), "kept here");
+        // A normal one still is shared.
+        let small = tx(&[(Hash256([0xb2; 32]), 0)], &[(1, p2pkh(8))], 0);
+        assert!(add(&t.node, t.p, &small));
+        assert!(shared(&small.raw));
     }
 
     #[test]
