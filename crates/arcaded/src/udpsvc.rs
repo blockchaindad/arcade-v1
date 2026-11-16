@@ -376,6 +376,10 @@ fn stun_answers(a: SocketAddr) -> bool {
 
 // ---------------- NAT ----------------
 
+/// STUN servers run by arcades we know by name (the Ashburn relay, DNS only: no proxy, no tunnel), asked when peers'
+/// proofs give fewer than two servers. Looked up at each use.
+const STUN_NAMES: &[&str] = &["ashburn.martinseeger.com:3478"];
+
 fn refresh_nat(node: &Node) {
     let Some(h) = hub(node) else { return };
     let servers: Vec<SocketAddr> = {
@@ -400,6 +404,22 @@ fn refresh_nat(node: &Node) {
         }
         v
     };
+    // Fewer than two servers from peers' proofs (all bare IPs): add our own STUN servers by name, looked up now. On a
+    // network that lets a packet out only to an address it just looked up, the IPs never answer and the node never
+    // learns its public address, so it can't be introduced (@simone_node, @strawberry/arcade-v1 #13). A name is an
+    // extra route, never a dependency: when it doesn't resolve, nothing changes.
+    let mut servers = servers;
+    if servers.len() < 2 {
+        for name in STUN_NAMES {
+            if servers.len() >= 2 {
+                break;
+            }
+            let found = std::net::ToSocketAddrs::to_socket_addrs(name).ok().and_then(|mut it| it.find(|a| a.is_ipv4()));
+            if let Some(a) = found.filter(|a| !servers.iter().any(|s| s.ip() == a.ip())) {
+                servers.push(a);
+            }
+        }
+    }
     if servers.is_empty() {
         return;
     }
