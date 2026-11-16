@@ -11,6 +11,12 @@
 //!    block; then taken in (arcade_chaindb::coreimport::import_coins), each coin checked
 //!    against the transaction at its position in our own blocks. That they are unspent is the
 //!    maker's word ("trusted from <maker>") until step 3.
+//!
+//! A folder import (crate::localcopy, chains.copy_from_dir) is an "all" copy read in place
+//! from a Core datadir on this computer: prepare_local walks its blk files from the coin set's
+//! block back to genesis (that gives the height, and finds a pruned or incomplete folder), takes
+//! its headers from them (checked by proof of work as always), then step 2 and step 3 run as
+//! for any copy. Its folder is only read, never written.
 //! 3. verify (afterwards, in the background): the coin set derived from the blocks again,
 //!    the normal way (in memory, or on disk when that is too big for ARCADE_VERIFY_MB, so every
 //!    coin is covered); equal -> "verified"; different -> ours replaces the copy's, the address
@@ -92,7 +98,11 @@ fn sources<'a>(node: &'a Node, p: &'static ChainParams, max: usize) -> Vec<Box<d
 }
 
 fn best_height(node: &Node, c: u16) -> u32 {
-    node.chain.best_header(c).ok().flatten().and_then(|h| node.chain.header(c, &h).ok().flatten()).map(|r| r.height).unwrap_or(0)
+    best_height_db(&node.chain, c)
+}
+
+fn best_height_db(db: &arcade_chaindb::ChainDb, c: u16) -> u32 {
+    db.best_header(c).ok().flatten().and_then(|h| db.header(c, &h).ok().flatten()).map(|r| r.height).unwrap_or(0)
 }
 
 /// Our own headers up to `h` (each checked as any header sync checks it).
@@ -256,6 +266,16 @@ impl FileSource {
         let pos = main.iter().enumerate().map(|(i, x)| (x.0, i)).collect();
         Ok(FileSource { files, main, pos, fmt: p.format.clone() })
     }
+
+    /// The tip's height, if the files hold its whole chain down to genesis (block 0); else
+    /// the lowest block found (the files lack its parent: pruned or incomplete).
+    pub fn tip_height(&self, genesis: Hash256) -> Result<u32, Hash256> {
+        match self.main.first() {
+            Some(x) if x.0 == genesis => Ok(self.main.len() as u32 - 1),
+            Some(x) => Err(x.0),
+            None => Err(Hash256::ZERO),
+        }
+    }
 }
 
 impl BlockSource for FileSource {
@@ -286,17 +306,17 @@ impl BlockSource for FileSource {
 }
 
 /// Our own headers up to `h` from one source, until it has no more.
-fn headers_from(node: &Node, p: &'static ChainParams, src: &mut dyn BlockSource, h: u32, cancel: &AtomicBool, note: &dyn Fn(String)) -> Result<(), String> {
+fn headers_from(db: &arcade_chaindb::ChainDb, p: &'static ChainParams, src: &mut dyn BlockSource, h: u32, cancel: &AtomicBool, note: &dyn Fn(String)) -> Result<(), String> {
     let c = p.chain_no;
-    let syncer = Syncer::new(&node.chain, p);
-    if node.chain.tip(c).ok().flatten().is_none() {
+    let syncer = Syncer::new(db, p);
+    if db.tip(c).ok().flatten().is_none() {
         let _ = syncer.ensure_genesis(src);
     }
     loop {
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
         }
-        let at = best_height(node, c);
+        let at = best_height_db(db, c);
         if at >= h {
             return Ok(());
         }
@@ -311,7 +331,7 @@ fn headers_from(node: &Node, p: &'static ChainParams, src: &mut dyn BlockSource,
 
 /// Index the blk files of a copy: block hash -> (file, offset, length).
 pub fn index_blk_files(dir: &Path, p: &ChainParams) -> Result<(Vec<std::path::PathBuf>, HashMap<Hash256, (usize, u64, u32)>), String> {
-    use std::io::{BufReader, Read, Seek, SeekFrom};
+    use std::io::{BufReader, Read};
     let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
         .map_err(|e| format!("{}: {e}", dir.display()))?
         .flatten()
@@ -321,7 +341,9 @@ pub fn index_blk_files(dir: &Path, p: &ChainParams) -> Result<(Vec<std::path::Pa
     files.sort();
     let mut map = HashMap::new();
     for (fi, f) in files.iter().enumerate() {
-        let mut r = BufReader::with_capacity(4 << 20, std::fs::File::open(f).map_err(|e| e.to_string())?);
+        // Only each record's 88 first bytes are read: a small buffer, kept across the skips
+        // (seek_relative), so a whole chain's files (Dogecoin: ~200 GB) are not read through.
+        let mut r = BufReader::with_capacity(16 << 10, std::fs::File::open(f).map_err(|e| e.to_string())?);
         let len = r.get_ref().metadata().map_err(|e| e.to_string())?.len();
         let mut pos = 0u64;
         while pos + 8 + 80 <= len {
@@ -339,7 +361,7 @@ pub fn index_blk_files(dir: &Path, p: &ChainParams) -> Result<(Vec<std::path::Pa
             let id = p.block_id(&arcade_chain::Header::parse(&h80));
             map.insert(id, (fi, pos + 8, n));
             pos += 8 + n as u64;
-            r.seek(SeekFrom::Start(pos)).map_err(|e| e.to_string())?;
+            r.seek_relative(n as i64 - 80).map_err(|e| e.to_string())?;
         }
     }
     Ok((files, map))
@@ -434,50 +456,131 @@ pub fn run(node: Arc<Node>, key: String) {
     }
 }
 
+/// Step 1 of a folder import (crate::localcopy): the folder checked again (Core may have been
+/// started since), its blk files walked from the coin set's block down to genesis, and our
+/// headers taken from them (checked by proof of work as any header is). Then step 2 (run).
+pub fn prepare_local(node: Arc<Node>, key: String) {
+    let r = (|| -> Result<(), String> {
+        let (sn, _, _, _, cancel) = crate::coreboot::job_info(&key).ok_or("no job")?;
+        let src = crate::coreboot::job_src(&key).ok_or("not a folder import")?;
+        crate::coreboot::set_prep(&key, "waiting for the chain to stand still");
+        if !crate::coreboot::wait_parked(&key, &node, Duration::from_secs(1800)) {
+            return Err("the chain's sync did not stop".into());
+        }
+        let p = params(&key);
+        // Notes only (set_prep): the job stays in its "copy" phase until step 2 takes it.
+        let set = |d: String| crate::coreboot::set_prep(&key, &d);
+        let ld = crate::localcopy::check_datadir(&src, p)?;
+        if sn["hash"].as_str() != Some(ld.best.to_hex().as_str()) {
+            return Err(format!("the folder's coin set moved to {} since the import was started (was Core run?); start it again", ld.best));
+        }
+        let (h, mut fs) = local_tip(&ld, p, &set)?;
+        crate::coreboot::set_local_manifest(&key, json!({"height": h, "hash": ld.best.to_hex(), "maker": crate::coreboot::LOCAL,
+            "from": ld.dir.display().to_string(), "utxo": null}));
+        if best_height(&node, p.chain_no) < h {
+            headers_from(&node.chain, p, &mut fs, h, &cancel, &set)?;
+        }
+        crate::coreboot::set_prep(&key, "done");
+        Ok(())
+    })();
+    match r {
+        Ok(()) => crate::coreboot::set_prepared(&key),
+        Err(e) => {
+            if crate::coreboot::job_info(&key).is_some_and(|j| !j.4.load(Ordering::Relaxed)) {
+                crate::coreboot::fail(&node, &key, &e);
+            }
+        }
+    }
+}
+
+/// A checked folder's tip height and its blk files as a header source: the chain from the coin
+/// set's block must reach genesis in the files (else pruned or incomplete: refused).
+pub fn local_tip(ld: &crate::localcopy::LocalDir, p: &'static ChainParams, note: &dyn Fn(String)) -> Result<(u32, FileSource), String> {
+    note(format!("indexing the block files in {} (headers only)", ld.dir.display()));
+    let fs = FileSource::open(&ld.dir.join("blocks"), p, ld.best)?;
+    let h = fs.tip_height(p.genesis_hash()).map_err(|low| {
+        format!("the folder's block files lack the parent of block {low}: pruned or incomplete (Core's -reindex would show it); every block is needed")
+    })?;
+    Ok((h, fs))
+}
+
 fn take_in(node: &Node, key: &str) -> Result<String, String> {
     let (sn, manifest, what, dir, cancel) = crate::coreboot::job_info(key).ok_or("no job")?;
     let manifest = manifest.ok_or("no manifest")?;
     let p = params(key);
-    let c = p.chain_no;
     let h = manifest["height"].as_u64().ok_or("manifest without height")? as u32;
     let hash = Hash256::from_hex(manifest["hash"].as_str().unwrap_or("")).map_err(|_| "manifest without tip hash")?;
     let set = |ph: &str, d: String| crate::coreboot::set_phase(key, ph, &d);
     if !crate::coreboot::wait_parked(key, node, Duration::from_secs(1800)) {
         return Err("the chain's sync did not stop".into());
     }
-    let data = dir.join("data");
-    if what == "all" && best_height(node, c) < h {
+    // A mesh copy's pieces are in our staging folder; a folder import reads the folder itself.
+    let src = crate::coreboot::job_src(key);
+    let data = src.clone().unwrap_or_else(|| dir.join("data"));
+    if let Some(d) = &src {
+        crate::localcopy::check_not_running(d)?;
+    }
+    let maker = manifest["maker"].as_str().unwrap_or("").to_string();
+    let mut trusted = json!({"maker": maker, "height": h, "hash": hash.to_hex(), "snap": sn["id"], "at": arcade_app::now()});
+    if let Some(d) = &src {
+        trusted["from"] = json!(d.display().to_string());
+    }
+    let mut more_headers = || headers_to(node, p, h, &cancel, &|s| set("import", s));
+    take_in_db(&node.chain, p, &data, &what, h, hash, &manifest["utxo"], trusted, &dir.join("sort"), &cancel, &set, &mut more_headers)
+}
+
+/// Step 2 on a chain database: `data` holds the copy's (or the folder's) blocks/ and
+/// chainstate/. Our headers to the copy's height ("all": from its blk files first, then
+/// `more_headers`), its tip on our own header chain, its blocks ("all"), the tx index of the
+/// new blocks, the coin set (its best block, the summary if any), each coin checked against
+/// our blocks, the set marked trusted (`trusted` + coins and layout).
+#[allow(clippy::too_many_arguments)]
+pub fn take_in_db(
+    db: &arcade_chaindb::ChainDb,
+    p: &'static ChainParams,
+    data: &Path,
+    what: &str,
+    h: u32,
+    hash: Hash256,
+    utxo: &Value,
+    mut trusted: Value,
+    tmp: &Path,
+    cancel: &AtomicBool,
+    set: &dyn Fn(&str, String),
+    more_headers: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<String, String> {
+    let c = p.chain_no;
+    if what == "all" && best_height_db(db, c) < h {
         set("import", "headers from the copy's block files".into());
         let mut src = FileSource::open(&data.join("blocks"), p, hash)?;
-        headers_from(node, p, &mut src, h, &cancel, &|s| set("import", s))?;
-        if best_height(node, c) < h {
-            headers_to(node, p, h, &cancel, &|s| set("import", s))?;
+        headers_from(db, p, &mut src, h, cancel, &|s| set("import", s))?;
+        if best_height_db(db, c) < h {
+            more_headers()?;
         }
     }
-    let tip = node.chain.tip(c).map_err(|e| e.to_string())?.ok_or("no genesis yet")?;
+    let tip = db.tip(c).map_err(|e| e.to_string())?.ok_or("no genesis yet")?;
     if tip.height >= h {
         return Ok(format!("{}: already at {} (past the copy's {h}); copy not needed", p.name, tip.height));
     }
     // The copy's tip must be our own header at its height.
-    let path = node.chain.header_path(c, tip.height + 1, h).map_err(|e| e.to_string())?;
+    let path = db.header_path(c, tip.height + 1, h).map_err(|e| e.to_string())?;
     if path.last() != Some(&hash) {
         return Err(format!("the copy's tip {hash} at {h} is not on our own header chain; refused"));
     }
-    if node.chain.header(c, &path[0]).map_err(|e| e.to_string())?.map(|r| r.header.prev) != Some(tip.hash) {
+    if db.header(c, &path[0]).map_err(|e| e.to_string())?.map(|r| r.header.prev) != Some(tip.hash) {
         return Err("our tip is not on our best header chain (a reorg?); try again later".into());
     }
     if what == "all" {
         set("import", "blocks from the copy's files".into());
-        blocks_from_files(&node.chain, p, &data.join("blocks"), &path, &cancel, &|s| set("import", s))?;
+        blocks_from_files(db, p, &data.join("blocks"), &path, cancel, &|s| set("import", s))?;
     }
-    let bs: Vec<u32> = path.iter().map(|h| node.chain.stored_b(c, h).ok().flatten().unwrap_or(0)).collect();
+    let bs: Vec<u32> = path.iter().map(|h| db.stored_b(c, h).ok().flatten().unwrap_or(0)).collect();
     if let Some(i) = bs.iter().position(|b| *b == 0) {
         return Err(format!("block at height {} is not stored", tip.height + 1 + i as u32));
     }
-    let tmp = dir.join("sort");
     set("import", "transaction index of the new blocks".into());
     let mut note = |s: String| set("import", s);
-    node.chain.write_txs_for(p, &bs, &tmp, &cancel, &mut note).map_err(|e| e.to_string())?;
+    db.write_txs_for(p, &bs, tmp, cancel, &mut note).map_err(|e| e.to_string())?;
     // The coin set: its best block and the manifest's summary first.
     let cs_dir = data.join("chainstate");
     set("import", "reading the coin set".into());
@@ -485,21 +588,23 @@ fn take_in(node: &Node, key: &str) -> Result<String, String> {
     if best != Some(hash) {
         return Err(format!("the coin set is at {:?}, not the copy's tip {hash}", best.map(|b| b.to_hex())));
     }
-    check_summary(&manifest["utxo"], n, sum)?;
-    let maker = manifest["maker"].as_str().unwrap_or("").to_string();
-    let trusted = json!({"maker": maker, "height": h, "hash": hash.to_hex(), "snap": sn["id"], "at": arcade_app::now(), "coins": n, "layout": layout.map(|l| l.name())}).to_string();
+    check_summary(utxo, n, sum)?;
+    let maker = trusted["maker"].as_str().unwrap_or("").to_string();
+    trusted["coins"] = json!(n);
+    trusted["layout"] = json!(layout.map(|l| l.name()));
+    let trusted = trusted.to_string();
     let mut cs = Chainstate::open(&cs_dir)?;
     let mut next = || -> Result<Option<ImportCoin>, String> {
         Ok(cs.next_coin()?.map(|k| ImportCoin { txid: k.txid, vout: k.vout, value: k.value, height: k.height, coinbase: k.coinbase, script: k.script }))
     };
     let t0 = std::time::Instant::now();
-    crate::coreboot::set_phase(key, "coins", "taking in the coin set");
+    set("coins", "taking in the coin set".into());
     let mut note = |s: String| set("coins", s);
-    let rep = node.chain.import_coins(p, &path, h, &mut next, &trusted, &tmp, &AtomicBool::new(false), &mut note).map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_dir_all(&tmp);
+    let rep = db.import_coins(p, &path, h, &mut next, &trusted, tmp, &AtomicBool::new(false), &mut note).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_dir_all(tmp);
     Ok(format!(
-        "{}: coin set taken in at {h} from a copy made by arcade {} ({} coins, {} kept; {} unchanged, {} added, {} removed, {} changed; {:.0}s; {}). Trusted until re-checked.",
-        p.name, crate::coreboot::short(&maker), rep.read, rep.kept, rep.diff.same, rep.diff.added, rep.diff.removed, rep.diff.changed, t0.elapsed().as_secs_f64(),
+        "{}: coin set taken in at {h} from {} ({} coins, {} kept; {} unchanged, {} added, {} removed, {} changed; {:.0}s; {}). Trusted until re-checked.",
+        p.name, crate::coreboot::who(&maker), rep.read, rep.kept, rep.diff.same, rep.diff.added, rep.diff.removed, rep.diff.changed, t0.elapsed().as_secs_f64(),
         layout.map(|l| l.name()).unwrap_or("?")
     ))
 }
@@ -578,12 +683,12 @@ fn verify(node: &Arc<Node>, key: &str) -> Result<(), String> {
     let r = r?;
     let how = if r.on_disk { format!(" (on disk: more than ARCADE_VERIFY_MB, {} MB, in memory)", verify_budget() >> 20) } else { String::new() };
     if !r.replaced {
-        let _ = node.app.event("chains", &format!("{}: the coin set from arcade {} re-checked from the blocks up to {}{how}: it matches ({} coins). Verified.", p.name, crate::coreboot::short(&maker), r.tip, r.diff.same));
+        let _ = node.app.event("chains", &format!("{}: the coin set from {} re-checked from the blocks up to {}{how}: it matches ({} coins). Verified.", p.name, crate::coreboot::who(&maker), r.tip, r.diff.same));
         return Ok(());
     }
     let _ = node.app.event("chains", &format!(
-        "{}: the coin set from arcade {} does NOT match the blocks ({} missing, {} extra, {} different coins){how}; it was replaced by this arcade's own, and the address rows are built again",
-        p.name, maker, r.diff.added, r.diff.removed, r.diff.changed
+        "{}: the coin set from {} does NOT match the blocks ({} missing, {} extra, {} different coins){how}; it was replaced by this arcade's own, and the address rows are built again",
+        p.name, if maker == crate::coreboot::LOCAL { crate::coreboot::who(&maker) } else { format!("arcade {maker}") }, r.diff.added, r.diff.removed, r.diff.changed
     ));
     Ok(())
 }
@@ -719,9 +824,14 @@ mod tests {
         Tx::parse(&o).unwrap()
     }
 
-    fn block(prev: Hash256, txs: Vec<Tx>, time: u32) -> Block {
+    /// With `mine`, the nonce is ground until the header meets its target (scrypt), so the
+    /// header sync's proof-of-work check passes as for a real chain.
+    fn block_mined(prev: Hash256, txs: Vec<Tx>, time: u32, mine: bool) -> Block {
         let ids: Vec<_> = txs.iter().map(|t| t.txid).collect();
-        let header = Header { version: 1, prev, merkle_root: merkle_root(&ids), time, bits: 0x207fffff, nonce: 0 };
+        let mut header = Header { version: 1, prev, merkle_root: merkle_root(&ids), time, bits: 0x207fffff, nonce: 0 };
+        while mine && !arcade_chain::pow::meets_target(&arcade_chain::pow::pow_hash(arcade_chain::pow::PowAlgo::Scrypt, &header.encode()), header.bits) {
+            header.nonce += 1;
+        }
         let mut raw = header.encode().to_vec();
         write_varint(&mut raw, txs.len() as u64);
         for t in &txs {
@@ -731,7 +841,13 @@ mod tests {
     }
 
     fn chain(n: u32) -> Vec<Block> {
-        let mut out = vec![block(Hash256::ZERO, vec![tx(&[], &[(50, script(0, 0))], 0)], 1)];
+        chain_with(n, false)
+    }
+
+    /// `mine`: real proof of work and times a minute apart (for a header sync).
+    fn chain_with(n: u32, mine: bool) -> Vec<Block> {
+        let t = |h: u32| if mine { 1_600_000_000 + 60 * h } else { 1 + h };
+        let mut out = vec![block_mined(Hash256::ZERO, vec![tx(&[], &[(50, script(0, 0))], 0)], t(0), mine)];
         let mut live: Vec<(Hash256, u32, u64)> = Vec::new();
         for h in 1..=n {
             let cb = tx(&[], &[(10_000 + h as u64, script(h as u8, h as u8)), (7, script(200, 2))], h);
@@ -748,7 +864,7 @@ mod tests {
                 live.push((cb.txid, v as u32, o.value));
             }
             let prev = out.last().unwrap().hash();
-            out.push(block(prev, txs, 1 + h));
+            out.push(block_mined(prev, txs, t(h), mine));
         }
         out
     }
@@ -923,6 +1039,253 @@ mod tests {
             assert_eq!(v["replaced"] == true, replaced);
             assert!(db.scan_all(arcade_chaindb::schema::OUTPUTS).unwrap() == reference.scan_all(arcade_chaindb::schema::OUTPUTS).unwrap());
         }
+    }
+
+    /// Params for a mined made-up chain: no coin rules, an easy target, no checkpoints.
+    fn mined_params(g: &Block) -> &'static ChainParams {
+        let mut pp = arcade_chain::params::PEPECOIN_TEST.clone();
+        pp.value_rules = None;
+        pp.genesis = Box::leak(g.hash().to_hex().into_boxed_str());
+        pp.genesis_header = "";
+        pp.format = arcade_chain::Format::BITCOIN;
+        pp.pow_limit_bits = 0x207fffff;
+        pp.digishield_from = None;
+        pp.checkpoints = &[];
+        // Made-up spends (no signatures): no script or block rules either.
+        pp.block_rules = None;
+        Box::leak(Box::new(pp))
+    }
+
+    /// The coins a Core node at the chain's tip holds (from a chain synced block by block).
+    fn core_coins(reference: &ChainDb, p: &'static ChainParams, blocks: &[Block]) -> Vec<crate::corecoins::CoreCoin> {
+        let mut coins = Vec::new();
+        for (h, b) in blocks.iter().enumerate() {
+            for t in &b.txs {
+                for v in 0..t.outputs.len() as u32 {
+                    if let Some(k) = reference.coin(p, &arcade_chain::OutPoint { txid: t.txid, vout: v }).unwrap() {
+                        coins.push(crate::corecoins::CoreCoin { txid: t.txid, vout: v, value: k.value, height: h as u32, coinbase: k.coinbase, script: k.script });
+                    }
+                }
+            }
+        }
+        coins.sort_by(|a, b| (a.txid.0, a.vout).cmp(&(b.txid.0, b.vout)));
+        coins
+    }
+
+    /// A stopped Core node's datadir as it lies on disk: blk files in arrival order (two
+    /// files, zero padding), the coin set (obfuscated), the lock files Core leaves behind,
+    /// a wallet, a conf and peers.dat (which must never be read or touched). `skip`: blocks
+    /// left out of the files.
+    fn core_datadir(dir: &std::path::Path, p: &'static ChainParams, blocks: &[Block], coins: &[crate::corecoins::CoreCoin], skip: &[usize]) {
+        let tip = blocks.last().unwrap().hash();
+        crate::corecoins::fixture::write_chainstate(&dir.join("chainstate"), coins, tip, [3, 1, 4, 1, 5, 9, 2, 6], crate::corecoins::Layout::PerTx);
+        std::fs::create_dir_all(dir.join("blocks").join("index")).unwrap();
+        let mut order: Vec<usize> = (0..blocks.len()).filter(|i| !skip.contains(i)).collect();
+        order.swap(4, 10);
+        order.swap(13, 21);
+        for (fi, part) in order.chunks(17).enumerate() {
+            let mut f = Vec::new();
+            for &i in part {
+                let raw = blocks[i].encode();
+                f.extend_from_slice(&p.magic);
+                f.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+                f.extend_from_slice(&raw);
+            }
+            f.extend(std::iter::repeat_n(0u8, 2048));
+            std::fs::write(dir.join("blocks").join(format!("blk{fi:05}.dat")), f).unwrap();
+        }
+        std::fs::write(dir.join("blocks").join("rev00000.dat"), [0u8; 64]).unwrap();
+        for f in [dir.join(".lock"), dir.join("chainstate").join("LOCK"), dir.join("blocks").join("index").join("LOCK")] {
+            std::fs::write(f, b"").unwrap();
+        }
+        std::fs::create_dir_all(dir.join("wallets")).unwrap();
+        std::fs::write(dir.join("wallet.dat"), b"secret wallet").unwrap();
+        std::fs::write(dir.join("wallets").join("wallet.dat"), b"secret wallet").unwrap();
+        std::fs::write(dir.join("dogecoin.conf"), b"txindex=1\n").unwrap();
+        std::fs::write(dir.join("peers.dat"), b"peers").unwrap();
+    }
+
+    /// Every file under `dir`: (path, size, modified, sha256) — to show nothing was written.
+    fn snapshot(dir: &std::path::Path) -> Vec<(std::path::PathBuf, u64, std::time::SystemTime, String)> {
+        use sha2::Digest;
+        let mut out = Vec::new();
+        let mut todo = vec![dir.to_path_buf()];
+        while let Some(d) = todo.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let m = e.metadata().unwrap();
+                if m.is_dir() {
+                    todo.push(e.path());
+                } else {
+                    out.push((e.path(), m.len(), m.modified().unwrap(), hex::encode(sha2::Sha256::digest(std::fs::read(e.path()).unwrap()))));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// "Take it from this folder": a stopped Core node's datadir on this computer, read in
+    /// place, taken in by a fresh arcade (only genesis) and by one synced part of the way.
+    /// The headers come from the blk files and pass the proof-of-work check; the result equals
+    /// a chain synced block by block (coins, transactions, heights, balances); the set is
+    /// trusted, then the re-check from the blocks finds it matches and marks it verified; and
+    /// the folder is byte for byte as it was (wallets, conf and lock files included).
+    #[test]
+    fn folder_import_end_to_end() {
+        let d = tempfile::tempdir().unwrap();
+        let blocks = chain_with(30, true);
+        let p = mined_params(&blocks[0]);
+        let c = p.chain_no;
+        let reference = ChainDb::open(d.path().join("ref.mdbx")).unwrap();
+        reference.connect_blocks(p, &blocks).unwrap();
+        let coins = core_coins(&reference, p, &blocks);
+        let core = d.path().join("Dogecoin");
+        core_datadir(&core, p, &blocks, &coins, &[]);
+        let before = snapshot(&core);
+        let tip = blocks.last().unwrap().hash();
+        // What the operator typed (the blocks folder, a trailing separator) still finds it.
+        let ld = crate::localcopy::check_datadir(&crate::localcopy::normalize(&format!("{}/blocks/", core.display())), p).unwrap();
+        assert_eq!((ld.dir.clone(), ld.best, ld.blk_files), (core.clone(), tip, 2));
+        let (h, _) = local_tip(&ld, p, &|_| {}).unwrap();
+        assert_eq!(h, 30);
+        for upto in [0usize, 11] {
+            let dir = d.path().join(format!("x{upto}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = ChainDb::open(dir.join("chain.mdbx")).unwrap();
+            db.connect_blocks(p, &blocks[..=upto]).unwrap();
+            let stop = AtomicBool::new(false);
+            let trusted = json!({"maker": crate::coreboot::LOCAL, "height": h, "hash": tip.to_hex(), "from": core.display().to_string()});
+            let mut no_net = || -> Result<(), String> { Err("no network in this test: the headers must come from the files".into()) };
+            let text = take_in_db(&db, p, &ld.dir, "all", h, tip, &Value::Null, trusted, &dir.join("sort"), &stop, &|_, _| {}, &mut no_net).unwrap();
+            assert!(text.contains("this computer's Core folder") && text.contains("Trusted until re-checked"), "{text}");
+            assert_eq!(db.tip(c).unwrap(), reference.tip(c).unwrap());
+            for t in [arcade_chaindb::schema::OUTPUTS, arcade_chaindb::schema::TXS, arcade_chaindb::schema::HEIGHT] {
+                let a = db.store(c).read(|r| r.scan_prefix(t, b"")).unwrap();
+                let b = reference.store(c).read(|r| r.scan_prefix(t, b"")).unwrap();
+                assert!(a == b, "{t} from {upto}");
+            }
+            let tv: Value = serde_json::from_str(&db.state_text(c, TRUSTED).unwrap().unwrap()).unwrap();
+            assert_eq!((tv["maker"].as_str(), tv["coins"].as_u64()), (Some("local"), Some(coins.len() as u64)));
+            assert!(db.build_addresses(p, &dir.join("sort"), &stop, &mut |_| {}).unwrap());
+            for k in 0..=31u8 {
+                for kind in 0..4 {
+                    let s = script(k, kind);
+                    assert_eq!(db.balance_for_script(c, &s).unwrap(), reference.balance_for_script(c, &s).unwrap());
+                }
+            }
+            // Step 3, as after a mesh copy: derived again from the blocks; it matches.
+            let r = recheck(&db, p, 64 << 20, &dir.join("verify"), false, "local", &mut |_| {}, &mut || Ok(())).unwrap();
+            assert!(!r.replaced);
+            assert!(db.state_text(c, TRUSTED).unwrap().is_none());
+            assert!(db.state_text(c, VERIFIED).unwrap().is_some());
+        }
+        assert!(snapshot(&core) == before, "the Core folder was written to");
+    }
+
+    /// A folder whose coin set keeps a coin the chain spent: taken in (trusted: every coin is
+    /// a real output of our blocks), then the re-check from the blocks replaces it with ours.
+    #[test]
+    fn folder_import_with_a_wrong_coin_set_is_replaced_by_the_recheck() {
+        let d = tempfile::tempdir().unwrap();
+        let blocks = chain_with(30, true);
+        let p = mined_params(&blocks[0]);
+        let c = p.chain_no;
+        let reference = ChainDb::open(d.path().join("ref.mdbx")).unwrap();
+        reference.connect_blocks(p, &blocks).unwrap();
+        let mut coins = core_coins(&reference, p, &blocks);
+        // A spent output put back.
+        let spent = blocks.iter().enumerate().skip(1).find_map(|(h, b)| {
+            b.txs.iter().find_map(|t| t.outputs.iter().enumerate().find_map(|(v, o)| {
+                let op = arcade_chain::OutPoint { txid: t.txid, vout: v as u32 };
+                (reference.coin(p, &op).unwrap().is_none() && !arcade_chaindb::db::is_unspendable(o.value, &o.script_pubkey))
+                    .then(|| crate::corecoins::CoreCoin { txid: t.txid, vout: v as u32, value: o.value, height: h as u32, coinbase: t.is_coinbase(), script: o.script_pubkey.clone() })
+            }))
+        }).unwrap();
+        coins.push(spent);
+        coins.sort_by(|a, b| (a.txid.0, a.vout).cmp(&(b.txid.0, b.vout)));
+        let core = d.path().join("core");
+        core_datadir(&core, p, &blocks, &coins, &[]);
+        let ld = crate::localcopy::check_datadir(&core, p).unwrap();
+        let (h, _) = local_tip(&ld, p, &|_| {}).unwrap();
+        let db = ChainDb::open(d.path().join("x.mdbx")).unwrap();
+        db.connect_blocks(p, &blocks[..=0]).unwrap();
+        let stop = AtomicBool::new(false);
+        let mut no_net = || -> Result<(), String> { Err("no network".into()) };
+        take_in_db(&db, p, &core, "all", h, ld.best, &Value::Null, json!({"maker": "local"}), &d.path().join("sort"), &stop, &|_, _| {}, &mut no_net).unwrap();
+        assert!(db.state_text(c, TRUSTED).unwrap().is_some());
+        let r = recheck(&db, p, 64 << 20, &d.path().join("verify"), false, "local", &mut |_| {}, &mut || Ok(())).unwrap();
+        assert!(r.replaced);
+        assert!(db.scan_all(arcade_chaindb::schema::OUTPUTS).unwrap() == reference.scan_all(arcade_chaindb::schema::OUTPUTS).unwrap());
+    }
+
+    /// The source folder is a RUNNING Core node's datadir: its locks are held, so the import
+    /// is refused before anything is read, with the advice to stop Core first; once Core is
+    /// stopped (locks let go) the same folder is accepted. Pruned or incomplete folders are
+    /// refused too.
+    #[test]
+    fn folder_import_refuses_a_running_core_and_a_pruned_folder() {
+        let d = tempfile::tempdir().unwrap();
+        let blocks = chain_with(30, true);
+        let p = mined_params(&blocks[0]);
+        let reference = ChainDb::open(d.path().join("ref.mdbx")).unwrap();
+        reference.connect_blocks(p, &blocks).unwrap();
+        let coins = core_coins(&reference, p, &blocks);
+        let core = d.path().join("core");
+        core_datadir(&core, p, &blocks, &coins, &[]);
+        let before = snapshot(&core);
+        for lock in crate::localcopy::lock_files(&core) {
+            // As Core holds them while it runs (exclusively).
+            let held = std::fs::OpenOptions::new().read(true).write(true).open(&lock).unwrap();
+            held.lock().unwrap();
+            let e = crate::localcopy::check_datadir(&core, p).unwrap_err();
+            assert!(e.contains("Core node is running") && e.contains("Stop it first"), "{e}");
+            assert!(crate::localcopy::check_not_running(&core).is_err());
+            held.unlock().unwrap();
+        }
+        assert!(crate::localcopy::check_datadir(&core, p).is_ok(), "stopped: accepted");
+        assert!(snapshot(&core) == before, "asking about the locks wrote nothing");
+        // Pruned: Core's flag in the block index.
+        let pruned = d.path().join("pruned");
+        core_datadir(&pruned, p, &blocks, &coins, &[]);
+        let idx = pruned.join("blocks").join("index");
+        let mut k = vec![b'F', 16];
+        k.extend_from_slice(b"prunedblockfiles");
+        crate::leveldb::write::folder(&idx, &[], 3, &[crate::leveldb::write::batch(1, &[(k, Some(b"1".to_vec()))])]);
+        assert!(crate::localcopy::check_datadir(&pruned, p).unwrap_err().contains("pruned"));
+        // Pruned without the flag: the first file is gone.
+        let gone = d.path().join("gone");
+        core_datadir(&gone, p, &blocks, &coins, &[]);
+        std::fs::remove_file(gone.join("blocks").join("blk00000.dat")).unwrap();
+        assert!(crate::localcopy::check_datadir(&gone, p).unwrap_err().contains("blk00000.dat"));
+        // A block missing in the middle: the walk from the tip stops above it.
+        let hole = d.path().join("hole");
+        core_datadir(&hole, p, &blocks, &coins, &[7]);
+        let ld = crate::localcopy::check_datadir(&hole, p).unwrap();
+        let e = local_tip(&ld, p, &|_| {}).err().unwrap();
+        assert!(e.contains("pruned or incomplete") && e.contains(&blocks[8].hash().to_hex()), "{e}");
+        // Headers that miss their target (not mined): refused by the header sync's proof-of-work
+        // check, so nothing is taken in.
+        let weak = chain_with(30, false);
+        let wp = mined_params(&weak[0]);
+        let wref = ChainDb::open(d.path().join("wref.mdbx")).unwrap();
+        wref.connect_blocks(wp, &weak).unwrap();
+        let wdir = d.path().join("weak");
+        core_datadir(&wdir, wp, &weak, &core_coins(&wref, wp, &weak), &[]);
+        let wld = crate::localcopy::check_datadir(&wdir, wp).unwrap();
+        let (wh, _) = local_tip(&wld, wp, &|_| {}).unwrap();
+        let db = ChainDb::open(d.path().join("w.mdbx")).unwrap();
+        db.connect_blocks(wp, &weak[..=0]).unwrap();
+        let mut no_net = || -> Result<(), String> { Err("no network".into()) };
+        let e = take_in_db(&db, wp, &wdir, "all", wh, wld.best, &Value::Null, json!({"maker": "local"}), &d.path().join("wsort"), &AtomicBool::new(false), &|_, _| {}, &mut no_net).unwrap_err();
+        assert!(e.contains("proof of work does not meet target"), "{e}");
+        assert!(db.state_text(wp.chain_no, TRUSTED).unwrap().is_none());
+        assert_eq!(db.tip(wp.chain_no).unwrap().unwrap().height, 0);
+        // Another chain's folder: its genesis isn't ours.
+        let other = mined_params(&chain_with(1, true)[0]);
+        let mut o = other.clone();
+        o.genesis = Box::leak(Hash256([7; 32]).to_hex().into_boxed_str());
+        let o: &'static ChainParams = Box::leak(Box::new(o));
+        assert!(crate::localcopy::check_datadir(&core, o).unwrap_err().contains("another chain"));
     }
 
     #[test]

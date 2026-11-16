@@ -781,7 +781,11 @@ pub fn status(node: &Node, key: &str) -> Result<Value, String> {
         let phase = j["phase"].as_str().unwrap_or("");
         let fetched = matches!(phase, "import" | "coins") || (bytes > 0 && done >= bytes);
         let pct_copy = if fetched { 100.0 } else if bytes == 0 { 0.0 } else { done as f64 * 100.0 / bytes as f64 };
-        let detail = if phase == "manifest" {
+        let local = j["from_dir"].as_str();
+        let pct_copy = if local.is_some() { 100.0 } else { pct_copy };
+        let detail = if let (Some(d), false) = (local, phase == "failed") {
+            format!("read in place from this computer's Core folder {d} (never written) · blocks too")
+        } else if phase == "manifest" {
             format!("asking for the copy's list of pieces · from arcade {}", crate::coreboot::short(j["maker"].as_str().unwrap_or("")))
         } else if phase == "failed" {
             format!("failed: {}", j["detail"].as_str().unwrap_or(""))
@@ -799,7 +803,7 @@ pub fn status(node: &Node, key: &str) -> Result<Value, String> {
     }
     if let Some(t) = copy.get("trusted").filter(|t| !t.is_null()) {
         let v = crate::cbimport::verify_note(key);
-        let d = format!("trusted coin set from arcade {} at block {}{}", crate::coreboot::short(t["maker"].as_str().unwrap_or("")), t["height"],
+        let d = format!("trusted coin set from {} at block {}{}", crate::coreboot::who(t["maker"].as_str().unwrap_or("")), t["height"],
             if v.is_empty() { " · not re-checked yet".to_string() } else { format!(" · {v}") });
         if let Some(st) = stages.iter_mut().find(|s| s["name"] == "Coins") {
             st["detail"] = json!(d);

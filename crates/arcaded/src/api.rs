@@ -807,6 +807,7 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         // Core-data copies (crate::coreboot)
         "chains.copy_status" => Ok(crate::coreboot::status(node, s("key").as_deref())),
         "chains.copy_start" => crate::coreboot::start(&node.self_arc(), &s("key").ok_or("key required")?, &s("what").unwrap_or_else(|| "coins".into())),
+        "chains.copy_from_dir" => crate::coreboot::start_from_dir(&node.self_arc(), &s("key").ok_or("key required")?, &s("dir").ok_or("dir required (a Core datadir on this computer)")?),
         "chains.copy_cancel" => crate::coreboot::cancel(node, &s("key").ok_or("key required")?),
         "chains.refill" => crate::refill::start(node.self_arc(), &s("key").ok_or("key required")?, req["from"].as_u64(), req["to"].as_u64(), req["sources"].as_u64()),
         "chains.refill_status" => Ok(crate::refill::status(s("key").as_deref())),
