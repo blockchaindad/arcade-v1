@@ -827,6 +827,9 @@ fn serve_loop(
             "ka" => {} // TCP keepalive while frames go over UDP
             // Relayed links (crate::relaysvc): as the relay, or as one side.
             "rl" => crate::relaysvc::on_frame(node, link, &f)?,
+            // Shared models (crate::llmsvc): an answer to our ask over this link (crvia), else an offer or an ask.
+            "lm" if crate::crvia::on_answer(peer, &f) => {}
+            "lm" => crate::llmsvc::on_frame(node, peer, &f),
             "cb" => crate::coreboot::on_frame(node, link, &f)?,
             "vx" => crate::vxshare::on_frame(node, link, &f)?,
             // A blob piece we asked for over this link (crate::arcblob, crvia), else the ARCADE chain's own frames.

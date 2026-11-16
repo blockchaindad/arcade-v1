@@ -81,7 +81,36 @@
   // The ring this window was opened from, if any (arcade.realtime.ringed).
   const ringId = /^[0-9a-f]{16}$/.test(q.get("ring") || "") ? q.get("ring") : "";
 
+  // Shared models (arcade.llm, docs/LLM.md): the app spends this wallet's model credit only after a yes, once a window.
+  let llmYes = false;
   const doors = {
+    async llm(m) {
+      if (m.op === "offers") {
+        const list = await api("llm.offers");
+        return { offers: list.map((o) => ({
+          seller: o.seller, here: o.here, name: o.name || "", tag: o.tag || "", max_out: o.max_out,
+          free: o.models.every((x) => x.free), models: o.models.map((x) => ({ id: x.id })),
+          prices: o.models.map((x) => ({ leg: "arctest", label: "ARCADE per million tokens", model: x.id, in: x.in, out: x.out })),
+          credit: o.credit,
+        })) };
+      }
+      if (m.op === "chat") {
+        const req = m.req || {};
+        if (!llmYes) {
+          const yes = await oneCard(() => card(`Let ${appName} use your model credit?`, [
+            `${appName} asks to send prompts to shared AI models, paid from your ARCADE credit at the sellers (free models cost nothing).`,
+            "It sees the replies; it can't buy more credit or move your coins."], "Allow"));
+          if (!yes) throw new Error("Cancelled.");
+          llmYes = true;
+        }
+        const args = { messages: req.messages, model: req.model || undefined, seller: req.seller || undefined };
+        for (const k of ["max_tokens", "max_completion_tokens", "temperature", "top_p", "stop", "tools", "tool_choice", "response_format", "seed"]) if (req[k] !== undefined) args[k] = req[k];
+        const r = await api("llm.chat", args);
+        return { content: r.content, reasoning: r.reasoning, usage: r.usage, cost: r.cost, left: r.left, seller: r.seller, model: r.model, leg: "arctest" };
+      }
+      if (m.op === "image") throw new Error("pictures aren't shared on this arcade yet");
+      throw new Error("llm ops are offers, chat and image");
+    },
     async node(m) {
       if (m.op === "identity") return await api("apps.node", { op: "identity" });
       if (m.op === "send") return await api("apps.node", { op: "send", page: here, to: String(m.to || ""), body: m.body });
