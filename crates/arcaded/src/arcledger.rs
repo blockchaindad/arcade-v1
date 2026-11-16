@@ -77,6 +77,28 @@ pub fn send(node: &Node, payload: &[u8]) -> Result<(String, u64), String> {
     Ok((txid.to_hex(), fee))
 }
 
+/// This wallet's sending address on ARCADE (its @tag's, else its first): where a relay asks to be paid (relaysvc).
+pub fn own_address(node: &Node) -> Result<String, String> {
+    Ok(sender(node, chain()?)?.0)
+}
+
+/// Pay `value` to `to` on ARCADE with `memo` in the same transaction (an AnyData record, so the payee can tell whose
+/// payment it is): spends confirmed coins and this wallet's change still waiting. Its txid and fee.
+pub fn pay_with_memo(node: &Node, to: &str, value: u64, memo: &[u8]) -> Result<(String, u64), String> {
+    let p = chain()?;
+    let to_script = arcade_ledger::address::script_for_address(p, to).ok_or_else(|| format!("{to} isn't an ARCADE address"))?;
+    let (_, _, sk) = sender(node, p)?;
+    let pk = arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
+    let script = arcade_wallet::keys::p2pkh_script_for(&pk);
+    let mut coins = crate::claims::arc_coins(node, p, &script);
+    coins.extend(crate::arcsvc::waiting_outputs(&script).into_iter().map(|(op, value)| arcade_wallet::tx::Utxo { outpoint: op, value, script: script.clone() }));
+    let tx = arcade_wallet::tx::build_arcade_with(p, &arcade_wallet::tx::any_data(memo), vec![arcade_wallet::tx::TxOutSpec { value, script: to_script }], &sk, &coins,
+        2 * arcade_arc::params::MIN_FEE_PER_KB, arcade_arc::params::DUST, arcade_app::now() as u32, arcade_wallet::tx::ARCADE_CLASS_C_MAX)
+        .map_err(|e| format!("could not build the payment: {e}"))?;
+    let (txid, fee) = crate::arcsvc::send_raw(&tx.raw)?;
+    Ok((txid.to_hex(), fee))
+}
+
 /// `ledger.announce` on ARCADE: the wallet's messaging key and profile name under its @tag there (a key announcement,
 /// what `msg.announce` sends on the home chain), so every arcade reads the profile back from the ARCADE chain.
 pub fn announce(node: &Node) -> Result<Value, String> {
