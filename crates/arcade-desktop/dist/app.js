@@ -642,6 +642,32 @@ $("w-link").addEventListener("click", async () => {
     drawLinks(picked());
   } catch (e) { msg($("w-msg"), e.message, "bad"); }
 });
+// Your own addresses on your @tag's profile (profile.publish_addresses): shown with the fee first, sent on "Publish now".
+$("w-pubaddr").addEventListener("click", async () => {
+  const b = $("w-pubaddr"); b.disabled = true;
+  try {
+    const r = await api("profile.publish_addresses", { send: false });
+    $("w-pubaddr-text").replaceChildren(
+      h("div", {}, `List these on @${r.tag}'s profile:`),
+      ...r.addresses.map((a) => h("div", { class: "s" }, `${a.name}: ${a.address}${a.listed ? " (already listed)" : ""}`)),
+      h("div", { class: "s" }, `fee ${coins(r.fee, r.chain)} · costs ${coins(r.total, r.chain)} in all · ${r.size} bytes · from ${r.address}`),
+      r.new ? null : h("p", { class: "msg" }, "Your profile already lists all of these."));
+    $("w-pubaddr-send").disabled = !r.new;
+    $("w-pubaddr-confirm").hidden = false;
+    msg($("w-msg"), "");
+  } catch (e) { msg($("w-msg"), e.message, "bad"); }
+  finally { b.disabled = false; }
+});
+$("w-pubaddr-cancel").addEventListener("click", () => { $("w-pubaddr-confirm").hidden = true; });
+$("w-pubaddr-send").addEventListener("click", async () => {
+  const b = $("w-pubaddr-send"); b.disabled = true;
+  try {
+    const r = await api("profile.publish_addresses", { send: true });
+    $("w-pubaddr-confirm").hidden = true;
+    msg($("w-msg"), `Published your addresses on @${r.tag}'s profile (${r.txid}); the Explorer lists them once a block holds it.`, "ok");
+  } catch (e) { msg($("w-msg"), e.message, "bad"); }
+  finally { b.disabled = false; }
+});
 $("w-signin").addEventListener("click", async () => {
   const b = $("w-signin");
   b.disabled = true; msg($("w-msg"), "Finding the arcade that holds your account and opening it (this takes a few seconds)…");

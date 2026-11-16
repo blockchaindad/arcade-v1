@@ -156,6 +156,13 @@
           <input id="w-wif" type="password" placeholder="private key (WIF)" autocomplete="off">
           <button id="w-link">Link wallet</button>
         </div>
+        <h2>Your addresses on your profile</h2>
+        <p class="note">List this wallet's own addresses (Pepecoin mainnet, Dogecoin and each other coin installed here) on your @tag's profile, so the Explorer shows them under your @tag. No private key is pasted: they come from your 12 words. It is one small transaction from your @tag's address; you see the fee first.</p>
+        <div class="row"><button id="w-pubaddr">Publish my addresses on my profile</button></div>
+        <div id="w-pubaddr-confirm" class="warn" hidden>
+          <div id="w-pubaddr-text"></div>
+          <div class="row"><button class="primary" id="w-pubaddr-send">Publish now</button><button id="w-pubaddr-cancel">Cancel</button></div>
+        </div>
       </details>
     </div>
     <p class="msg" id="w-msg"></p>
