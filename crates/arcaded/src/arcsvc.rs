@@ -2083,6 +2083,11 @@ pub fn pooled(txid: &Hash256) -> bool {
     svc().is_some_and(|s| s.st.lock().unwrap().pool.iter().any(|w| w.tx.txid == *txid))
 }
 
+/// Whether the chain runs here and is as far as the arcades it is linked to (its pool takes what it should).
+pub fn ready() -> bool {
+    svc().is_some_and(|s| s.caught_up())
+}
+
 pub fn send_raw(raw: &[u8]) -> Result<(Hash256, u64), String> {
     let svc = svc().ok_or("the ARCADE chain isn't running here")?;
     take_tx(&svc, raw).map_err(|e| e.to_string())

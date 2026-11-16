@@ -253,7 +253,7 @@ fn relay(node: &Node) {
         if let Ok(tx) = Tx::parse_with(&v[4..], &p.format) {
             if crate::arcsvc::runs(p) {
                 // Its own pool hands it on; one it holds already is refused, which is fine.
-                let _ = crate::arcsvc::send_raw(&tx.raw);
+                let _ = crate::ownwait::send_arc(node, &tx);
             } else if p.chain_no == node.params.chain_no {
                 // Its unconfirmed parents first, oldest first: a peer drops a child whose parent it hasn't seen.
                 for parent in ancestors(node, p, &tx) {
@@ -290,7 +290,7 @@ fn ancestors(node: &Node, p: &ChainParams, tx: &Tx) -> Vec<Vec<u8>> {
 
 fn relay_once(node: &Node, p: &ChainParams, tx: &Tx) -> Result<String, String> {
     if crate::arcsvc::runs(p) {
-        return Ok(crate::arcsvc::send_raw(&tx.raw)?.0.to_hex());
+        return Ok(crate::ownwait::send_arc(node, &tx)?.0.to_hex());
     }
     if p.chain_no == node.params.chain_no {
         if !crate::mempoolshare::add(node, p, tx) {
