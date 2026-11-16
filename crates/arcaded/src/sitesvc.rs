@@ -625,6 +625,7 @@ pub(crate) mod tests {
             holds: Mutex::new(Default::default()),
             my_sizes: Mutex::new(Default::default()),
             mesh_sizes: Mutex::new(Default::default()),
+            list_cache: Default::default(),
         };
         T { _dir: dir, node, p, cb1, spend }
     }

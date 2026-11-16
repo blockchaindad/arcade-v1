@@ -461,11 +461,8 @@ pub fn find_own_tag(node: &Node, now: bool) -> Option<String> {
     if !node.app.has_wallet().unwrap_or(false) {
         return None;
     }
-    // Its tag key on the chain claims go to (ARCADE), else on the ledger home.
-    for c in [claim_home(node).chain_no, p.chain_no] {
-        if let Some(t) = node.app.tag_keys(c).unwrap_or_default().into_iter().find_map(|k| k.tag) {
-            return Some(t);
-        }
+    if let Some(t) = recorded_tag(node) {
+        return Some(t);
     }
     // A claim under way is this arcade's own wallet's (claims are made from Home, for it): an added account
     // in use still has its @handle looked for, or its arcade could prove no handle and lose the mesh's indexes.
@@ -501,6 +498,31 @@ pub fn find_own_tag(node: &Node, now: bool) -> Option<String> {
             node.app.event("tag", &format!("@{t} is yours (found on chain for this wallet's words)")).ok();
             return Some(t);
         }
+    }
+    None
+}
+
+/// The @handle already recorded for this wallet: its tag key on the chain claims go to (ARCADE),
+/// else on the ledger home.
+fn recorded_tag(node: &Node) -> Option<String> {
+    [claim_home(node).chain_no, node.ledger_home().chain_no].into_iter().find_map(|c| node.app.tag_keys(c).unwrap_or_default().into_iter().find_map(|k| k.tag))
+}
+
+/// [`find_own_tag`] for a request: a recorded @handle at once; else the search, which can ask
+/// other arcades for several seconds, runs in the background (one at a time) and a later call
+/// shows what it found.
+pub fn own_tag_quick(node: &Node) -> Option<String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOOKING: AtomicBool = AtomicBool::new(false);
+    if let Some(t) = recorded_tag(node) {
+        return Some(t);
+    }
+    let Some(n) = node.me.get().and_then(|w| w.upgrade()) else { return find_own_tag(node, false) };
+    if !LOOKING.swap(true, Ordering::SeqCst) {
+        std::thread::spawn(move || {
+            find_own_tag(&n, false);
+            LOOKING.store(false, Ordering::SeqCst);
+        });
     }
     None
 }
@@ -633,9 +655,10 @@ pub fn start_status(node: &Node) -> serde_json::Value {
     if !wallet {
         return json!({"wallet": false});
     }
-    // A restored wallet's @handle is looked for here too (throttled while catching up), so the
-    // Home tab shows it as soon as it is found.
-    let tag = find_own_tag(node, false);
+    // A restored wallet's @handle is looked for here too (throttled while catching up, in the
+    // background: asking other arcades took ~30 s on a first call), so the Home tab shows it
+    // as soon as it is found.
+    let tag = own_tag_quick(node);
     let claim = node.app.claims().unwrap_or_default().into_iter().filter(|c| c.chain == p.chain_no).max_by_key(|c| c.created);
     let index = claim.as_ref().map(|c| c.key_index).unwrap_or(0);
     let (key, _) = match node.app.tag_key(p, index) {

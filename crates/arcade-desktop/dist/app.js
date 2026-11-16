@@ -28,9 +28,10 @@ async function refreshHome() {
   const s = await api("status");
   state.wallet = s.wallet;
   $("conn").textContent = "connected"; $("conn").className = "pill ok";
+  $("w-loading").hidden = true;
   if (!$("home").classList.contains("on")) return;
-  await drawStart();
-  drawMesh(await api("mesh.overview"));
+  // Side by side: the mesh doesn't wait for the getting-started card.
+  await Promise.all([drawStart(), api("mesh.overview").then(drawMesh)]);
 }
 
 // Home: a getting-started guide until this arcade's owner has a handle.
@@ -563,7 +564,18 @@ async function refreshActivity() {
   }));
 }
 
-async function refresh() {
+// One refresh at a time: a tick while one is out runs once after it instead of piling up.
+let refreshing = null, refreshAgain = false;
+function refresh() {
+  if (refreshing) { refreshAgain = true; return refreshing; }
+  refreshing = refreshOnce().finally(() => {
+    refreshing = null;
+    if (refreshAgain) { refreshAgain = false; refresh(); }
+  });
+  return refreshing;
+}
+
+async function refreshOnce() {
   loadHome();
   try {
     await refreshHome();
