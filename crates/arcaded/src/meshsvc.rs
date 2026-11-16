@@ -351,6 +351,77 @@ fn on_coin_peers(node: &Node, h: &Value) {
 }
 
 /// How long to wait after `fails` failed dials in a row; None: let a heard address go.
+/// The last dials: (to a bare IP?, how long, failure, when). ARCADE #12: on a network that lets an arcade reach only
+/// addresses it looked up by name, every dial to a bare IP is refused within a millisecond or two; `mesh.dials` says so.
+type Dial = (bool, u64, Option<String>, u64);
+
+fn dials() -> std::sync::MutexGuard<'static, std::collections::VecDeque<Dial>> {
+    static D: std::sync::OnceLock<std::sync::Mutex<std::collections::VecDeque<Dial>>> = std::sync::OnceLock::new();
+    D.get_or_init(Default::default).lock().unwrap()
+}
+
+fn note_dial(addr: &str, took: Duration, err: Option<String>) {
+    let host = addr.strip_prefix("wss://").map(|r| r.split('/').next().unwrap_or("")).unwrap_or(addr);
+    let host = host.rsplit_once(':').map(|x| x.0).unwrap_or(host).trim_matches(|c| c == '[' || c == ']');
+    let ip = host.parse::<std::net::IpAddr>().is_ok();
+    let mut d = dials();
+    d.push_back((ip, took.as_millis() as u64, err.map(|e| e.chars().take(120).collect()), now()));
+    while d.len() > 100 {
+        d.pop_front();
+    }
+}
+
+/// Dials refused this fast are refused by this computer or its network, not by the far side.
+const FAST_REFUSAL_MS: u64 = 20;
+
+/// `mesh.dials`: the last dials, and whether this network seems to refuse bare IPs while names connect.
+pub fn dials_status() -> Value {
+    let d = dials();
+    let to_ips: Vec<&Dial> = d.iter().filter(|x| x.0).rev().take(20).collect();
+    let fast = to_ips.iter().filter(|x| x.2.is_some() && x.1 < FAST_REFUSAL_MS).count();
+    let ip_ok = to_ips.iter().filter(|x| x.2.is_none()).count();
+    let name_ok = d.iter().filter(|x| !x.0 && x.2.is_none()).count();
+    let gated = to_ips.len() >= 10 && ip_ok == 0 && fast * 10 >= to_ips.len() * 8;
+    let note = if gated {
+        Some(format!("{fast} of the last {} dials to bare IPs were refused in under {FAST_REFUSAL_MS} ms{}: this network seems to allow only addresses looked up by name. Links by name (wss://…) and through a relay still work (ARCADE #12).",
+            to_ips.len(), if name_ok > 0 { ", while names connect" } else { "" }))
+    } else {
+        None
+    };
+    json!({
+        "to_ips": {"tried": to_ips.len(), "linked": ip_ok, "refused_fast": fast},
+        "names_linked": name_ok,
+        "note": note,
+        "last": d.iter().rev().take(20).map(|x| json!({"ip": x.0, "ms": x.1, "error": x.2, "at": x.3})).collect::<Vec<_>>(),
+    })
+}
+
+/// The name other arcades may dial this one by (`mesh.name_set`): a wss:// URL or host:port, shared in "hi" so a
+/// network that reaches only names can still find it (ARCADE #12).
+pub fn public_name(node: &Node) -> Option<String> {
+    node.app.store.read(|r| r.get(arcade_app::META, b"mesh_name")).ok().flatten().and_then(|v| String::from_utf8(v).ok()).filter(|n| !n.is_empty())
+}
+
+/// A dial name as a peer entry's (host, port), if it may be dialed.
+fn name_entry(name: &str) -> Option<(String, u16)> {
+    if name.starts_with("wss://") {
+        return heard_addr(name, 443).map(|a| (a, 443));
+    }
+    let (h, p) = name.rsplit_once(':')?;
+    let p: u16 = p.parse().ok()?;
+    heard_addr(h, p as u64).filter(|_| h.parse::<std::net::IpAddr>().is_err()).map(|_| (h.to_string(), p))
+}
+
+/// `mesh.name_set {name}` (Admin): "" clears it.
+pub fn set_public_name(node: &Node, name: &str) -> Result<Value, String> {
+    let name = name.trim();
+    if !name.is_empty() && name_entry(name).is_none() {
+        return Err("a public name: wss://host/mesh or host:port, with a host name (not an IP)".into());
+    }
+    node.app.store.write(|w| w.put(arcade_app::META, b"mesh_name", name.as_bytes())).map_err(|e| e.to_string())?;
+    Ok(json!({"name": public_name(node)}))
+}
+
 fn retry_after(fails: u32, heard: bool) -> Option<Duration> {
     if heard && fails >= HEARD_TRIES {
         return None;
@@ -368,10 +439,12 @@ pub fn run(node: Arc<Node>, addr: String, heard: Option<&'static str>) {
     // A parked address gets one dial a round, not another quick series.
     let retrying = heard.is_some() && parked().contains_key(&addr);
     loop {
+        let began = std::time::Instant::now();
         let dialed = match heard {
             Some(_) => Link::dial_checked(&addr, NET, &node.identity, None, &public_ip),
             None => Link::dial(&addr, NET, &node.identity, None),
         };
+        note_dial(&addr, began.elapsed(), dialed.as_ref().err().map(|e| e.to_string()));
         match dialed {
             Err(e) => {
                 fails += 1;
@@ -578,7 +651,11 @@ pub fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> 
             nets.insert(r.params.net.into(), json!({"h": t.height}));
         }
     }
-    link.send(&arcade_mesh::bk::hi(Value::Object(nets), node.mesh_port))?;
+    let mut hi = arcade_mesh::bk::hi(Value::Object(nets), node.mesh_port);
+    if let Some(n) = public_name(node) {
+        hi.head["name"] = json!(n);
+    }
+    link.send(&hi)?;
     // Every arcade is a seed: share the arcades and coin peers we know.
     share(node, link)?;
     // Offer our chain to arcades that borrow one (existing arcades' coreshare).
@@ -838,6 +915,13 @@ fn serve_bk(node: &Node, link: &mut Link, addr: &str, h: &Value) -> Result<(), L
                 }
                 note_offer(node, &link.peer_id, &dial, "bk", &h["nets"]);
             }
+            // Its public name: kept in the peer book as the way to dial it (and shared as such), ARCADE #12.
+            if let Some((host, port)) = h["name"].as_str().filter(|n| n.len() <= 255).and_then(name_entry) {
+                let known = node.app.peers().unwrap_or_default().into_iter().find(|p| p.id == link.peer_id);
+                if known.as_ref().is_none_or(|p| p.host != host || p.port != port) {
+                    let _ = node.app.put_peer(&arcade_app::Peer { id: link.peer_id.clone(), host, port, source: "named".into(), last_seen: now(), failures: 0 });
+                }
+            }
         }
         "hq" if h["net"] == p.net => {
             let r = node.chain.headers_payload(p, &hashes("loc"), 2000).map_err(|e| e.to_string());
@@ -918,6 +1002,35 @@ fn operator_me(node: &Node) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A public name is a host name (wss:// URL or host:port), never a bare IP or a local name.
+    #[test]
+    fn public_names_are_host_names() {
+        assert_eq!(name_entry("wss://ashburn.martinseeger.com/mesh"), Some(("wss://ashburn.martinseeger.com/mesh".into(), 443)));
+        assert_eq!(name_entry("arcade.example.org:8421"), Some(("arcade.example.org".into(), 8421)));
+        assert_eq!(name_entry("147.124.204.26:8421"), None);
+        assert_eq!(name_entry("wss://localhost/mesh"), None);
+        assert_eq!(name_entry("box.lan:8421"), None);
+        assert_eq!(name_entry("example.org"), None);
+    }
+
+    /// Bare IPs refused in a millisecond while names connect: the dial note says the network gates them (ARCADE #12).
+    #[test]
+    fn dials_refused_at_once_to_bare_ips_are_noted() {
+        dials().clear();
+        assert!(dials_status()["note"].is_null());
+        note_dial("wss://ashburn.martinseeger.com/mesh", Duration::from_millis(80), None);
+        for i in 0..12 {
+            note_dial(&format!("203.0.113.{i}:8421"), Duration::from_millis(1), Some("Operation not permitted (os error 1)".into()));
+        }
+        let s = dials_status();
+        assert_eq!(s["to_ips"]["refused_fast"], 12);
+        assert!(s["note"].as_str().unwrap().contains("names connect"));
+        // A dial to a bare IP that links: not gated.
+        note_dial("203.0.113.99:8421", Duration::from_millis(30), None);
+        assert!(dials_status()["note"].is_null());
+        dials().clear();
+    }
 
     #[test]
     fn only_public_addresses_are_dialed_from_gossip() {

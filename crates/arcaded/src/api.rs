@@ -104,6 +104,9 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         }
         "mesh.udp" => Ok(crate::udpsvc::status(node)),
         "mesh.relay" => Ok(crate::relaysvc::status(node)),
+        "mesh.dials" => Ok(crate::meshsvc::dials_status()),
+        "mesh.name" => Ok(json!({"name": crate::meshsvc::public_name(node)})),
+        "mesh.name_set" => crate::meshsvc::set_public_name(node, req["name"].as_str().ok_or("name required (\"\" clears it)")?),
         "mesh.relay_set" => crate::relaysvc::set(node, &req),
         "mesh.udp_set" => {
             if let Some(p) = req["drop"].as_str().filter(|p| !p.is_empty()) {
