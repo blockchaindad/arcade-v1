@@ -40,6 +40,9 @@ const SPREAD_SECS: u64 = 60;
 /// A payment notice keeps others from paying the address for this long; after it the balance
 /// alone decides (a notice is only its sender's word).
 const SENT_HOLD: u64 = 600;
+/// Most addresses kept with an open ask, and with payment notices: past it a new one is
+/// neither kept nor passed on (asks are signed, but node keys cost nothing to make).
+const MAX_ADDRS: usize = 20_000;
 
 #[derive(Default)]
 struct State {
@@ -138,10 +141,17 @@ pub fn on_frame(node: &Node, head: &Value) {
         if !fresh(at, now) || addr.len() > 64 {
             continue;
         }
+        // Only an ARCADE address is kept and passed on.
+        if crate::arcsvc::defined().is_some_and(|p| script_of(p, addr).is_err()) {
+            continue;
+        }
         let new = {
             let mut st = state().lock().unwrap();
             match r["k"].as_str() {
                 Some("ask") => {
+                    if !st.asks.contains_key(addr) && st.asks.len() >= MAX_ADDRS {
+                        continue;
+                    }
                     let newer = st.asks.get(addr).map(|o| o["at"].as_u64() < Some(at)).unwrap_or(true);
                     if newer {
                         st.asks.insert(addr.to_string(), r.clone());
@@ -150,6 +160,9 @@ pub fn on_frame(node: &Node, head: &Value) {
                 }
                 Some("sent") => {
                     let Some(txid) = r["txid"].as_str() else { continue };
+                    if !st.sent.contains_key(addr) && st.sent.len() >= MAX_ADDRS {
+                        continue;
+                    }
                     let list = st.sent.entry(addr.to_string()).or_default();
                     let new = !list.iter().any(|(t, _)| t == txid);
                     if new {
