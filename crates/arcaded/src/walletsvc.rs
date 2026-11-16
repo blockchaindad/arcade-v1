@@ -390,11 +390,14 @@ pub(crate) fn tx_status(node: &Node, txid: &str) -> Option<Value> {
     let cc = c(node);
     let h = arcade_chain::Hash256::from_hex(txid).ok()?;
     if let Some((b, _)) = node.chain.tx_location(crate::pagechain::params(node), &h).ok().flatten() {
-        let tip = node.chain.tip(cc).ok().flatten().map(|t| t.height).unwrap_or(0);
         let height = node.chain.block_height_of(cc, b).ok().flatten();
         let hash = height.and_then(|ht| node.chain.hash_at(cc, ht).ok().flatten());
         let time = hash.and_then(|hh| node.chain.header(cc, &hh).ok().flatten()).map(|r| r.header.time);
-        return Some(json!({"txid": txid, "confirmed": true, "confirmations": height.map(|ht| tip.saturating_sub(ht) + 1), "conflicted": false,
+        // Confirmations as they count for money: on a chain where a block's height proves little (DigiByte, Kotia,
+        // Wojakcoin) only the checked work above it counts, and a payment under none is not confirmed yet.
+        let p = crate::pagechain::params(node);
+        let conf = height.map(|ht| node.chain.money_depth(p).map(|m| m.at(ht)).unwrap_or(0));
+        return Some(json!({"txid": txid, "confirmed": conf.is_none_or(|n| n > 0), "confirmations": conf, "conflicted": false,
                            "block": height, "blockhash": hash.map(|x| x.to_hex()), "time": time}));
     }
     let pooled = node.chain.mempool(cc).ok()?.iter().any(|(_, raw)| arcade_chain::Tx::parse_with(raw, &crate::pagechain::params(node).format).map(|t| t.txid == h).unwrap_or(false));

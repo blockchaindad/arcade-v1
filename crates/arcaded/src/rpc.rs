@@ -56,6 +56,10 @@ pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, metho
     let e = |x: arcade_store::StoreError| err(-1, x.to_string());
     let tip = db.tip(c).map_err(e)?.ok_or_else(|| err(-28, "chain is not loaded yet"))?;
     let param = |i: usize| params.get(i).cloned().unwrap_or(Value::Null);
+    // A transaction's or coin's confirmations as they count for money (arcade_chaindb::proven: on DigiByte, Kotia
+    // and Wojakcoin only the checked work above it counts), for a program that pays out on them.
+    let money = std::cell::OnceCell::new();
+    let money_conf = |h: u32| -> u32 { money.get_or_init(|| db.money_depth(p).ok()).as_ref().map(|m| m.at(h)).unwrap_or(0) };
     let arc = crate::arcsvc::runs(p);
     // The waiting transactions (when seen, as it is) and what spends a coin among them.
     let pool = || -> Result<Vec<(u64, Vec<u8>)>, (i64, String)> {
@@ -165,7 +169,7 @@ pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, metho
                 if let Some((hash, height)) = block_of(node, p, bn) {
                     v["blockhash"] = json!(hash.to_hex());
                     v["height"] = json!(height);
-                    v["confirmations"] = json!(tip.height - height + 1);
+                    v["confirmations"] = json!(money_conf(height));
                     if let Some(t) = db.header(c, &hash).ok().flatten().map(|r| r.header.time) {
                         v["time"] = json!(t);
                         v["blocktime"] = json!(t);
@@ -187,7 +191,7 @@ pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, metho
                 None => Ok(Value::Null),
                 Some(coin) => Ok(json!({
                     "bestblock": tip.hash.to_hex(),
-                    "confirmations": tip.height - coin.height + 1,
+                    "confirmations": money_conf(coin.height),
                     "value": coins(coin.value),
                     "scriptPubKey": {"hex": hex::encode(&coin.script)},
                     "coinbase": coin.coinbase,
@@ -306,7 +310,7 @@ pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, metho
                 let Some(sc) = arcade_ledger::address::script_for_address(p, &a) else { return Err(err(-5, format!("Invalid address: {a}"))) };
                 watch_add(&caller(), c, &a, now());
                 for (op, value, height) in db.coins_for_script(p, &sc).map_err(e)? {
-                    let conf = (tip.height + 1).saturating_sub(height) as u64;
+                    let conf = money_conf(height) as u64;
                     if conf < minconf || conf > maxconf || spender(&op)?.is_some() {
                         continue;
                     }
@@ -336,7 +340,7 @@ pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, metho
                 for (h, t12, recv, sent) in db.history_for_script(c, &sc).map_err(e)? {
                     for txid in db.txids_by_t12(p, &t12).map_err(e)? {
                         rows.push((h, json!({"address": a, "category": if sent > recv { "send" } else { "receive" }, "amount": coins(recv.abs_diff(sent)),
-                                             "txid": txid.to_hex(), "blockheight": h, "confirmations": tip.height.saturating_sub(h) + 1, "involvesWatchonly": true})));
+                                             "txid": txid.to_hex(), "blockheight": h, "confirmations": money_conf(h), "involvesWatchonly": true})));
                     }
                 }
                 if p.chain_no == node.params.chain_no {
