@@ -635,20 +635,57 @@ pub fn route(node: &Node, path: &str, q: &Map<String, Value>) -> Option<Reply> {
 
 // ---------------- /content/<inscription id> ----------------
 
+/// How far /content's bytes are vouched for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Vouched {
+    /// This arcade's own ord index, or read from the inscription's own transactions (each checked
+    /// against its txid): the chain's bytes and type. Kept, and served as never changing.
+    Chain,
+    /// Only what arcades on the mesh sent (its transactions can't be read here): how many
+    /// independent ones sent the same type and bytes. Served, but kept only a short while and
+    /// never as the chain's.
+    Holders(usize),
+}
+
+impl Vouched {
+    pub fn level(self) -> crate::vouch::Level {
+        match self {
+            Vouched::Chain => crate::vouch::Level::Green,
+            Vouched::Holders(n) => crate::vouch::Level::of_sources(n),
+        }
+    }
+}
+
+/// How long bytes only arcades vouch for are kept here.
+const SAID_SECS: u64 = 300;
+
 /// An ord inscription's (content type, bytes) for /content: from a chain this arcade keeps the
-/// ord index of, else (`ask`: the request came from this computer) from an arcade on the mesh,
-/// which sends pictures up to 4 MB and text up to 64 KB.
-pub fn content(node: &Node, id: &str, ask: bool) -> Option<(String, Vec<u8>)> {
+/// ord index of, else (`ask`: the request came from this computer) found through an arcade on the
+/// mesh. Its record only names the transactions: the bytes and the type are read from those, each
+/// checked against its txid. When no transaction can be read here (a chain neither kept nor
+/// borrowed), the previews of up to three independent arcades are compared (pictures up to 4 MB,
+/// text up to 64 KB): one arcade's is served with a yellow mark, arcades that disagree get nothing.
+pub fn content(node: &Node, id: &str, ask: bool) -> Option<(String, Vec<u8>, Vouched)> {
+    content_at(node, id, ask, 0)
+}
+
+fn content_at(node: &Node, id: &str, ask: bool, depth: u32) -> Option<(String, Vec<u8>, Vouched)> {
     let id = id.to_lowercase();
     if !sites::is_inscription_id(&id) {
         return None;
     }
     static KEPT: Mutex<Option<(usize, HashMap<String, (String, Vec<u8>)>)>> = Mutex::new(None);
-    if let Some(hit) = KEPT.lock().unwrap().as_ref().and_then(|k| k.1.get(&id).cloned()) {
-        return Some(hit);
+    static SAID: Mutex<Option<(usize, HashMap<String, (Instant, String, Vec<u8>, usize)>)>> = Mutex::new(None);
+    if let Some((ct, b)) = KEPT.lock().unwrap().as_ref().and_then(|k| k.1.get(&id).cloned()) {
+        return Some((ct, b, Vouched::Chain));
+    }
+    if let Some((at, ct, b, n)) = SAID.lock().unwrap().as_ref().and_then(|k| k.1.get(&id).cloned()) {
+        if at.elapsed().as_secs() < SAID_SECS {
+            return Some((ct, b, Vouched::Holders(n)));
+        }
     }
     let here = keeps(node, "ord");
-    let mut got = here.iter().find_map(|p| ord::content(&node.chain, p, &id).ok());
+    let mut got = here.iter().find_map(|p| ord::content(&node.chain, p, &id).ok()).map(|(ct, b)| (ct, b, Vouched::Chain));
     if got.is_none() && ask {
         let seen = SEEN.lock().unwrap().as_ref().and_then(|m| m.get(&id).copied());
         let mut list: Vec<&'static ChainParams> = seen.into_iter().collect();
@@ -665,58 +702,136 @@ pub fn content(node: &Node, id: &str, ask: bool) -> Option<(String, Vec<u8>)> {
             .into_iter()
             .filter_map(|(p, r)| Some((p, r.ok()?)))
             .collect();
-        got = answers.iter().find_map(|(_, r)| {
-            let c = &r["content"];
-            let ct = c["type"].as_str().unwrap_or("").to_string();
-            match c["kind"].as_str()? {
-                "image" => {
-                    let b64 = c["data"].as_str()?.split_once(";base64,")?.1;
-                    Some((ct, base64::engine::general_purpose::STANDARD.decode(b64).ok()?))
-                }
-                // Whole only: a cut text is not the inscription.
-                "text" | "html" => c["text"].as_str().filter(|t| Some(t.len() as u64) == c["size"].as_u64()).map(|t| (ct, t.as_bytes().to_vec())),
-                _ => None,
-            }
-        });
-        // What the preview can't carry whole (a script, a long page, a big picture: an Anti Doginal Dog loads a 292 KB
-        // renderer) is rebuilt from the inscription's own transactions, each fetched from a lender and checked
-        // against its txid, so the bytes are the chain's, not an arcade's word.
+        got = answers.iter().find_map(|(p, r)| checked(node, p, &id, r, depth));
         if got.is_none() {
-            got = answers.iter().find_map(|(p, r)| rebuilt(node, p, r));
+            got = compared(node, &id, &answers, depth);
         }
     }
-    if let Some((ct, body)) = &got {
-        let mut g = KEPT.lock().unwrap();
-        let k = g.get_or_insert_with(|| (0, HashMap::new()));
-        if k.0 + body.len() > CONTENT_KEEP {
-            *k = (0, HashMap::new());
+    match &got {
+        Some((ct, body, Vouched::Chain)) => {
+            let mut g = KEPT.lock().unwrap();
+            let k = g.get_or_insert_with(|| (0, HashMap::new()));
+            if k.0 + body.len() > CONTENT_KEEP {
+                *k = (0, HashMap::new());
+            }
+            if body.len() <= CONTENT_KEEP / 4 {
+                k.0 += body.len();
+                k.1.insert(id, (ct.clone(), body.clone()));
+            }
         }
-        if body.len() <= CONTENT_KEEP / 4 {
-            k.0 += body.len();
-            k.1.insert(id, (ct.clone(), body.clone()));
+        Some((ct, body, Vouched::Holders(n))) => {
+            let mut g = SAID.lock().unwrap();
+            let k = g.get_or_insert_with(|| (0, HashMap::new()));
+            if k.0 + body.len() > CONTENT_KEEP / 4 {
+                *k = (0, HashMap::new());
+            }
+            if body.len() <= CONTENT_KEEP / 16 {
+                k.0 += body.len();
+                k.1.insert(id, (Instant::now(), ct.clone(), body.clone(), *n));
+            }
         }
+        None => {}
     }
     got
 }
 
-/// Largest inscription rebuilt from a borrowed chain's transactions for /content.
+/// Largest inscription read from a borrowed chain's transactions for /content, and the most piece
+/// transactions a record may name for it.
 const REBUILD_MOST: u64 = 4 << 20;
+const REBUILD_PIECES: usize = 5_000;
 
-/// An inscription's (content type, bytes) from its record on another arcade (its type, size and transactions):
-/// the transactions come from the chain's lenders, each checked against its txid, and the body is read out of them
-/// as this arcade's own index would. None when the chain isn't borrowed here or a piece can't be had.
-fn rebuilt(node: &Node, p: &'static ChainParams, rec: &Value) -> Option<(String, Vec<u8>)> {
-    if rec["size"].as_u64().map_or(true, |s| s > REBUILD_MOST) {
-        return None;
+/// Transactions of chain `p` by txid: this arcade's own copies, the rest from the chain's lenders, each
+/// checked against its txid. None when a piece can't be had.
+fn txs_of(node: &Node, p: &'static ChainParams, txids: &[arcade_chain::Hash256]) -> Option<HashMap<arcade_chain::Hash256, arcade_chain::Tx>> {
+    let mut out = HashMap::new();
+    let mut want = Vec::new();
+    for h in txids {
+        let own = node.chain.tx_raw(p, h).ok().flatten().and_then(|(raw, _)| arcade_chain::Tx::parse_with(&raw, &p.format).ok()).filter(|t| t.txid == *h);
+        match own {
+            Some(t) => {
+                out.insert(*h, t);
+            }
+            None => want.push(*h),
+        }
     }
+    if !want.is_empty() {
+        if !crate::borrow::is_borrowed(p.key) {
+            return None;
+        }
+        out.extend(crate::borrow::raw_txs(node, p, &want).ok()?);
+    }
+    Some(out)
+}
+
+/// An inscription's (content type, bytes) read from its own transactions, which another arcade's
+/// record `rec` names (ord::read_from_txs: the first must be the id's own, each piece must spend the
+/// one before). A delegate's content when it has no body of its own. None when its transactions
+/// can't be read here or aren't the inscription's.
+fn checked(node: &Node, p: &'static ChainParams, id: &str, rec: &Value, depth: u32) -> Option<(String, Vec<u8>, Vouched)> {
     let txids: Vec<arcade_chain::Hash256> = rec["txs"].as_array()?.iter().filter_map(|t| arcade_chain::Hash256::from_hex(t.as_str()?).ok()).collect();
-    if txids.is_empty() {
+    if txids.is_empty() || txids.len() > REBUILD_PIECES || rec["size"].as_u64().is_some_and(|s| s > REBUILD_MOST) {
         return None;
     }
-    let txs = crate::borrow::raw_txs(node, p, &txids).ok()?;
-    let body = ord::body_of(p, rec, &|h| txs.get(h).cloned()).ok()?;
-    // The record's size is another arcade's word too: the body read from the chain must agree with it.
-    (Some(body.len() as u64) == rec["size"].as_u64()).then(|| (rec["ct"].as_str().unwrap_or("").to_string(), body))
+    let txs = txs_of(node, p, &txids)?;
+    let got = ord::read_from_txs(p, id, &txids, &|h| txs.get(h).cloned()).ok()?;
+    if got.body.len() as u64 > REBUILD_MOST {
+        return None;
+    }
+    if got.body.is_empty() && depth < 4 {
+        if let Some(dl) = got.delegate {
+            return content_at(node, &dl, true, depth + 1);
+        }
+    }
+    Some((got.ctype, got.body, Vouched::Chain))
+}
+
+/// What an Explorer preview carries whole: (content type, bytes). A cut text is not the inscription.
+fn preview(r: &Value) -> Option<(String, Vec<u8>)> {
+    let c = &r["content"];
+    let ct = c["type"].as_str().unwrap_or("").to_string();
+    match c["kind"].as_str()? {
+        "image" => {
+            let b64 = c["data"].as_str()?.split_once(";base64,")?.1;
+            Some((ct, base64::engine::general_purpose::STANDARD.decode(b64).ok()?))
+        }
+        "text" | "html" => c["text"].as_str().filter(|t| Some(t.len() as u64) == c["size"].as_u64()).map(|t| (ct, t.as_bytes().to_vec())),
+        _ => None,
+    }
+}
+
+/// No transaction could be read here: the inscription as up to three independent arcades keeping its
+/// chain describe it. A record one of them sends may still be checkable (another arcade's names the
+/// right transactions); else their previews must agree: the bytes then carry how many sent them.
+/// Arcades that disagree: nothing is served (an event says so, once).
+fn compared(node: &Node, id: &str, answers: &[(&'static ChainParams, Value)], depth: u32) -> Option<(String, Vec<u8>, Vouched)> {
+    for (p, first) in answers {
+        let each = crate::vouch::ask_each(node, p, "ord", "explorer.inscription", &json!({"chain": p.key, "id": id}), 3, 6_000);
+        if let Some(hit) = each.iter().find_map(|(r, _)| checked(node, p, id, r, depth)) {
+            return Some(hit);
+        }
+        let said: Vec<(Option<(String, Vec<u8>)>, String)> = if each.is_empty() {
+            // Nobody answered this round: the first answer alone (who sent it is all that is known of it).
+            vec![(preview(first), first["_mesh"]["node"].as_str().unwrap_or("").to_string())]
+        } else {
+            each.iter().map(|(r, who)| (preview(r), who.clone())).collect()
+        };
+        let groups = crate::vouch::tally(&said);
+        match groups.len() {
+            0 => continue,
+            1 => {
+                let ((ct, body), who) = groups.into_iter().next()?;
+                return Some((ct, body, Vouched::Holders(who.len())));
+            }
+            _ => {
+                let names: Vec<String> = groups.iter().map(|g| g.1.iter().map(|w| crate::vouch::who(w)).collect::<Vec<_>>().join(", ")).collect();
+                crate::vouch::alert_once(node, &format!("content:{id}"), "mesh", &format!(
+                    "Arcades keeping {} sent different content for inscription {id} ({}): not shown until they agree or its transactions can be read here",
+                    p.name, names.join(" / ")));
+                return None;
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -733,6 +848,25 @@ mod tests {
         let known: Vec<String> = ["apple.mesh", "ape.mesh", "apply.mesh", "maple.mesh", "zebra.pepe"].iter().map(|s| s.to_string()).collect();
         assert_eq!(close_matches("appel.mesh", &known, 3, 0.75), vec!["apply.mesh", "apple.mesh", "ape.mesh"]);
         assert!(close_matches("nothing.like", &known, 3, 0.75).is_empty());
+    }
+
+    #[test]
+    fn mesh_content_is_marked_by_who_vouches() {
+        use crate::vouch::Level;
+        assert_eq!(Vouched::Chain.level(), Level::Green);
+        assert_eq!(Vouched::Holders(2).level(), Level::Green);
+        assert_eq!(Vouched::Holders(1).level(), Level::Yellow);
+        // A preview is taken only whole; its type is the sender's, so it never counts as the chain's.
+        let whole = json!({"content": {"kind": "text", "type": "text/plain", "text": "hi", "size": 2}});
+        assert_eq!(preview(&whole), Some(("text/plain".to_string(), b"hi".to_vec())));
+        assert_eq!(preview(&json!({"content": {"kind": "text", "type": "text/plain", "text": "hi", "size": 900}})), None);
+        let pic = json!({"content": {"kind": "image", "type": "image/png", "data": "data:image/png;base64,UE5HIQ=="}});
+        assert_eq!(preview(&pic), Some(("image/png".to_string(), b"PNG!".to_vec())));
+        assert_eq!(preview(&json!({"content": {"kind": "other"}})), None);
+        // Two arcades sending different bytes for one id are two groups: nothing is served.
+        let said = vec![(preview(&whole), "n1".to_string()), (preview(&pic), "n2".to_string()), (preview(&whole), "n3".to_string())];
+        let g = crate::vouch::tally(&said);
+        assert_eq!((g.len(), g[0].1.len()), (2, 2));
     }
 
     #[test]

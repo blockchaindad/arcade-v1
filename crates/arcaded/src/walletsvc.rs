@@ -693,7 +693,15 @@ pub fn preview(node: &Node, id: &str) -> Result<Value, String> {
 
 /// The page's name as the chain says it: its app card's name and its creator's @tag.
 fn page_card(node: &Node, page: &str) -> Value {
-    let Some(i) = arcade_ledger::content::inscription(&node.chain, c(node), page) else { return json!({"page": page}) };
+    let Some(i) = arcade_ledger::content::inscription(&node.chain, c(node), page) else {
+        // An app on a chain whose ledger isn't here: its card as the App Store has it, with a caution when only
+        // one arcade on the mesh vouches for it (crate::appsvc trust).
+        return match crate::appsvc::of_page(node, page) {
+            Some(a) => json!({"page": page, "app": a["name"], "creator": a["creator"], "chain": a["chain"],
+                              "caution": (a["trust"]["level"] != "green").then(|| a["trust"]["note"].clone())}),
+            None => json!({"page": page}),
+        };
+    };
     let card = arcade_ledger::cards::parse(i["json"].as_str().unwrap_or("")).map(|c| c.name);
     json!({"page": page, "app": card, "creator": i["creator"], "creator_tag": i["creator"].as_str().and_then(|a| tag_of(node, a))})
 }
