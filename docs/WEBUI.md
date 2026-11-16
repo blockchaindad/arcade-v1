@@ -34,8 +34,9 @@ the arcade restarts (it then asks for the new link).
 A tunnel needs SSH on every computer that uses it. At home, the operator can instead run a small
 proxy beside the arcade: https on this computer's LAN address, for home-network addresses only,
 behind its own password. It forwards to `127.0.0.1:<port>` from loopback, with `Host:
-127.0.0.1:<port>`, no `X-Forwarded-*` headers, and the cookie on `/rpc`. It passes `/ui/`, `/rpc`,
-`/app/`, `/r/`, `/content/`, `/ord/` and `/inscription/`.
+127.0.0.1:<port>`, no `X-Forwarded-*`, `Forwarded`, `Via` or other client-address headers, and
+the cookie on `/rpc`. It passes `/ui/`, `/rpc`, `/app/`, `/r/`, `/content/`, `/ord/` and
+`/inscription/`.
 
 In a browser the window treats its own origin as the arcade, whether that's a tunnel's `127.0.0.1`
 or such an entrance. The arcade's `http://127.0.0.1:<port>` addresses (app frames, content windows,

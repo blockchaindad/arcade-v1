@@ -4,7 +4,9 @@
 // window opened, never what a message says.
 (() => {
   const q = new URLSearchParams(location.search);
-  const frame = q.get("frame") || "";
+  // The app's page and its key (apps.launch gives "<page>?pass=<key>"): asked for with the key, the arcade serves
+  // the page with its pass for the page API; a bare request for the page gets none.
+  const [frame, passKey] = (() => { const f = q.get("frame") || ""; const m = /^(.*)\?pass=([0-9a-f]{32})$/.exec(f); return m ? [m[1], m[2]] : [f, ""]; })();
   const id = q.get("id") || "";
   document.title = q.get("title") || "App";
   const el = document.getElementById("app");
@@ -630,9 +632,10 @@
     finally { showing = null; }
   }, 1500);
 
-  // The page with its pass for the page API (a new address, so a copy cached before passes isn't used), and the place
+  // The page with its pass for the page API (asked for with its key; "?pass=" also makes a new address, so a copy
+  // cached before passes isn't used), and the place
   // to open it at when the window was asked for one (`at`: a plain #/ route, as Arcade Git's #/@owner/name).
   const at = q.get("at") || "";
-  el.src = frame + "?pass=1" + (/^#\/[A-Za-z0-9@._\/-]{0,200}$/.test(at) ? at : "");
+  el.src = frame + "?pass=" + (passKey || "1") + (/^#\/[A-Za-z0-9@._\/-]{0,200}$/.test(at) ? at : "");
   window.arcadeApp = { id, frame, el };
 })();

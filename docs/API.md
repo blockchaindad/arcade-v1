@@ -10,8 +10,9 @@ Everything the desktop app does goes through one set of commands. Programs reach
 
 **Only this computer.** `/rpc` and `/api/v1` answer only requests from this computer, addressed to
 `127.0.0.1`, `localhost` or `[::1]` with the arcade's port (the `Host` header), that didn't come
-through a proxy (requests carrying `X-Forwarded-For`, `Forwarded` or `X-Real-IP` are refused). A
-reverse proxy or tunnel that adds none of those (a plain `proxy_pass`, `ssh -L`, `socat`) would make
+through a proxy (requests carrying a proxy's headers, such as `X-Forwarded-*`, `Forwarded`, `Via`,
+`X-Real-IP`, `CF-Connecting-IP` or `True-Client-IP`, are refused). A reverse proxy or tunnel that
+adds none of those (a plain `proxy_pass`, `ssh -L`, `socat`) would make
 its visitors look like this computer: run arcaded with `--behind-proxy` there, and nothing over the
 web port counts as this computer (programs then use the socket). Answers carry no CORS headers. The
 operator can open the HTTP port (`arcaded --http-bind 0.0.0.0`) and serve a website from it
