@@ -19,10 +19,37 @@ fn home() -> std::path::PathBuf {
     base.join("arcade")
 }
 
+/// What an app window's own code (appwindow.js, and the trade.js and media.js it loads) asks the arcade: the doors it
+/// answers for its app (storage, rooms, rings, messages, contacts, groups, trades, prizes, inscribing, and the wallet
+/// requests its cards put to the player), and the public reads it shows. An app window holds a stranger's page in a
+/// frame, so it gets these only; the rest (the wallet's words, a send of its own, options, other apps) is the main
+/// window's. A new door in appwindow.js needs its command here (tests::app_windows_ask_only_their_doors checks).
+const APP_WINDOW_COMMANDS: &[&str] = &[
+    "apps.node", "apps.owner", "apps.owner_send", "apps.perms", "apps.storage",
+    "chains.list", "explorer.inscription", "explorer.ledger_inscription",
+    "contacts.delete", "contacts.list", "contacts.save", "msg.who",
+    "group.add", "group.app_list", "group.app_read", "group.create", "group.leave", "group.open", "group.say", "group.seal",
+    "inscribe", "inscribe.estimate", "prize.claim", "prize.seed",
+    "realtime.fast", "realtime.join", "realtime.lanes", "realtime.leave", "realtime.media", "realtime.poll", "realtime.send",
+    "ring.get", "ring.send",
+    "trade.fill", "trade.items", "trade.leg", "trade.open", "trade.watch", "trade.who",
+    "wallet.approve", "wallet.deny", "wallet.preview", "wallet.requests",
+];
+
+/// May the window `label` send `cmd`: the main window anything, an app window its doors, any other window nothing
+/// (content windows are in no capability either).
+fn window_may(label: &str, cmd: &str) -> bool {
+    label == "main" || label.starts_with("app-") && APP_WINDOW_COMMANDS.contains(&cmd)
+}
+
 /// Forward one request to arcaded and return its answer (off the UI thread: some wait, such as
-/// realtime.poll).
+/// realtime.poll). Only what the asking window may send (window_may).
 #[tauri::command(async)]
-fn api(req: Value) -> Value {
+fn api(window: tauri::WebviewWindow, req: Value) -> Value {
+    let cmd = req["cmd"].as_str().unwrap_or("");
+    if !window_may(window.label(), cmd) {
+        return json!({"ok": false, "error": format!("{cmd} is not for this window")});
+    }
     let sock = home().join("arcaded.sock");
     let mut s = match UnixStream::connect(&sock) {
         Ok(s) => s,
@@ -171,6 +198,33 @@ fn save_file(app: tauri::AppHandle, name: String, data: String) -> Result<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_windows_ask_only_their_doors() {
+        // Every command the app window's scripts send is one of its doors.
+        let scripts = [include_str!("../dist/appwindow.js"), include_str!("../dist/trade.js"), include_str!("../dist/media.js")];
+        let mut asked = 0;
+        for js in scripts {
+            for part in js.split("api(\"").skip(1) {
+                let cmd = part.split('"').next().unwrap();
+                assert!(window_may("app-00ff", cmd), "{cmd} is sent by an app window but isn't one of its doors");
+                asked += 1;
+            }
+        }
+        assert!(asked > 40, "{asked}");
+        for cmd in ["wallet.approve", "wallet.deny", "realtime.poll"] {
+            assert!(window_may("app-00ff", cmd), "{cmd}");
+        }
+        // The rest is the main window's.
+        for cmd in ["wallet.phrase", "wallet.send", "wallet.create", "wallet.import", "options.set", "apps.launch", "status", ""] {
+            assert!(!window_may("app-00ff", cmd), "{cmd}");
+            assert!(window_may("main", cmd), "{cmd}");
+        }
+        // Content windows, and windows of no known kind, send nothing.
+        for label in ["content-00ff", "other", "mainx", "App-00ff"] {
+            assert!(!window_may(label, "chains.list"), "{label}");
+        }
+    }
 
     #[test]
     fn saved_names_stay_in_the_folder() {
