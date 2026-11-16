@@ -190,13 +190,29 @@ fn body_cap(node: &Node, r: &Req, is_local: bool) -> usize {
 }
 
 fn respond(s: &mut TcpStream, status: &str, ctype: &str, extra: &[(&str, String)], body: &[u8]) {
-    let mut h = format!("HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n", body.len());
+    let _ = s.write_all(head(status, ctype, extra, body.len()).as_bytes());
+    let _ = s.write_all(body);
+}
+
+/// A header value as sent: one line of visible characters. Content types and redirects can come from inscriptions and
+/// from other arcades; a line break in one would end the header block early and drop the headers after it (the
+/// sandbox CSP among them), so such a value is never written as it is.
+fn header_safe(v: &str) -> bool {
+    !v.bytes().any(|b| b < 0x20 && b != b'\t' || b == 0x7f)
+}
+
+/// The response head. A content type that isn't one clean line becomes application/octet-stream; another header whose
+/// value isn't is left out.
+fn head(status: &str, ctype: &str, extra: &[(&str, String)], len: usize) -> String {
+    let ctype = if header_safe(ctype) { ctype } else { "application/octet-stream" };
+    let mut h = format!("HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {len}\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n");
     for (k, v) in extra {
-        h.push_str(&format!("{k}: {v}\r\n"));
+        if header_safe(k) && header_safe(v) {
+            h.push_str(&format!("{k}: {v}\r\n"));
+        }
     }
     h.push_str("\r\n");
-    let _ = s.write_all(h.as_bytes());
-    let _ = s.write_all(body);
+    h
 }
 
 /// Inscription content is served as a page of its own: an opaque origin that reaches nothing.
@@ -878,7 +894,9 @@ fn serve_file(s: &mut TcpStream, r: &Req, id: &str, f: &crate::arcblob::FileMani
     }
     let (from, to) = range.unwrap_or((0, f.size - 1));
     let status = if range.is_some() { "206 Partial Content" } else { "200 OK" };
-    let mut h = format!("HTTP/1.1 {status}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\nAccept-Ranges: bytes\r\nETag: \"{id}\"\r\nCache-Control: public, max-age=31536000, immutable\r\nAccess-Control-Allow-Origin: *\r\nContent-Security-Policy: {csp}\r\n", f.kind, to - from + 1);
+    // The kind is the blob's own word (anyone's): one clean line or none (see header_safe).
+    let kind = if header_safe(&f.kind) { f.kind.as_str() } else { "application/octet-stream" };
+    let mut h = format!("HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\nAccept-Ranges: bytes\r\nETag: \"{id}\"\r\nCache-Control: public, max-age=31536000, immutable\r\nAccess-Control-Allow-Origin: *\r\nContent-Security-Policy: {csp}\r\n", to - from + 1);
     if range.is_some() {
         h.push_str(&format!("Content-Range: bytes {from}-{to}/{}\r\n", f.size));
     }
@@ -1167,6 +1185,24 @@ pub(crate) mod tests {
     }
 
     use super::*;
+
+    /// A content type or header value with a line break can't end the head early: the CSP after it is still sent, and
+    /// nothing the value carries becomes a header or the body.
+    #[test]
+    fn a_header_value_cannot_break_the_head() {
+        let csp = ("Content-Security-Policy", CONTENT_CSP.to_string());
+        for bad in ["text/html\r\n\r\n<script>x</script>", "text/html\nSet-Cookie: a=b", "text/html\r", "text/html\u{7f}"] {
+            let h = head("200 OK", bad, &[csp.clone()], 5);
+            assert!(h.contains("Content-Type: application/octet-stream\r\n"), "{h}");
+            assert!(h.contains(&format!("Content-Security-Policy: {CONTENT_CSP}\r\n")), "{h}");
+            assert!(h.ends_with("\r\n\r\n") && h.matches("\r\n\r\n").count() == 1, "{h}");
+            assert!(!h.contains("Set-Cookie") && !h.contains("<script>"), "{h}");
+        }
+        let h = head("302 Found", "text/plain", &[("Location", "/x\r\nSet-Cookie: a=b".into()), csp.clone()], 0);
+        assert!(!h.contains("Location") && !h.contains("Set-Cookie") && h.contains("Content-Security-Policy"), "{h}");
+        let h = head("200 OK", "text/html; charset=utf-8", &[csp], 1);
+        assert!(h.contains("Content-Type: text/html; charset=utf-8\r\n"), "{h}");
+    }
 
     /// A test arcade (crate::sitesvc's), one at a time across these tests: each maps a database,
     /// and many at once run out of address space. The guard is dropped after the arcade.
