@@ -87,8 +87,19 @@ fn max_links(node: &Node) -> u64 {
     cfg(node)["max_links"].as_u64().unwrap_or(DEFAULT_MAX_LINKS)
 }
 
-/// The relay's price in ARCADE base units per GB (0: free).
+/// Where this relay is paid: the address its operator set (`pay_to`), else this arcade's own ARCADE wallet. None when
+/// it has neither, and then it charges nothing (v0.1.96 billed with no address to pay: Ashburn has no wallet).
+fn pay_to(node: &Node) -> Option<String> {
+    let p = crate::arcledger::chain().ok()?;
+    cfg(node)["pay_to"].as_str().filter(|a| arcade_ledger::address::script_for_address(p, a).is_some()).map(String::from)
+        .or_else(|| crate::arcledger::own_address(node).ok())
+}
+
+/// The relay's price in ARCADE base units per GB (0: free, and free while there's no address to be paid at).
 fn price(node: &Node) -> u64 {
+    if pay_to(node).is_none() {
+        return 0;
+    }
     cfg(node)["price_per_gb"].as_f64().filter(|p| *p > 0.0).map(|p| (p * arcade_arc::params::COIN as f64).round() as u64).unwrap_or(0)
 }
 
@@ -813,7 +824,7 @@ fn bill(node: &Node, f: &mut Fees, who: &str) -> Option<Value> {
     if !f.accounts.contains_key(who) {
         return None;
     }
-    let pay_to = crate::arcledger::own_address(node).ok()?;
+    let pay_to = self::pay_to(node)?;
     let a = account(f, who).clone();
     Some(json!({"op": "bill", "price": price(node), "free_mb": free_mb(node), "pay_to": pay_to, "used_mb": a.used / 1_000_000,
                 "month_charged": a.month_charged, "charged": a.charged, "credit": a.credit}))
@@ -839,7 +850,7 @@ fn confirmed_tx(node: &Node, txid: &arcade_chain::hash::Hash256) -> Option<arcad
 /// Payments said: credited once in a block, to the arcade their memo names, by what they pay this relay's address.
 fn settle_claims(node: &Node, f: &mut Fees) {
     let Ok(p) = crate::arcledger::chain() else { return };
-    let Some(to) = crate::arcledger::own_address(node).ok().and_then(|a| arcade_ledger::address::script_for_address(p, &a)) else { return };
+    let Some(to) = pay_to(node).and_then(|a| arcade_ledger::address::script_for_address(p, &a)) else { return };
     let now = now_s();
     let claims = std::mem::take(&mut f.claims);
     for (who, txid, at) in claims {
@@ -1059,7 +1070,8 @@ pub fn status(node: &Node) -> Value {
         // The fee, as the relay.
         "price_per_gb": coins(price(node)),
         "free_mb": free_mb(node),
-        "pay_to": crate::arcledger::own_address(node).ok(),
+        "pay_to": pay_to(node),
+        "price_set": cfg(node)["price_per_gb"].as_f64().unwrap_or(0.0),
         "earned": coins(st.fee.accounts.values().map(|a| a.credit).sum()),
         "accounts": accounts,
         "waiting_payments": st.fee.claims.len(),
@@ -1090,6 +1102,23 @@ pub fn set(node: &Node, req: &Value) -> Result<Value, String> {
     }
     if let Some(v) = req.get("free_mb").filter(|v| !v.is_null()) {
         c["free_mb"] = json!(v.as_u64().filter(|v| *v <= 10_000_000).ok_or("free_mb: a number of MB, 0 or more")?);
+    }
+    if let Some(a) = req["pay_to"].as_str() {
+        let a = a.trim();
+        if a.is_empty() {
+            c.as_object_mut().map(|o| o.remove("pay_to"));
+        } else {
+            let p = crate::arcledger::chain()?;
+            arcade_ledger::address::script_for_address(p, a).ok_or_else(|| format!("pay_to: {a} isn't an ARCADE address"))?;
+            c["pay_to"] = json!(a);
+        }
+    }
+    if c["price_per_gb"].as_f64().is_some_and(|p| p > 0.0) {
+        let p = crate::arcledger::chain()?;
+        let has = c["pay_to"].as_str().is_some_and(|a| arcade_ledger::address::script_for_address(p, a).is_some()) || crate::arcledger::own_address(node).is_ok();
+        if !has {
+            return Err("a price needs an address to be paid at: set pay_to (any ARCADE address) or make this arcade a wallet".into());
+        }
     }
     if let Some(on) = req["pay_on"].as_bool() {
         c["pay_on"] = json!(on);

@@ -41,7 +41,7 @@ async function refreshRelay() {
     if (document.activeElement !== $("o-relay-price")) $("o-relay-price").value = r.price_per_gb;
     if (document.activeElement !== $("o-relay-free")) $("o-relay-free").value = r.free_mb;
     $("o-relay-earned").textContent = `${r.earned} ARCADE` + (r.waiting_payments ? ` (${r.waiting_payments} waiting for a block)` : "");
-    $("o-relay-payto").textContent = r.pay_to || "no wallet";
+    $("o-relay-payto").textContent = r.pay_to || "no address: free until one is set";
     const list = $("o-relay-list");
     list.replaceChildren(
       ...r.passing.map((c) => h("li", {}, `Passing ${c.a} ⇄ ${c.b}: ${c.mb} MB`)),
@@ -73,6 +73,12 @@ $("o-relay-fee-set").addEventListener("click", async () => {
   const price_per_gb = Math.max(0, Number($("o-relay-price").value) || 0);
   const free_mb = Math.max(0, Math.floor(Number($("o-relay-free").value) || 0));
   try { await api("mesh.relay_set", { price_per_gb, free_mb }); say("o-relay-msg", price_per_gb ? `Price set: ${price_per_gb} ARCADE a GB, ${free_mb} MB free a month.` : "Relaying is free."); }
+  catch (e) { say("o-relay-msg", e.message, true); }
+  refreshRelay();
+});
+$("o-relay-payto-set").addEventListener("click", async () => {
+  const pay_to = $("o-relay-payto-in").value.trim();
+  try { await api("mesh.relay_set", { pay_to }); say("o-relay-msg", pay_to ? `Paid to ${pay_to}.` : "Paid to this arcade's wallet."); }
   catch (e) { say("o-relay-msg", e.message, true); }
   refreshRelay();
 });
