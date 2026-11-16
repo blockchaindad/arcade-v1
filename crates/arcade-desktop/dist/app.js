@@ -609,7 +609,7 @@ $("w-pubaddr").addEventListener("click", async () => {
     $("w-pubaddr-text").replaceChildren(
       h("div", {}, `List these on @${r.tag}'s profile:`),
       ...r.addresses.map((a) => h("div", { class: "s" }, `${a.name}: ${a.address}${a.listed ? " (already listed)" : ""}`)),
-      h("div", { class: "s" }, `fee ${coins(r.fee, r.chain)} · ${r.size} bytes · from ${r.address}`),
+      h("div", { class: "s" }, `fee ${coins(r.fee, r.chain)} · costs ${coins(r.total, r.chain)} in all · ${r.size} bytes · from ${r.address}`),
       r.new ? null : h("p", { class: "msg" }, "Your profile already lists all of these."));
     $("w-pubaddr-send").disabled = !r.new;
     $("w-pubaddr-confirm").hidden = false;

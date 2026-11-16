@@ -814,8 +814,10 @@ pub fn publish_addresses(node: &Node, send: bool) -> Result<Value, String> {
     let ins: u64 = tx.inputs.iter().filter_map(|i| coins.iter().find(|c| c.outpoint == i.prevout).map(|c| c.value)).sum();
     let outs: u64 = tx.outputs.iter().map(|o| o.value).sum();
     let fee = ins.saturating_sub(outs);
+    // What leaves the wallet: the fee and the Class B outputs' coins.
+    let back: u64 = tx.outputs.iter().filter(|o| o.script_pubkey == script).map(|o| o.value).sum();
     let mut out = json!({"tag": tag, "address": address, "chain": home.key, "addresses": rows, "new": new,
-                         "fee": fee, "size": tx.raw.len(), "send": false});
+                         "fee": fee, "total": ins.saturating_sub(back), "size": tx.raw.len(), "send": false});
     if !send {
         return Ok(out);
     }
