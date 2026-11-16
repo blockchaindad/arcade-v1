@@ -277,7 +277,11 @@ impl AppDb {
     }
 
     fn secret(&self, name: &str) -> Result<Option<Vec<u8>>> {
-        let name = self.sname(name);
+        self.secret_at(&self.sname(name))
+    }
+
+    /// A secret by its full stored name (the account part already in it).
+    fn secret_at(&self, name: &str) -> Result<Option<Vec<u8>>> {
         let Some(v) = self.store.read(|r| r.get(SECRETS, name.as_bytes()))? else { return Ok(None) };
         if v.len() < 24 {
             return Err(AppError::BadSecret);
@@ -379,6 +383,17 @@ impl AppDb {
     pub fn phrase(&self) -> Result<String> {
         let p = self.secret("phrase")?.ok_or(AppError::NoWallet)?;
         String::from_utf8(p).map_err(|_| AppError::BadSecret)
+    }
+
+    /// The key of tag slot `index` on a chain for account `id` ("" = this arcade's own wallet), whichever account is
+    /// active: for work that belongs to one account (a swap or an order it placed) and must not follow a switch.
+    /// Read only (nothing is remembered). NoWallet when that account is not here (never added, or signed out).
+    pub fn account_tag_key(&self, id: &str, p: &arcade_wallet::ChainParams, index: u32) -> Result<arcade_wallet::SecretKey> {
+        let name = if id.is_empty() { "phrase".to_string() } else { format!("acct/{id}/phrase") };
+        let phrase = String::from_utf8(self.secret_at(&name)?.ok_or(AppError::NoWallet)?).map_err(|_| AppError::BadSecret)?;
+        let seed = arcade_wallet::keys::seed_from_phrase(&phrase).map_err(|e| AppError::Other(e.to_string()))?;
+        let x = arcade_wallet::keys::tag_key(&seed[..], p.bip44_coin_type, index).map_err(|e| AppError::Other(e.to_string()))?;
+        Ok(x.key)
     }
 
     /// Derive (and remember) the key for tag slot `index` on a chain.
@@ -516,6 +531,20 @@ mod tests {
         db.set_active_account("acc1").unwrap();
         assert!(!db.has_wallet().unwrap());
         assert!(db.scan_sealed(CONTACTS, b"").unwrap().is_empty());
+        // An account's key is read by its id whichever account is active, and is gone with the account.
+        let p2 = &arcade_wallet::PEPECOIN_TEST;
+        db.set_active_account("").unwrap();
+        let own_sk = db.tag_key(p2, 0).unwrap().1;
+        db.set_active_account("acc2").unwrap();
+        db.create_wallet(Some("legal winner thank year wave sausage worth useful legal winner thank yellow")).unwrap();
+        let acc2_sk = db.tag_key(p2, 0).unwrap().1;
+        assert_eq!(db.account_tag_key("", p2, 0).unwrap(), own_sk, "the own wallet's key while acc2 is active");
+        db.set_active_account("").unwrap();
+        assert_eq!(db.account_tag_key("acc2", p2, 0).unwrap(), acc2_sk, "acc2's key while the own wallet is active");
+        assert_eq!(db.active_account(), "", "reading it switches nothing");
+        db.drop_account("acc2").unwrap();
+        assert!(matches!(db.account_tag_key("acc2", p2, 0), Err(AppError::NoWallet)), "signed out: no key");
+        db.set_active_account("acc1").unwrap();
         // Reopened, the active account is remembered.
         drop(db);
         let db = AppDb::open(d.path()).unwrap();
