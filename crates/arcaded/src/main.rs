@@ -52,6 +52,7 @@ mod corecoins;
 mod coreboot;
 mod coreshare;
 mod leveldb;
+mod localcopy;
 mod crsource;
 mod crvia;
 mod explorer;

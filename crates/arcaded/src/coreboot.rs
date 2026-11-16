@@ -92,6 +92,9 @@ pub struct Job {
     /// Step 1 of the import (headers, missing blocks) while the pieces come in.
     pub prep: String,
     pub prepared: bool,
+    /// A Core datadir on this computer to take it from (crate::localcopy), read in place;
+    /// None for a copy fetched over the mesh.
+    pub src: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -218,7 +221,8 @@ fn schedule(s: &mut State, peer: &str) {
         {
             let next_id = &mut s.next_id;
             let Some(j) = s.jobs.get_mut(&key) else { continue };
-            if j.cancel.load(Ordering::Relaxed) || j.phase != "copy" && j.phase != "manifest" {
+            // A folder import asks nobody for anything.
+            if j.src.is_some() || j.cancel.load(Ordering::Relaxed) || j.phase != "copy" && j.phase != "manifest" {
                 continue;
             }
             let id = j.sn["id"].as_str().unwrap_or("").to_string();
@@ -358,6 +362,18 @@ fn slot(w: What) -> (usize, u64) {
 pub fn short(id: &str) -> String {
     id[..id.len().min(8)].to_string()
 }
+
+/// Who a coin set came from, for messages: an arcade, or this computer's Core folder.
+pub fn who(maker: &str) -> String {
+    if maker == LOCAL {
+        "this computer's Core folder".into()
+    } else {
+        format!("arcade {}", short(maker))
+    }
+}
+
+/// The maker named for a folder import (crate::localcopy).
+pub const LOCAL: &str = "local";
 
 // ---------------- the manifest and the pieces ----------------
 
@@ -623,6 +639,18 @@ fn restore(node: &Arc<Node>) {
         let sn = jv["sn"].clone();
         let mut j = new_job(node, &key, sn, &what);
         j.started = jv["started"].as_u64().unwrap_or(0);
+        if let Some(src) = jv["src"].as_str() {
+            // A folder import starts over from the folder (checked again: Core may run now).
+            j.src = Some(PathBuf::from(src));
+            j.phase = "copy".into();
+            j.detail = "resumed after a restart".into();
+            hold(&key, true);
+            st().jobs.insert(key.clone(), j);
+            let _ = node.app.event("chains", &format!("{key}: resuming the import from the folder {src}"));
+            let (n, k) = (node.clone(), key.clone());
+            std::thread::Builder::new().name(format!("folder prep {key}")).spawn(move || crate::cbimport::prepare_local(n, k)).unwrap();
+            continue;
+        }
         if let Ok(m) = std::fs::read(j.dir.join("manifest.json")) {
             if let Ok(mv) = serde_json::from_slice::<Value>(&m) {
                 set_manifest(&mut j, mv, &what);
@@ -668,6 +696,7 @@ fn new_job(node: &Node, key: &str, sn: Value, what: &str) -> Job {
         importing: false,
         prep: String::new(),
         prepared: false,
+        src: None,
     }
 }
 
@@ -683,7 +712,8 @@ fn job_json(j: &Job) -> Value {
     json!({"phase": j.phase, "detail": j.detail, "what": j.what, "snap": j.sn["id"], "height": j.sn["h"], "hash": j.sn["hash"],
            "maker": j.sn["maker"], "pieces": j.wanted.len(), "pieces_done": j.wanted.keys().filter(|k| j.done.contains(k)).count(),
            "bytes": want, "bytes_done": have, "mb_s": (mbs * 10.0).round() / 10.0, "holders": holders, "started": j.started,
-           "in_flight": j.inflight.len(), "prep": j.prep, "prepared": j.prepared})
+           "in_flight": j.inflight.len(), "prep": j.prep, "prepared": j.prepared,
+           "from_dir": j.src.as_ref().map(|d| d.display().to_string())})
 }
 
 /// chains.copy_status: per installed chain (or one), the copy offered, the job, the note.
@@ -715,20 +745,27 @@ pub fn chain_status(node: &Node, key: &str) -> Value {
 }
 
 /// chains.copy_start: the operator chose to bootstrap from the best copy offered.
-pub fn start(node: &Arc<Node>, key: &str, what: &str) -> Result<Value, String> {
-    let p = arcade_chain::params::by_key(key).ok_or_else(|| format!("unknown chain {key}"))?;
-    let key = p.key;
-    crate::chaindrive::not_moving(key)?;
-    if !matches!(what, "coins" | "all") {
-        return Err("what must be coins (the coin set; missing blocks from the network) or all (blocks too)".into());
-    }
-    let mode = node.mode_of(key).ok_or_else(|| format!("{} is not installed", p.name))?;
-    if key == node.params.key {
+/// What any bootstrap of a chain needs (from a copy or a folder): installed, not the home
+/// chain, every block kept, not moving.
+fn may_bootstrap(node: &Node, p: &'static arcade_chain::params::ChainParams) -> Result<(), String> {
+    crate::chaindrive::not_moving(p.key)?;
+    let mode = node.mode_of(p.key).ok_or_else(|| format!("{} is not installed (install it first: arcade chain add {} full)", p.name, p.key))?;
+    if p.key == node.params.key {
         return Err("the home chain is not bootstrapped from copies".into());
     }
     if mode == "shared" {
         return Err("Shared storage keeps only part of the blocks; a copy's coin set needs every block stored".into());
     }
+    Ok(())
+}
+
+pub fn start(node: &Arc<Node>, key: &str, what: &str) -> Result<Value, String> {
+    let p = arcade_chain::params::by_key(key).ok_or_else(|| format!("unknown chain {key}"))?;
+    let key = p.key;
+    if !matches!(what, "coins" | "all") {
+        return Err("what must be coins (the coin set; missing blocks from the network) or all (blocks too)".into());
+    }
+    may_bootstrap(node, p)?;
     if st().jobs.contains_key(key) {
         return Ok(chain_status(node, key));
     }
@@ -759,6 +796,57 @@ pub fn start(node: &Arc<Node>, key: &str, what: &str) -> Result<Value, String> {
     let n = node.clone();
     let k = key.to_string();
     std::thread::Builder::new().name(format!("copy prep {key}")).spawn(move || crate::cbimport::prepare(n, k)).unwrap();
+    Ok(chain_status(node, key))
+}
+
+/// chains.copy_from_dir: bootstrap a chain once from a Core datadir on this computer (an old
+/// arcade's node, stopped), read in place (crate::localcopy): its blocks and coin set are
+/// taken in as an "all" copy's are, then re-checked from the blocks in the background.
+pub fn start_from_dir(node: &Arc<Node>, key: &str, dir: &str) -> Result<Value, String> {
+    let p = arcade_chain::params::by_key(key).ok_or_else(|| format!("unknown chain {key}"))?;
+    let key = p.key;
+    may_bootstrap(node, p)?;
+    if let Some(j) = st().jobs.get(key) {
+        if j.phase != "failed" {
+            return Err(format!("{} is already being bootstrapped ({}); cancel it first: arcade chain copy cancel {key}", p.name, j.phase));
+        }
+    }
+    let dir = crate::localcopy::normalize(dir);
+    // Refused here, before the chain is held: not a datadir, Core running, pruned, another chain.
+    let ld = crate::localcopy::check_datadir(&dir, p)?;
+    let (tip, _) = behind(node, key).unwrap_or((0, 0));
+    let id = crate::localcopy::snap_id(&ld.dir, &ld.best);
+    let sn = json!({"id": id, "h": null, "hash": ld.best.to_hex(), "maker": LOCAL, "from": ld.dir.display().to_string()});
+    let mut j = new_job(node, key, sn.clone(), "all");
+    j.src = Some(ld.dir.clone());
+    j.phase = "copy".into();
+    j.detail = format!("reading {} in place ({} block files)", ld.dir.display(), ld.blk_files);
+    std::fs::create_dir_all(&j.dir).map_err(|e| e.to_string())?;
+    std::fs::write(
+        job_dir(node, key).join("job.json"),
+        serde_json::to_vec(&json!({"sn": sn, "what": "all", "started": j.started, "src": ld.dir.display().to_string()})).unwrap(),
+    )
+    .map_err(|e| e.to_string())?;
+    if let Ok(rd) = std::fs::read_dir(job_dir(node, key)) {
+        for e in rd.flatten() {
+            if e.path().is_dir() && e.path() != j.dir {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
+    {
+        let mut s = st();
+        s.declined.remove(key);
+        s.jobs.insert(key.to_string(), j);
+    }
+    hold(key, true);
+    let _ = node.app.event("chains", &format!(
+        "{}: bootstrapping once from the Core folder {} (read in place, never written; this arcade at {tip}; coin set at block {}, {})",
+        p.name, ld.dir.display(), ld.best, ld.layout.map(|l| l.name()).unwrap_or("no coins yet")
+    ));
+    let n = node.clone();
+    let k = key.to_string();
+    std::thread::Builder::new().name(format!("folder prep {key}")).spawn(move || crate::cbimport::prepare_local(n, k)).unwrap();
     Ok(chain_status(node, key))
 }
 
@@ -812,6 +900,20 @@ pub fn prepared(key: &str) -> bool {
 
 pub fn failed(key: &str) -> bool {
     st().jobs.get(key).is_some_and(|j| j.phase == "failed")
+}
+
+/// The folder a folder import reads (None for a mesh copy).
+pub fn job_src(key: &str) -> Option<PathBuf> {
+    st().jobs.get(key).and_then(|j| j.src.clone())
+}
+
+/// A folder import's tip and height, known once its blk files are walked: the stand-in for a
+/// copy's manifest.
+pub fn set_local_manifest(key: &str, m: Value) {
+    if let Some(j) = st().jobs.get_mut(key) {
+        j.sn["h"] = m["height"].clone();
+        j.manifest = Some(m);
+    }
 }
 
 /// Snapshot of what the importer needs.
@@ -873,7 +975,7 @@ mod tests {
             key: "pep".into(), net: "main".into(), sn, what: "coins".into(), dir: "/nonexistent".into(), manifest: None,
             wanted: Default::default(), done: Default::default(), inflight: Default::default(), holders: Default::default(),
             phase: "manifest".into(), detail: String::new(), started: 0, got_bytes: 0, rate: Default::default(),
-            cancel: Default::default(), importing: false, prep: String::new(), prepared: false,
+            cancel: Default::default(), importing: false, prep: String::new(), prepared: false, src: None,
         };
         set_manifest(&mut j, m.clone(), "coins");
         let coins = (j.wanted.len(), want_bytes(&j));
