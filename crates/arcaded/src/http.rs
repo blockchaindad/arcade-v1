@@ -1653,7 +1653,7 @@ fn openai_err(s: &mut TcpStream, status: &str, msg: &str) {
     respond(s, status, "application/json", &[], v.to_string().as_bytes());
 }
 
-/// `/openai/v1/models` and `/openai/v1/chat/completions` (crate::llmsvc): a shared model, paid from this wallet's
+/// `/openai/v1/models`, `/openai/v1/chat/completions` and `/openai/v1/audio/speech` (crate::llmsvc): a shared model, paid from this wallet's
 /// credit at its seller, as OpenAI programs ask for it.
 fn openai_door(node: &Node, s: &mut TcpStream, r: &Req, rest: &str) {
     let key = r.headers.get("authorization").and_then(|v| v.as_str()).and_then(|v| v.strip_prefix("Bearer ")).map(str::trim).unwrap_or("");
@@ -1759,6 +1759,39 @@ fn openai_door(node: &Node, s: &mut TcpStream, r: &Req, rest: &str) {
                 Err(e) => openai_err(s, "502 Bad Gateway", &e),
             }
         }
-        _ => openai_err(s, "404 Not Found", "this door has GET models and POST chat/completions"),
+        ("POST", "audio/speech") => {
+            let Ok(body) = serde_json::from_slice::<Value>(&r.body) else { return openai_err(s, "400 Bad Request", "the body isn't JSON") };
+            let asked = body["model"].as_str().unwrap_or("").to_string();
+            let (seller, model) = match crate::llmsvc::pick(node, &asked) {
+                Ok(x) => x,
+                Err(e) => return openai_err(s, "404 Not Found", &e),
+            };
+            let mut b = body.clone();
+            b["model"] = json!(model);
+            // The head goes out with the first audio, so an error before it is a proper error answer.
+            let mut out = s.try_clone().ok();
+            let mut started = false;
+            let r = crate::llmsvc::speak(node, &seller, &b, &mut |ct, bytes| {
+                let Some(o) = out.as_mut() else { return Err("closed".into()) };
+                if !started {
+                    let head = format!("HTTP/1.1 200 OK\r\nContent-Type: {}\r\nCache-Control: no-store\r\nConnection: close\r\nTransfer-Encoding: chunked\r\nX-Content-Type-Options: nosniff\r\n\r\n", ct.unwrap_or("application/octet-stream"));
+                    o.write_all(head.as_bytes()).map_err(|_| "the program hung up".to_string())?;
+                    started = true;
+                }
+                if bytes.is_empty() {
+                    return Ok(());
+                }
+                o.write_all(format!("{:x}\r\n", bytes.len()).as_bytes()).and_then(|_| o.write_all(bytes)).and_then(|_| o.write_all(b"\r\n")).map_err(|_| "the program hung up".to_string())
+            });
+            match r {
+                Ok(_) if started => {
+                    let _ = s.write_all(b"0\r\n\r\n");
+                }
+                Ok(_) => openai_err(s, "502 Bad Gateway", "the seller sent no audio"),
+                Err(e) if !started => openai_err(s, if e.starts_with("not enough credit") { "402 Payment Required" } else { "502 Bad Gateway" }, &e),
+                Err(_) => {} // cut off: the program sees the audio end early
+            }
+        }
+        _ => openai_err(s, "404 Not Found", "this door has GET models, POST chat/completions and POST audio/speech"),
     }
 }

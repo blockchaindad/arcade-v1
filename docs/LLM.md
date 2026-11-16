@@ -1,6 +1,6 @@
 # Shared models (LLM inference for ARCADE)
 
-Status: BUILT on branch claude/llm-share (2026-11-16), tested on a local two-arcade ARCADE net; not released. Martin 2026-11-16: "add open AI API to arcade V1 so that someone with a local model can
+Status: LIVE in v0.1.98 (chat, PR #239); **speech** (voices, §7) built on branch claude/llm-speech 2026-11-16. Martin 2026-11-16: "add open AI API to arcade V1 so that someone with a local model can
 share their inference to the network in exchange. They should earn arcade coin." Decided: **buyers pay sellers**
 (a market, as the original arcade's LLM service); no minted reward, no change to the ARCADE coin's rules.
 
@@ -95,3 +95,31 @@ is reached once it links to the buyer's arcade (or through a relay).
 
 - Whether credits can also be paid in other coins (pep, doge ...) later; this plan is ARCADE only.
 - Pictures (step 2).
+
+## 7. Speech (voices)
+
+Martin 2026-11-16: "build the sharing of the conversational speech model" (the CSM voice server, `csm-voice`, an
+OpenAI `/v1/audio/speech` server whose `/v1/models` lists `csm-1b` with its `voices`).
+
+- **Several model servers.** A seller sets `servers: [{url, key}]` (the old single `url` + `key` is read as the first),
+  so one arcade can share its chat server and its voice server together. A scan of every server records where each
+  model lives and what it is (`info: {model: {server, kind, voices}}`); requests go only to that server. Each server
+  has its own slots, so a voice and a chat don't wait for each other.
+- **A speech model** is one whose list entry has `voices`, or whose name says tts/csm/speech/kokoro/orpheus. Its offer
+  entry carries `kind: "speech"` and the voices; older arcades list it as a chat model and get a clear refusal.
+- **Price**: `in` = ARCADE per million **characters** of input (OpenAI prices speech the same way); `out` is unused.
+  The cost is known before: it is reserved in full, refused when the credit doesn't cover it, and charged only when
+  audio came (an error costs nothing). Input 1 to 4096 characters. The buyer counts the characters itself, so its
+  record shows any over-billing exactly.
+- **Wire**: `q {what: "speech", body: {model, input, voice?, response_format?, speed?, instructions?}}` (nothing else
+  is passed to the voice server). Answers carry the audio in the frames' blobs (48 KiB pieces, the first with
+  `ev {type}`), keepalives `ev {wait: true}` every 20 s while the voice server is still making audio (CSM makes a
+  whole wav before sending), then `{"arcade": {usage: {characters, bytes}, cost, left, ...}}`. A speech request may
+  take 20 minutes; the seller waits while the link's queue is full rather than dropping audio.
+- **Buyer**: `POST /openai/v1/audio/speech` streams the audio as it arrives (`Content-Type` from the seller's server;
+  402 when the credit is short, 502 on a seller error, OpenAI-style). `GET /openai/v1/models` marks voices with
+  `kind: "speech"` and `voices`. `llm.speak {model|seller, input, voice?, response_format?}` returns base64 for the
+  Models tab, whose try-it box becomes *Speak* with a voice picker and a player when a voice is picked. App pages'
+  `arcade.llm` lists chat models only.
+- Tested: scratchpad `llmspeech.py` on a closed two-arcade net with a fake voice server (byte-exact audio, 0.002
+  ARCADE for 40 characters at 50/M, failure free, door 5.8 MB wav, 45 s silent start, own use free, chat beside it).
