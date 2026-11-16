@@ -21,11 +21,17 @@ const THEME = (() => {
   const KEY = "arcade.theme";            // {id, chain, txid, name}
   const CACHE = "arcade.theme.cache";    // {txid, manifest}: drawn at once on the next start
   const DESK = "arcade.theme.desk.";     // + theme id: windows' places
-  const TABS = [
-    ["home", "Home"], ["wallet", "Wallet"], ["messages", "Messages"], ["feed", "Feed"], ["apps", "Apps"],
-    ["explorer", "Explorer"], ["chains", "Chains & Coins"], ["mine", "Mine"], ["activity", "Activity"],
-    ["apitab", "API"], ["options", "Options"],
-  ];
+  // Every theme shows the app's own tabs, read from its tab bar (index.html's nav), so a tab added to the app (People)
+  // is in every theme's menus, toolbar, desktop, start menu and dock at once. The list is the fallback for a page
+  // without the nav.
+  const TABS = (() => {
+    const nav = [...document.querySelectorAll("nav button[data-tab]")].map((b) => [b.dataset.tab, b.textContent.trim()]);
+    return nav.length ? nav : [
+      ["home", "Home"], ["wallet", "Wallet"], ["messages", "Messages"], ["feed", "Feed"], ["people", "People"], ["apps", "Apps"],
+      ["explorer", "Explorer"], ["chains", "Chains & Coins"], ["mine", "Mine"], ["activity", "Activity"],
+      ["apitab", "API"], ["options", "Options"],
+    ];
+  })();
   const COLOURS = ["bg", "panel", "panel-2", "ink", "muted", "line", "accent", "accent-ink", "accent-soft",
     "warn-bg", "warn-line", "bad", "faint"];
   // Pairs that must read: [text, background, least contrast].
@@ -319,7 +325,8 @@ button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:defa
 `;
   const ICONS = {
     home: "M3 11 12 4l9 7v9h-6v-6H9v6H3z", wallet: "M3 7h15a3 3 0 0 1 3 3v8H3zM3 7l12-3v3M16 13h2",
-    messages: "M4 5h16v11H9l-5 4z", feed: "M5 5h14M5 10h14M5 15h9M5 20h6", apps: "M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z",
+    messages: "M4 5h16v11H9l-5 4z", feed: "M5 5h14M5 10h14M5 15h9M5 20h6",
+    people: "M9 11a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7zM3 20c0-3.5 2.7-6 6-6s6 2.5 6 6M16 4.5a3.5 3.5 0 0 1 0 6.5M18 14c2 .7 3 2.8 3 6", apps: "M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z",
     explorer: "M10 4a6 6 0 1 1 0 12 6 6 0 0 1 0-12zM15 15l5 5", chains: "M9 8h-3a4 4 0 0 0 0 8h3M15 8h3a4 4 0 0 1 0 8h-3M8 12h8",
     mine: "M5 20 15 10M13 4l7 7M11 6l7 7", activity: "M3 12h4l3-7 4 14 3-7h4", apitab: "M8 7l-5 5 5 5M16 7l5 5-5 5",
     options: "M12 8a4 4 0 1 1 0 8 4 4 0 0 1 0-8zM12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M5 19l2-2M17 7l2-2",
