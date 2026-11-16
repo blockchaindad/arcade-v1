@@ -683,6 +683,9 @@ fn our_tip(node: &Node) -> u64 {
     node.chain.tip(node.params.chain_no).ok().flatten().map(|t| t.height as u64).unwrap_or(0)
 }
 
+/// A link that has heard nothing for this long has ended (pings go both ways every 15 s).
+const LINK_SILENT: Duration = Duration::from_secs(120);
+
 pub fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> {
     link.set_read_timeout(Duration::from_secs(5))?;
     // Tell V1.0 peers what we can serve (existing arcades ignore this kind).
@@ -757,6 +760,10 @@ fn serve_loop(
 ) -> Result<(), LinkError> {
     let cr_reqs = &mut *cr_reqs;
     crate::arcsvc::new_link(&link.peer_id);
+    // Last frame heard. Both ends ping every 15 s and answer pings, so a link that has heard nothing for LINK_SILENT
+    // is dead (a relayed link whose far end is gone, a socket the network dropped without a reset): it ends, so the two
+    // arcades can link again, instead of staying "linked" with nothing going through (seen 2026-11-16, ARCADE #19).
+    let mut heard = std::time::Instant::now();
     loop {
         // Queued frames: every link sends every frame once (those still in the ring).
         let pending: Vec<Value> = {
@@ -816,6 +823,10 @@ fn serve_loop(
         // fast lane is busy).
         let wait = if crate::realtime::fast::busy() { 2 } else { 50 };
         if !link.ready(Duration::from_millis(wait))? {
+            // Checked only with nothing waiting to be read, so a long turn of this loop isn't taken for silence.
+            if heard.elapsed() > LINK_SILENT {
+                return Err(LinkError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, format!("nothing heard for {} s", LINK_SILENT.as_secs()))));
+            }
             continue;
         }
         let f = match link.recv() {
@@ -823,6 +834,7 @@ fn serve_loop(
             Err(LinkError::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
             Err(e) => return Err(e),
         };
+        heard = std::time::Instant::now();
         match f.kind() {
             "ping" => link.send(&Frame::pong(&f))?,
             #[cfg(feature = "oldimport")]
