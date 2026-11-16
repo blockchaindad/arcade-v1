@@ -181,7 +181,7 @@ fn page_route_ok(path: &str) -> bool {
 /// Mesh answers kept a short while: the Explorer asks the same things again and again
 /// (switching coins and back, the overview's 30 s refresh). A failure is kept too, so a
 /// holder that can't be reached costs one wait, not one per page.
-fn mesh_ask(node: &Node, p: &'static ChainParams, ix: &str, cmd: &str, q: &Value) -> Result<(Value, String), String> {
+pub(crate) fn mesh_ask(node: &Node, p: &'static ChainParams, ix: &str, cmd: &str, q: &Value) -> Result<(Value, String), String> {
     type Cache = std::collections::HashMap<String, (std::time::Instant, Result<(Value, String), String>)>;
     static C: std::sync::OnceLock<std::sync::Mutex<Cache>> = std::sync::OnceLock::new();
     let c = C.get_or_init(Default::default);
