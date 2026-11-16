@@ -664,6 +664,175 @@ pub fn announce_if_needed(node: &Node) -> Result<Option<String>, String> {
     Ok(txids.into_iter().next())
 }
 
+// ---------------- your addresses on your profile ----------------
+
+/// Where a key announcement from the ledger home `home` lists an address of chain `p`: the other Pepecoin network in
+/// section 2, Dogecoin in 7, any other coin by its net name in 8 (arcade_ledger::index::linked_of reads them back).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Slot {
+    Other,
+    Doge,
+    Net(String),
+}
+
+pub fn slot_for(home: &arcade_chain::params::ChainParams, p: &arcade_chain::params::ChainParams) -> Option<Slot> {
+    if p.chain_no == home.chain_no || p.net == "regtest" {
+        return None;
+    }
+    let pep = |c: &arcade_chain::params::ChainParams| c.key.starts_with("pep");
+    if pep(home) && pep(p) && matches!((home.net, p.net), ("test", "main") | ("main", "test")) {
+        return Some(Slot::Other);
+    }
+    if matches!((home.net, p.net), ("test", "test") | ("main", "main") | ("main", "test") | ("test", "main")) {
+        return None; // "test"/"main" name the other Pepecoin network only
+    }
+    if p.key == "doge" {
+        return Some(Slot::Doge);
+    }
+    (1..=16).contains(&p.net.len()).then(|| Slot::Net(p.net.to_string()))
+}
+
+/// This wallet's own address on a coin: the key that holds an @tag there, else its first key, else slot 0
+/// (m/44'/coin'/0'/0/0), the same address the Wallet tab shows for the coin.
+fn own_key_on(node: &Node, p: &'static arcade_chain::params::ChainParams) -> Option<(String, [u8; 20])> {
+    let keys = node.app.tag_keys(p.chain_no).ok().unwrap_or_default();
+    let k = keys.iter().find(|k| k.tag.is_some()).or(keys.first()).cloned().or_else(|| node.app.tag_key(p, 0).ok().map(|x| x.0))?;
+    let pk = hex::decode(&k.pubkey).ok().and_then(|b| arcade_wallet::secp256k1::PublicKey::from_slice(&b).ok())?;
+    Some(own_address(p, &pk))
+}
+
+/// A key's p2pkh address on chain `p` and its key hash.
+pub fn own_address(p: &arcade_chain::params::ChainParams, pk: &arcade_wallet::secp256k1::PublicKey) -> (String, [u8; 20]) {
+    let h: [u8; 20] = arcade_ledger::address::hash160(&pk.serialize());
+    (arcade_ledger::address::base58check(p.p2pkh_version, &h), h)
+}
+
+/// The announcement that keeps a published profile (name, @tag, picture, bio, link and what it already lists) and
+/// lists `add` too, each replacing any address the profile had in the same place.
+pub fn announce_with(key: [u8; 32], stated: [u8; 20], tag: &str, prof: Option<&Value>, home: &arcade_chain::params::ChainParams, add: &[(Slot, [u8; 20])]) -> arcade_msg::public::Announce {
+    let text = |k: &str| prof.and_then(|v| v[k].as_str()).map(str::to_string).filter(|s| !s.is_empty());
+    let mut a = arcade_msg::public::Announce {
+        key,
+        hash160: Some(stated),
+        name: text("name").unwrap_or_else(|| tag.to_string()),
+        tag: Some(tag.to_string()),
+        // The index keeps a picture's txid in display order (reversed bytes).
+        pfp: text("pfp").and_then(|x| hex::decode(x).ok()).and_then(|mut b| { b.reverse(); b.try_into().ok() }),
+        bio: text("bio"),
+        url: text("url"),
+        ..Default::default()
+    };
+    for l in prof.and_then(|v| v["linked"].as_array()).into_iter().flatten() {
+        let (Some(net), Some(ad)) = (l["chain"].as_str(), l["address"].as_str()) else { continue };
+        let h = match ad.strip_prefix("h160:") {
+            Some(x) => hex::decode(x).ok(),
+            None => arcade_ledger::address::decode_base58check(ad).map(|(_, h)| h),
+        };
+        let Some(h) = h.and_then(|h| <[u8; 20]>::try_from(h).ok()) else { continue };
+        let slot = match net {
+            "main" | "test" => Slot::Other,
+            "doge" => Slot::Doge,
+            n => match arcade_chain::params::by_key(n).and_then(|p| slot_for(home, p)) {
+                Some(s) => s,
+                None => Slot::Net(n.to_string()),
+            },
+        };
+        put_slot(&mut a, slot, h);
+    }
+    for (slot, h) in add {
+        put_slot(&mut a, slot.clone(), *h);
+    }
+    a
+}
+
+fn put_slot(a: &mut arcade_msg::public::Announce, slot: Slot, h: [u8; 20]) {
+    match slot {
+        Slot::Other => a.other = Some(h),
+        Slot::Doge => a.doge = Some(h),
+        Slot::Net(n) => {
+            a.chains.retain(|(m, _)| *m != n);
+            a.chains.push((n, h));
+        }
+    }
+}
+
+/// `profile.publish_addresses {send?}`: list this wallet's own addresses on its @tag's profile (Pepecoin mainnet,
+/// Dogecoin and each other coin installed here) with a new key announcement from the @tag's address on the ledger
+/// home, keeping the rest of the profile. No private key is pasted: the addresses come from the 12 words. Without
+/// send: true it is only built and shown with its fee; send: true broadcasts it.
+pub fn publish_addresses(node: &Node, send: bool) -> Result<Value, String> {
+    if !node.app.has_wallet().map_err(|e| e.to_string())? {
+        return Err("make or restore a wallet first".into());
+    }
+    let home = node.ledger_home();
+    let (address, tag, sk) = sender_key(node)?;
+    let tag = tag.ok_or("claim an @tag first: the addresses go on your @tag's profile")?;
+    let prof = arcade_ledger::index::profile(&node.chain, home.chain_no, &address).map_err(|e| e.to_string())?;
+    let listed: Vec<(String, String)> = prof.as_ref().and_then(|v| v["linked"].as_array()).into_iter().flatten()
+        .filter_map(|l| Some((l["chain"].as_str()?.to_string(), l["address"].as_str()?.to_string()))).collect();
+    let mut chains: Vec<&'static arcade_chain::params::ChainParams> = Vec::new();
+    let extra: Vec<String> = node.extra.lock().unwrap().keys().map(|k| k.to_string()).collect();
+    for cp in extra.iter().filter_map(|k| crate::chains::find(k)) {
+        let arcade = crate::arcsvc::runs(cp) || crate::arcsvc::defined().is_some_and(|d| d.chain_no == cp.chain_no);
+        if !arcade && !chains.iter().any(|c| c.chain_no == cp.chain_no) {
+            chains.push(cp);
+        }
+    }
+    chains.sort_by_key(|c| c.key);
+    let mut add: Vec<(Slot, [u8; 20])> = Vec::new();
+    let mut rows: Vec<Value> = Vec::new();
+    for cp in chains {
+        let Some(slot) = slot_for(home, cp) else { continue };
+        if add.iter().any(|(s, _)| *s == slot) {
+            continue;
+        }
+        let Some((a, h)) = own_key_on(node, cp) else { continue };
+        let net = match &slot {
+            Slot::Other => if home.net == "test" { "main" } else { "test" }.to_string(),
+            Slot::Doge => "doge".to_string(),
+            Slot::Net(n) => n.clone(),
+        };
+        let already = listed.iter().any(|(n, x)| *n == net && *x == a);
+        rows.push(json!({"chain": cp.key, "name": cp.name, "address": a, "listed": already}));
+        add.push((slot, h));
+    }
+    if add.is_empty() {
+        return Err("no other coin is installed here, so there is no address to list (add one in Chains & Coins)".into());
+    }
+    let k = keys(node)?;
+    let h160 = arcade_ledger::address::p2pkh_hash_of(home, &address).ok_or("bad address")?;
+    let a = announce_with(k.public_bytes(), h160, &tag, prof.as_ref(), home, &add);
+    let fresh = prof.as_ref().map_or(true, |p| p["pubkey"] != hex::encode(k.public_bytes()).as_str() || p["stated"] != true);
+    let new = fresh || rows.iter().any(|r| r["listed"] != true);
+    let payload = arcade_wallet::tx::any_data(&a.encode());
+    // Built here first: its size and fee, the same way it is sent.
+    let pk = arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
+    let script = arcade_wallet::keys::p2pkh_script_for(&pk);
+    let coins = crate::claims::spendable(node, &script);
+    let tx = arcade_wallet::tx::build_arcade(home, &payload, vec![], &sk, &coins, crate::claims::FEE_PER_KB, crate::claims::DUST, arcade_app::now() as u32)
+        .map_err(|e| format!("could not build the profile's transaction (the fee is paid in {} coins from @{tag}'s address): {e}", home.name))?;
+    let ins: u64 = tx.inputs.iter().filter_map(|i| coins.iter().find(|c| c.outpoint == i.prevout).map(|c| c.value)).sum();
+    let outs: u64 = tx.outputs.iter().map(|o| o.value).sum();
+    let fee = ins.saturating_sub(outs);
+    let mut out = json!({"tag": tag, "address": address, "chain": home.key, "addresses": rows, "new": new,
+                         "fee": fee, "size": tx.raw.len(), "send": false});
+    if !send {
+        return Ok(out);
+    }
+    if !new {
+        return Err(format!("@{tag}'s profile already lists these addresses: nothing was sent"));
+    }
+    let (txids, fee) = send_payloads(node, &[a.encode()])?;
+    // announce_if_needed waits for this one rather than sending a key announcement without the addresses.
+    let flag = format!("announce:{}", hex::encode(k.public_bytes()));
+    node.app.store.write(|w| w.put(arcade_app::META, flag.as_bytes(), &arcade_app::now().to_be_bytes())).map_err(|e| e.to_string())?;
+    let _ = node.app.event("messages", &format!("published your addresses on @{tag}'s profile (fee {fee})"));
+    out["send"] = json!(true);
+    out["fee"] = json!(fee);
+    out["txid"] = json!(txids.into_iter().next());
+    Ok(out)
+}
+
 // ---------------- arcade.node: node-to-node messages for app pages ----------------
 
 const NODE_PER_HOUR: usize = 30;
@@ -732,4 +901,87 @@ pub fn node_replies(node: &Node, page: &str, after: u64, limit: usize) -> Value 
     out.sort_by_key(|r| r["id"].as_u64());
     out.truncate(limit.clamp(1, 100));
     json!(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arcade_chain::params::{DIGIBYTE_MAIN, DOGECOIN_MAIN, LITECOIN_TEST, PEPECOIN_MAIN, PEPECOIN_REGTEST, PEPECOIN_TEST};
+
+    const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    fn key_on(p: &arcade_chain::params::ChainParams) -> arcade_wallet::secp256k1::PublicKey {
+        let seed = arcade_wallet::keys::seed_from_phrase(PHRASE).unwrap();
+        arcade_wallet::keys::tag_key(&seed[..], p.bip44_coin_type, 0).unwrap().public()
+    }
+
+    #[test]
+    fn own_addresses_come_from_the_words() {
+        // m/44'/3'/0'/0/0: Dogecoin's known address for these words, and Pepecoin mainnet's from the same key.
+        let (doge, dh) = own_address(&DOGECOIN_MAIN, &key_on(&DOGECOIN_MAIN));
+        assert_eq!(doge, "DBus3bamQjgJULBJtYXpEzDWQRwF5iwxgC");
+        let (pep, ph) = own_address(&PEPECOIN_MAIN, &key_on(&PEPECOIN_MAIN));
+        assert_eq!(pep, "PehYeRLFsRj5jboZXTC6rFHxmYdmV9RdfR");
+        assert_eq!(dh, ph, "one coin type, one key");
+        // m/44'/1'/0'/0/0 on Pepecoin testnet: the @tag's address, another key.
+        let (home, hh) = own_address(&PEPECOIN_TEST, &key_on(&PEPECOIN_TEST));
+        assert_eq!(home, "nZVmfmUtKPmskB9Ds4P9GUJy9eYFqPKHqH");
+        assert_ne!(hh, ph);
+    }
+
+    #[test]
+    fn each_coin_has_its_place_in_the_announcement() {
+        let home = &PEPECOIN_TEST;
+        assert_eq!(slot_for(home, &PEPECOIN_MAIN), Some(Slot::Other));
+        assert_eq!(slot_for(home, &DOGECOIN_MAIN), Some(Slot::Doge));
+        assert_eq!(slot_for(home, &DIGIBYTE_MAIN), Some(Slot::Net("dgb".into())));
+        assert_eq!(slot_for(home, &LITECOIN_TEST), Some(Slot::Net("ltctest".into())));
+        assert_eq!(slot_for(home, &PEPECOIN_TEST), None, "the home's own address is the @tag's");
+        assert_eq!(slot_for(home, &PEPECOIN_REGTEST), None);
+    }
+
+    #[test]
+    fn published_addresses_read_back_as_listed_and_keep_the_profile() {
+        let home = &PEPECOIN_TEST;
+        let (_, ph) = own_address(&PEPECOIN_MAIN, &key_on(&PEPECOIN_MAIN));
+        let (_, dh) = own_address(&DOGECOIN_MAIN, &key_on(&DOGECOIN_MAIN));
+        let (stated_addr, stated) = own_address(home, &key_on(home));
+        let dgb = arcade_ledger::address::base58check(DIGIBYTE_MAIN.p2pkh_version, &[5; 20]);
+        let pfp = "aa".repeat(31) + "01";
+        // A profile already published: its name, picture, bio, link, an old Pepecoin mainnet address and a DigiByte one.
+        let prof = json!({"name": "Alice A.", "tag": "alice", "pfp": pfp, "bio": "hi", "url": "https://example.com",
+                          "linked": [{"chain": "main", "address": arcade_ledger::address::base58check(56, &[9; 20])},
+                                     {"chain": "dgb", "address": dgb}]});
+        let a = announce_with([7; 32], stated, "alice", Some(&prof), home, &[(Slot::Other, ph), (Slot::Doge, dh)]);
+        let payload = arcade_wallet::tx::any_data(&a.encode());
+        assert_eq!(arcade_msg::public::Announce::parse(&a.encode()).as_ref(), Some(&a));
+        // What the profiles index reads back, and so the explorer's @tag page.
+        let back = arcade_ledger::index::parse_announcement(&payload).unwrap();
+        assert_eq!(back.pubkey, [7; 32]);
+        assert_eq!(back.stated_h160, Some(stated));
+        assert_eq!(arcade_ledger::address::base58check(home.p2pkh_version, &stated), stated_addr);
+        assert_eq!(back.tag.as_deref(), Some("alice"));
+        assert_eq!(back.name.as_deref(), Some("Alice A."));
+        assert_eq!(back.pfp.as_deref(), Some(pfp.as_str()));
+        assert_eq!(back.bio.as_deref(), Some("hi"));
+        assert_eq!(back.url.as_deref(), Some("https://example.com"));
+        let linked = arcade_ledger::index::linked_of(&back, home);
+        assert_eq!(linked, vec![
+            ("main".to_string(), "PehYeRLFsRj5jboZXTC6rFHxmYdmV9RdfR".to_string()),
+            ("doge".to_string(), "DBus3bamQjgJULBJtYXpEzDWQRwF5iwxgC".to_string()),
+            ("dgb".to_string(), dgb),
+        ]);
+        // The explorer shows an address on the chain whose net it names.
+        assert!(linked.iter().any(|(n, a)| *n == PEPECOIN_MAIN.net && a.starts_with('P')));
+        assert!(linked.iter().any(|(n, _)| *n == DOGECOIN_MAIN.net));
+    }
+
+    #[test]
+    fn a_first_profile_gets_the_tag_as_its_name() {
+        let a = announce_with([1; 32], [2; 20], "bob", None, &PEPECOIN_TEST, &[(Slot::Net("ltc".into()), [3; 20])]);
+        assert_eq!(a.name, "bob");
+        assert_eq!(a.tag.as_deref(), Some("bob"));
+        assert_eq!(a.chains, vec![("ltc".to_string(), [3; 20])]);
+        assert!(a.other.is_none() && a.doge.is_none() && a.bio.is_none() && a.pfp.is_none());
+    }
 }

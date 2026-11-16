@@ -164,6 +164,7 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | `msg.send` | `/api/v1/msg/send` | message | to, text?, file? | Send a private message to a @tag, address or key; file = {name, type, data (base64)}. |
 | `msg.delete` | `/api/v1/msg/delete` | message | id | Stop showing a message here (the chain keeps it). |
 | `msg.announce` | `/api/v1/msg/announce` | wallet | — | Publish your messaging key now if it isn't on chain. |
+| `profile.publish_addresses` | `/api/v1/profile/publish_addresses` | wallet | send? | List this wallet's own addresses (Pepecoin mainnet, Dogecoin, each other coin installed here) on your @tag's profile, keeping the rest of it; no private key is pasted. send: true broadcasts, otherwise it's only built and shown with its fee. |
 
 ### Contacts
 

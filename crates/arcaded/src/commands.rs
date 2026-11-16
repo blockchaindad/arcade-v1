@@ -115,6 +115,7 @@ cmds! {
     "msg.send" Message "to, text?, file?" "Send a private message to a @tag, address or key; file = {name, type, data (base64)}.";
     "msg.delete" Message "id" "Stop showing a message here (the chain keeps it).";
     "msg.announce" Wallet "" "Publish your messaging key now if it isn't on chain.";
+    "profile.publish_addresses" Wallet "send?" "List this wallet's own addresses (Pepecoin mainnet, Dogecoin, each other coin installed here) on your @tag's profile, keeping the rest of it; no private key is pasted. send: true broadcasts, otherwise it's only built and shown with its fee.";
     "contacts.list" Read "" "Your contacts.";
     "contacts.save" Message "key, name?, address?, notes?" "Add or change a contact (by messaging key).";
     "contacts.delete" Message "key" "Remove a contact.";

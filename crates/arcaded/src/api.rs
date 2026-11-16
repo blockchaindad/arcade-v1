@@ -353,6 +353,7 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         "rpc.info" => Ok(json!({"url": format!("http://127.0.0.1:{}/rpc", node.http_port.get().copied().unwrap_or(8420)), "api": format!("http://127.0.0.1:{}/api/v1/", node.http_port.get().copied().unwrap_or(8420)), "cookie_file": node.home.canonicalize().unwrap_or_else(|_| node.home.clone()).join(".cookie")})),
         "msg.delete" => crate::msgsvc::delete(node, &s("id").ok_or("id required")?),
         "msg.announce" => Ok(json!({"txid": crate::msgsvc::announce_if_needed(node)?})),
+        "profile.publish_addresses" => crate::msgsvc::publish_addresses(node, req["send"] == true),
         "contacts.list" => Ok(crate::msgsvc::contacts_list(node)),
         "contacts.save" => crate::msgsvc::contact_save(node, &s("key").ok_or("key required")?, &s("name").unwrap_or_default(), &s("address").unwrap_or_default(), &s("notes").unwrap_or_default()),
         "contacts.delete" => crate::msgsvc::contact_delete(node, &s("key").ok_or("key required")?),
