@@ -45,7 +45,7 @@ pub fn list(node: &Node) -> Value {
         // on the wrong account.
         if a["tag"].is_null() {
             if let Some(addr) = a["address"].as_str() {
-                a["tag"] = json!(arcade_ledger::index::tag_of(&node.chain, node.params.chain_no, addr).ok().flatten());
+                a["tag"] = json!(arcade_ledger::index::tag_of(&node.chain, node.ledger_home().chain_no, addr).ok().flatten());
             }
         }
         a["active"] = json!(a["id"] == active.as_str());
@@ -128,7 +128,7 @@ pub fn add_words(node: &Node, phrase: &str) -> Result<Value, String> {
         let a = l.into_iter().find(|a| a["id"] == id.as_str()).unwrap_or_default();
         return Ok(json!({"account": {"id": id, "tag": a["tag"], "address": a["address"]}, "added": false, "own": false}));
     }
-    let p = node.params;
+    let p = node.ledger_home();
     let seed = arcade_wallet::keys::seed_from_phrase(&phrase).map_err(|e| e.to_string())?;
     let x = arcade_wallet::keys::tag_key(&seed[..], p.bip44_coin_type, 0).map_err(|e| e.to_string())?;
     let addr0 = arcade_wallet::keys::p2pkh_address(&x.public(), p.p2pkh_version);
@@ -226,7 +226,7 @@ fn ask_vault(host: &str, tag: &str, here: bool) -> Option<(String, Value)> {
 /// The sealed vault for @tag: from `from` if given, else from whichever known arcade holds it
 /// (up to 8 asked at once). Its address must be the one the @tag names on chain.
 fn find_vault(node: &Node, tag: &str, from: Option<&str>) -> Result<(String, Value), String> {
-    let owner = arcade_ledger::index::tag_row(&node.chain, node.params.chain_no, tag)
+    let owner = arcade_ledger::index::tag_row(&node.chain, node.ledger_home().chain_no, tag)
         .map_err(|e| e.to_string())?
         .map(|r| r.address)
         .ok_or_else(|| format!("@{tag} is not claimed"))?;
@@ -273,7 +273,7 @@ pub fn sign_in(node: &Node, tag: &str, password: &str, from: Option<&str>) -> Re
         return Err("those words don't match the account's login key".into());
     }
     // The @tag's address must come from these words (m/44'/1'/0'/0/0 on the account chain).
-    let p = node.params;
+    let p = node.ledger_home();
     let seed = arcade_wallet::keys::seed_from_phrase(&phrase).map_err(|e| e.to_string())?;
     let x = arcade_wallet::keys::tag_key(&seed[..], p.bip44_coin_type, 0).map_err(|e| e.to_string())?;
     let addr0 = arcade_wallet::keys::p2pkh_address(&x.public(), p.p2pkh_version);

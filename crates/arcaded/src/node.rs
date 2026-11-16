@@ -199,6 +199,13 @@ pub struct Node {
 
 
 impl Node {
+    /// The ledger's home chain (docs/HOMECHAIN.md): where @tags, profiles, follows, posts, messages, linked wallets and
+    /// the operator's handle proof are written, and read first. `params` is a coin chain (Pepecoin testnet's sync,
+    /// miner, mempool and welcome faucet); the two are one chain until HOMECHAIN.md phase 3 moves the ledger to ARCADE.
+    pub fn ledger_home(&self) -> &'static arcade_chain::params::ChainParams {
+        self.params
+    }
+
     /// Our node id: the Ed25519 identity key in hex.
     pub fn id_hex(&self) -> String {
         hex::encode(self.identity.verifying_key().to_bytes())

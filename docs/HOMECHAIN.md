@@ -42,7 +42,8 @@ Each phase ships as a release, and each has a pass test like §15.2's.
 
 ### 0. An ARCADE network that is always up and reachable
 
-- **Ashburn installs ARCADE testnet** (`chains.add arctest`), keeps it whole and lends it.
+- **Ashburn installs ARCADE testnet** (`chains.add arctest`), keeps it whole and lends it. **Done 2026-11-16:**
+  installed on v0.1.84, synced to block 451 within minutes, about 890 MB of RAM (1.3 GB still free) and 129 MB of disk.
   - **Today:** only home-network arcades and one other address hold the chain. A firewalled arcade sat at block 0
     because none of the arcades it could reach ran the chain (2026-11-16).
   - **Seeds:** Ashburn is in SEEDS already. Once it runs the chain, the seeds give every arcade an ARCADE source.
@@ -57,6 +58,18 @@ Each phase ships as a release, and each has a pass test like §15.2's.
   - **Ledger uses** go through `ledger_home()`.
   - **Coin uses** take the chain they mean (`chains::find`, or the coin's own params).
 - **Pass:** the whole test suite passes, and the three arcades behave as before.
+- **Done (2026-11-16):** `Node::ledger_home()` is in, with 66 uses routed through it:
+  - **Whole modules:** claims, follows, feedsvc, links, handlegate, accountsvc and msgsvc.
+  - **Mixed modules, ledger reads only:** tag lookups in explorer and realtime, the App Store's feed acts and
+    creator tags, `msg.stats`, and arcledger's ledger chains.
+- **Left on `params` (184 uses):** these mean Pepecoin testnet as a coin chain, or are defaults phase 3 decides:
+  - **Coin machinery:** sync, the miner, the mempool, resends, the welcome faucet, Core copies, lending, its own
+    ledger index (`ledger.rs`), and the "from home" profile (the old Pepecoin profile shown beside an ARCADE one).
+  - **Market, trades and swaps** (marketsvc, tradesvc, swaps): their tokens and order book are Pepecoin testnet's
+    ledger today. **Open for phase 3:** do tokens and the market move to ARCADE with the rest? The snapshot already
+    carried 121 tokens and 462 balances there.
+  - **Defaults:** the explorer's and site API's chain when none is named (explorer, sitesvc, http, pagechain), and
+    the wallet's send chain (walletsvc).
 
 ### 2. Reads ask ARCADE first
 
