@@ -45,6 +45,11 @@
     el.className = "brow" + (c.installed || borrowed ? "" : " off");
     const info = document.createElement("div"); info.className = "bi";
     const nm = document.createElement("div"); nm.className = "bn"; nm.textContent = `${c.name} `;
+    // Kept here: every block is checked on this arcade, green with no count.
+    if (c.installed) nm.prepend(trustDot("green", `${c.name} is kept on this arcade: every block is checked here.`, null, true));
+    else if (borrowed && bc.trust) nm.prepend(trustDot(bc.trust, bc.trust_note, bc.trust_hosts));
+    // Borrowing on but nobody lends it: grey, 0.
+    else if (!c.installed && !borrowed && bc.on !== false && globalOn && !bc.lendable) nm.prepend(trustDot("grey", `No arcade lends ${c.name} right now.`, 0));
     const tk = document.createElement("span"); tk.className = "bt"; tk.textContent = TICKERS[c.key] || c.key; nm.append(tk);
     const d = document.createElement("div"); d.className = "bd";
     const l = document.createElement("div"); l.className = "bl";
@@ -74,7 +79,9 @@
       d.textContent = "Not installed" + (bc.on === false || !globalOn ? " · borrowing off" : bc.lendable ? " · borrowing starts soon" : " · no arcade lends it right now");
     }
     if (c.arcade && c.local) d.textContent += " · local test chain";
-    if (bc.mismatch) { const w = document.createElement("div"); w.className = "bw"; w.textContent = bc.mismatch; info.append(w); }
+    // Red only: what the problem is (other levels say it in the dot's tooltip).
+    if (borrowed && bc.trust === "red" && bc.trust_note) { const w = document.createElement("div"); w.className = "bw"; w.textContent = bc.trust_note; info.append(w); }
+    else if (bc.mismatch) { const w = document.createElement("div"); w.className = "bw"; w.textContent = bc.mismatch; info.append(w); }
     const bal = document.createElement("div"); bal.className = "bb"; bal.textContent = borrowed ? coinAmt(bc.balance, c.key) : "";
     const act = document.createElement("div"); act.className = "ba";
     if (!c.installed && bc.key) {

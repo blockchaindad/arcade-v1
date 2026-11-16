@@ -1,12 +1,14 @@
 :root {
   --bg: #f6f7f5; --panel: #ffffff; --ink: #1d231f; --muted: #66706a; --line: #dfe4df;
   --accent: #2e8b44; --accent-ink: #ffffff; --warn-bg: #fff6e0; --warn-line: #e8c56a; --bad: #b3261e;
+  --trust-green: #2e8b44; --trust-yellow: #c58a00; --trust-grey: #6f7973; --trust-red: #b3261e; --trust-ink: #fff; --trust-ink-yellow: #241c00;
   color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #121614; --panel: #1b201d; --ink: #e7ece8; --muted: #9aa59e; --line: #2c342f;
     --accent: #4fbf68; --accent-ink: #0d1a10; --warn-bg: #2a2412; --warn-line: #7a6427; --bad: #ff8a80;
+    --trust-green: #4fbf68; --trust-yellow: #e6b93c; --trust-grey: #6b766f; --trust-red: #ff8a80; --trust-ink: #0d110e; --trust-ink-yellow: #0d110e;
     color-scheme: dark;
   }
 }
@@ -334,7 +336,15 @@ button.linkish { border: 0; background: none; padding: 0; font-size: 11px; color
 .brow .bi { flex: 1; min-width: 0; }
 .brow .bn { font-weight: 650; }
 .brow .bd, .brow .bl { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
-.brow .bw { color: #c0392b; font-size: 12px; }
+.brow .bw { color: var(--trust-red, #c0392b); font-size: 12px; }
+/* A borrowed chain's trust colour (common.js trustDot). */
+.trust { display: inline-flex; align-items: center; justify-content: center; min-width: 15px; height: 15px; padding: 0 3px; box-sizing: border-box; border-radius: 8px; margin-right: 6px; vertical-align: 1px; background: var(--trust-grey); flex: none; font: 600 10px/1 system-ui, -apple-system, "Segoe UI", sans-serif; color: #fff; font-variant-numeric: tabular-nums; color: var(--trust-ink); }
+.trust.yellow { color: var(--trust-ink-yellow); }
+.trust.grey { color: #fff; }
+.trust.green { background: var(--trust-green); }
+.trust.yellow { background: var(--trust-yellow); }
+.trust.red { background: var(--trust-red); }
+.trust.kept { min-width: 9px; width: 9px; height: 9px; padding: 0; }
 .brow .bb { font-weight: 600; font-size: 13px; white-space: nowrap; }
 .brow.off .bi, .brow.off .logo { opacity: .6; }
 .brow .bt { color: var(--muted); font-weight: 500; font-size: 12px; }

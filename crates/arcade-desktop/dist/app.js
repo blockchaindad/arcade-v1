@@ -323,8 +323,10 @@ async function refreshWallet() {
     for (const p of ["w-send-panel", "w-recv-panel", "w-imp-panel"]) $(p).hidden = true;
     $("w-confirm").hidden = true; msg($("w-send-msg"), "");
   }
-  const [keys, imps] = await Promise.all([api("wallet.keys", { chain: ch.key }), api("wallet.imports").catch(() => [])]);
+  const [keys, imps, st] = await Promise.all([api("wallet.keys", { chain: ch.key }), api("wallet.imports").catch(() => []), api("chains.status", { key: ch.key }).catch(() => null)]);
   state.keys = keys;
+  // The chain's status, for its trust dot (drawCard runs again without asking for it).
+  W.st = st; W.stKey = ch.key;
   W.list = [
     ...keys.map((k) => ({ id: "own:" + k.index, own: true, index: k.index, address: k.address, legacy: k.legacy, tag: k.tag, balance: k.balance, pending: k.pending || 0,
       confirmed: k.confirmed, free: k.free, pendingCoins: k.pending_coins || 0, waiting: k.waiting || [], dropped: k.dropped || [],
@@ -387,8 +389,15 @@ function drawCard(ch) {
   $("w-who").textContent = w.own ? (w.tag ? "@" + w.tag : "This arcade's wallet") : `${w.name || "Imported wallet"} · imported ${w.kind === "phrase" ? "from words" : "key"}`;
   $("w-bal").textContent = w.balance == null ? "—" : coinNum(w.balance);
   $("w-unit").textContent = tk;
+  // A borrowed chain: its trust colour beside the balance (red adds its note below), from the
+  // status refreshWallet loaded. Kept here: a plain green dot; borrowed: its colour and count.
+  const st = W.stKey === ch.key ? W.st : null;
+  $("w-trust").replaceChildren();
+  if (st && !st.borrowed && (st.installed || st.home)) $("w-trust").replaceChildren(trustDot("green", `${ch.name} is kept on this arcade: every block is checked here.`, null, true));
+  else if (st && st.borrowed && st.trust) $("w-trust").replaceChildren(trustDot(st.trust, st.trust_note, st.trust_hosts));
   const ddOn = w.own && w.index === 0 && isDD(ch.key) && W.dd && !W.dd.error;
   const sub = [];
+  if (st && st.borrowed && st.trust === "red" && st.trust_note) sub.push(st.trust_note);
   if (w.balance == null) sub.push(`${ch.name} isn't installed or borrowed with addresses here: add it in Chains & Coins to see balances.`);
   // The balance follows the mempool (wallet.keys): the blocks' figure beside it when they differ.
   if (w.confirmed != null && w.confirmed !== w.balance) sub.push(`${coinNum(w.confirmed)} ${tk} confirmed`);
