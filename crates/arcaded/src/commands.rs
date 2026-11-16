@@ -203,6 +203,7 @@ cmds! {
     "ledger.item_state" Wallet "repo, number, state, manifest?" "Close, reopen or merge an issue or pull request.";
     "ledger.items" Read "repo, number?" "A repository's issues and pull requests with their comments and reviews.";
     "arc.earn" Admin "chain, on?" "The Earn ARCADE switch for a chain kept here in full (docs/EARN.md), and where it stands: sealing, the catalog, replicas waiting to register, this arcade's turn and next payout.";
+    "arc.earning" Read "" "Whether this arcade earns ARCADE: a light (green, yellow, grey, red) and why, pay built up, audits, the next payout turn, and the account paid.";
     "ord.chunks" Public "from?, chain?" "Ord fingerprint chunks (as other arcades compare them).";
     "name" Public "name?, chain?" "A name claim, or counts.";
     "map" Public "map?, chain?" "A map claim, or counts.";

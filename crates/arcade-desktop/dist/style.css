@@ -483,6 +483,12 @@ button.linkish { border: 0; background: none; padding: 0; font-size: 11px; color
 .earn-h .switch { margin-left: auto; }
 .earn-line { margin-top: 6px; font-size: 13px; opacity: .85; }
 .earn .bar { margin-top: 8px; }
+.earning { margin: 12px 0 4px; padding: 12px 14px; border: 1px solid #6a3fb0; border-radius: 12px; background: rgba(120,70,200,.08); }
+.earning .eword { margin-left: auto; font-size: 13px; color: var(--muted); }
+.edot { display: inline-block; width: 14px; height: 14px; border-radius: 50%; flex: none; border: 1px solid rgb(0 0 0 / .15); }
+.edot.green { background: #2e8b44; } .edot.yellow { background: #d9a400; } .edot.grey { background: #9aa59e; } .edot.red { background: #c62828; }
+.earn-rows { display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; margin: 10px 0 6px; font-size: 13px; overflow-wrap: anywhere; }
+.earn-rows .k { padding-top: 2px; }
 .switch { position: relative; display: inline-block; width: 42px; height: 24px; }
 .switch input { opacity: 0; width: 0; height: 0; }
 .switch .knob { position: absolute; inset: 0; border-radius: 12px; background: #3a3d3b; transition: .15s; cursor: pointer; }

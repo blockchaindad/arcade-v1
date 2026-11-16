@@ -430,6 +430,20 @@ impl AppDb {
         self.store.read(|r| Ok(r.get(TAG_KEYS, &k)?))?.map(|v| dec(TAG_KEYS, &v)).transpose()
     }
 
+    /// A tag key one account (`id`; "" is this arcade's own wallet) has made for a chain, read as stored, without
+    /// making that account the one in use. None when it never made one.
+    pub fn stored_tag_key_of(&self, id: &str, chain: u16, index: u32) -> Result<Option<TagKey>> {
+        let key = KeyBuf::new().u16(chain).u32(index).done();
+        let k = if id.is_empty() {
+            key
+        } else {
+            let mut k = format!("@{id}/").into_bytes();
+            k.extend_from_slice(&key);
+            k
+        };
+        self.store.read(|r| Ok(r.get(TAG_KEYS, &k)?))?.map(|v| dec(TAG_KEYS, &v)).transpose()
+    }
+
     pub fn tag_keys(&self, chain: u16) -> Result<Vec<TagKey>> {
         self.ascan(TAG_KEYS, &KeyBuf::new().u16(chain).done())?.into_iter().map(|(_, v)| dec(TAG_KEYS, &v)).collect()
     }
