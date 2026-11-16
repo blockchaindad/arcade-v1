@@ -680,7 +680,7 @@ pub fn wallet_addresses(node: &Node) -> serde_json::Map<String, Value> {
     if !node.app.has_wallet().unwrap_or(false) {
         return out;
     }
-    let mut chains: Vec<&'static ChainParams> = vec![node.params];
+    let mut chains: Vec<&'static ChainParams> = vec![node.ledger_home()];
     let extra: Vec<String> = node.extra.lock().unwrap().keys().map(|k| k.to_string()).collect();
     chains.extend(extra.iter().filter_map(|k| crate::chains::find(k)));
     for cp in chains {
@@ -726,7 +726,7 @@ fn h160_of(address: &str) -> Option<Vec<u8>> {
 /// The chains whose arcade ledger is read here, besides ARCADE: the home chain and every chain installed with its
 /// ledger or profiles index.
 fn ledger_chains(node: &Node) -> Vec<&'static ChainParams> {
-    let mut out = vec![node.params];
+    let mut out = vec![node.ledger_home()];
     let extra: Vec<String> = node.extra.lock().unwrap().keys().map(|k| k.to_string()).collect();
     for k in extra {
         if let Some(cp) = crate::chains::find(&k) {

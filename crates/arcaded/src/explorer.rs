@@ -867,7 +867,7 @@ fn tip(x: &Ctx) -> u32 {
 
 fn tag_of(x: &Ctx, a: &str) -> Option<String> {
     // @tags live on the home chain.
-    arcade_ledger::index::tag_of(&x.node.chain, x.node.params.chain_no, a).ok().flatten()
+    arcade_ledger::index::tag_of(&x.node.chain, x.node.ledger_home().chain_no, a).ok().flatten()
 }
 
 fn scan_after(x: &Ctx, table: &str, pre: Vec<u8>, after: Option<String>, n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -1465,7 +1465,7 @@ fn search(x: &Ctx, q: &str) -> R {
     let hit = |kind: &str, id: String| Ok(json!({"kind": kind, "id": id}));
     if let Some(t) = q.strip_prefix('@') {
         // A tag page: every address the tag's owner has on this chain.
-        arcade_ledger::index::tag_row(&x.node.chain, x.node.params.chain_no, &t.to_lowercase()).map_err(e)?.ok_or_else(|| format!("@{t} is not claimed"))?;
+        arcade_ledger::index::tag_row(&x.node.chain, x.node.ledger_home().chain_no, &t.to_lowercase()).map_err(e)?.ok_or_else(|| format!("@{t} is not claimed"))?;
         return hit("tag", t.to_lowercase());
     }
     if let Some(num) = q.strip_prefix('#') {
@@ -1500,7 +1500,7 @@ fn search(x: &Ctx, q: &str) -> R {
     // A plain word: everything it could be on this chain, as a list.
     let w = q.to_lowercase();
     let mut items: Vec<Value> = Vec::new();
-    if arcade_ledger::index::tag_row(&x.node.chain, x.node.params.chain_no, &w).ok().flatten().is_some() {
+    if arcade_ledger::index::tag_row(&x.node.chain, x.node.ledger_home().chain_no, &w).ok().flatten().is_some() {
         items.push(json!({"kind": "tag", "id": w, "label": format!("@{w}"), "what": "@tag"}));
     }
     if x.has("names") {

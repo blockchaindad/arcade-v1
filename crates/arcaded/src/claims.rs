@@ -20,22 +20,22 @@ pub struct Check {
 
 /// The chain a claim is on: the home chain, or the ARCADE chain running here (§15 step 7: the ledger on ARCADE).
 pub fn chain_of(node: &Node, c: u16) -> Option<&'static ChainParams> {
-    if c == node.params.chain_no {
-        return Some(node.params);
+    if c == node.ledger_home().chain_no {
+        return Some(node.ledger_home());
     }
     crate::arcsvc::defined().filter(|p| p.chain_no == c && crate::arcsvc::runs(p))
 }
 
 /// A chain asked for by key (none: the home chain), if claims can be made on it.
 pub fn chain_for(node: &Node, key: Option<&str>) -> Result<&'static ChainParams, String> {
-    match key.filter(|k| !k.is_empty() && !k.eq_ignore_ascii_case(node.params.key)) {
-        None => Ok(node.params),
-        Some(k) => crate::arcsvc::params_for(k).filter(|p| crate::arcsvc::runs(p)).ok_or_else(|| format!("@tags are claimed on {} or on the ARCADE chain (installed here); not on {k}", node.params.name)),
+    match key.filter(|k| !k.is_empty() && !k.eq_ignore_ascii_case(node.ledger_home().key)) {
+        None => Ok(node.ledger_home()),
+        Some(k) => crate::arcsvc::params_for(k).filter(|p| crate::arcsvc::runs(p)).ok_or_else(|| format!("@tags are claimed on {} or on the ARCADE chain (installed here); not on {k}", node.ledger_home().name)),
     }
 }
 
 fn is_home(node: &Node, p: &ChainParams) -> bool {
-    p.chain_no == node.params.chain_no
+    p.chain_no == node.ledger_home().chain_no
 }
 
 /// The claim transaction's fee rate and dust for `p`.
@@ -104,13 +104,13 @@ pub fn check_on(node: &Node, p: &'static ChainParams, tag: &str) -> Check {
 /// Spendable coins of a tag key's address.
 /// Coins carrying an inscription are left out (crate::ordsafe).
 pub fn spendable(node: &Node, script: &[u8]) -> Vec<Utxo> {
-    crate::ordsafe::keep_free(node, node.params, coins(node, script))
+    crate::ordsafe::keep_free(node, node.ledger_home(), coins(node, script))
 }
 
 pub(crate) fn coins(node: &Node, script: &[u8]) -> Vec<Utxo> {
     // The home chain still catching up: its borrowed copy knows the coins (incl. waiting ones).
-    if crate::borrow::is_borrowed(node.params.key) {
-        let mut out = crate::borrow::spendable(node, node.params, script);
+    if crate::borrow::is_borrowed(node.ledger_home().key) {
+        let mut out = crate::borrow::spendable(node, node.ledger_home(), script);
         out.retain(|u| !node.pending_spent.lock().unwrap().contains(&u.outpoint));
         return out;
     }
@@ -123,7 +123,7 @@ pub(crate) fn coins(node: &Node, script: &[u8]) -> Vec<Utxo> {
 /// another pooled transaction or by one of ours. Spending them is valid: parent and child
 /// confirm together (Core accepts chains of unconfirmed transactions).
 pub(crate) fn unconfirmed_coins(node: &Node, script: &[u8]) -> Vec<Utxo> {
-    let p = node.params;
+    let p = node.ledger_home();
     let c = p.chain_no;
     let mut out = Vec::new();
     for (_, raw) in node.chain.mempool(c).unwrap_or_default() {
@@ -170,7 +170,7 @@ pub(crate) fn arc_coins(node: &Node, p: &ChainParams, script: &[u8]) -> Vec<Utxo
 }
 
 fn confirmed_coins(node: &Node, script: &[u8]) -> Vec<Utxo> {
-    let p = node.params;
+    let p = node.ledger_home();
     let c = p.chain_no;
     let tip = node.chain.tip(c).ok().flatten().map(|t| t.height).unwrap_or(0);
     let mut out = Vec::new();
@@ -356,13 +356,13 @@ fn advance_one(node: &Node, mut c: Claim) -> Result<Claim, String> {
 /// This arcade's own tag index is behind the chain: the home chain is borrowed (still syncing)
 /// or more than 10 blocks back.
 fn lagging(node: &Node) -> bool {
-    crate::borrow::is_borrowed(node.params.key) || crate::borrow::home_lag(node).0 > 10
+    crate::borrow::is_borrowed(node.ledger_home().key) || crate::borrow::home_lag(node).0 > 10
 }
 
 /// Who holds `tag` by another arcade's word, for when this arcade's own tag index is behind.
 /// Ok(None): an arcade keeping the tags says it is not claimed; Err: nobody could say.
 fn owner_while_lagging(node: &Node, tag: &str) -> Result<Option<String>, String> {
-    mesh_verdict(crate::explorer::handle(node, "explorer.tag", &serde_json::json!({"chain": node.params.key, "tag": tag})))
+    mesh_verdict(crate::explorer::handle(node, "explorer.tag", &serde_json::json!({"chain": node.ledger_home().key, "tag": tag})))
 }
 
 /// explorer.tag's answer as a verdict: an owner, free (only when the mesh was asked and said
@@ -384,7 +384,7 @@ fn mesh_verdict(r: Result<serde_json::Value, String>) -> Result<Option<String>, 
 /// A claim for `tag` waiting in the mempool of a V1.0 arcade keeping the home chain (a
 /// borrowed home chain's own pool may not hold it): its sender.
 fn pending_elsewhere(node: &Node, tag: &str) -> Option<String> {
-    let p = node.params;
+    let p = node.ledger_home();
     let (v, _) = crate::shares::ask_explorer(node, p, "", "explorer.mempool", &serde_json::json!({"chain": p.key, "local": true})).ok()?;
     v["pending_tags"].as_array()?.iter().find(|x| x[0] == tag).and_then(|x| x[1].as_str().map(String::from))
 }
@@ -404,14 +404,14 @@ fn mesh_owner(node: &Node, tag: &str) -> Option<String> {
         }
         m.insert(tag.to_string(), now);
     }
-    let v = crate::explorer::handle(node, "explorer.tag", &serde_json::json!({"chain": node.params.key, "tag": tag})).ok()?;
+    let v = crate::explorer::handle(node, "explorer.tag", &serde_json::json!({"chain": node.ledger_home().key, "tag": tag})).ok()?;
     v["_mesh"].is_object().then(|| v["home_address"].as_str().map(String::from)).flatten()
 }
 
 /// A wallet with no @handle and no claim yet keeps asking for test coins while it has none
 /// (an ask made when no arcade could pay is asked again after 15 minutes).
 fn ask_for_first_handle(node: &Node) {
-    let p = node.params;
+    let p = node.ledger_home();
     if !node.app.has_wallet().unwrap_or(false) {
         return;
     }
@@ -440,7 +440,7 @@ const RESTORE_SLOTS: u32 = 5;
 pub fn find_own_tag(node: &Node, now: bool) -> Option<String> {
     use std::sync::Mutex;
     static LAST: Mutex<u64> = Mutex::new(0);
-    let p = node.params;
+    let p = node.ledger_home();
     if !node.app.has_wallet().unwrap_or(false) {
         return None;
     }
@@ -486,7 +486,7 @@ pub fn find_own_tag(node: &Node, now: bool) -> Option<String> {
 
 /// The @tag another arcade says `address` holds on the home chain.
 fn tag_by_mesh(node: &Node, address: &str) -> Option<String> {
-    let p = node.params;
+    let p = node.ledger_home();
     let (v, _) = crate::shares::ask_explorer(node, p, "", "explorer.address", &serde_json::json!({"chain": p.key, "address": address, "local": true})).ok()?;
     v["tag"].as_str().filter(|t| !t.is_empty()).map(String::from)
 }
@@ -504,14 +504,14 @@ pub fn advance_all(node: &Node) {
 
 /// Remember the coins a transaction we just built spends, until a block settles them.
 pub fn mark_spent(node: &Node, tx: &arcade_chain::Tx) {
-    let _ = crate::mempoolshare::add(node, node.params, tx);
+    let _ = crate::mempoolshare::add(node, node.ledger_home(), tx);
     let mut ps = node.pending_spent.lock().unwrap();
     for i in &tx.inputs {
         ps.insert(i.prevout);
     }
     // Forget coins the chain has since seen spent.
-    let _c = node.params.chain_no;
-    ps.retain(|op| node.chain.coin(node.params, op).ok().flatten().is_some());
+    let _c = node.ledger_home().chain_no;
+    ps.retain(|op| node.chain.coin(node.ledger_home(), op).ok().flatten().is_some());
     for i in &tx.inputs {
         ps.insert(i.prevout);
     }
@@ -520,7 +520,7 @@ pub fn mark_spent(node: &Node, tx: &arcade_chain::Tx) {
 /// Arcade transactions waiting in the home mempool: (tx, what it carries).
 pub fn pending_arcade(node: &Node) -> Vec<(arcade_chain::Tx, arcade_ledger::extract::ArcadeTx)> {
     use arcade_ledger::extract::{class_b_marker, detect_class, extract, Prevout};
-    let p = node.params;
+    let p = node.ledger_home();
     let marker = class_b_marker(p);
     let pool: Vec<arcade_chain::Tx> = node
         .chain
@@ -558,7 +558,7 @@ pub fn pending_arcade(node: &Node) -> Vec<(arcade_chain::Tx, arcade_ledger::extr
 /// Tag claims waiting in the mempool: (tag, sender address).
 pub fn pending_tags(node: &Node) -> Vec<(String, String)> {
     use arcade_ledger::extract::{class_b_marker, detect_class, extract, Prevout};
-    let p = node.params;
+    let p = node.ledger_home();
     let marker = class_b_marker(p);
     let mut out = Vec::new();
     let pool: Vec<arcade_chain::Tx> = node
@@ -605,7 +605,7 @@ pub fn signals_rbf(tx: &arcade_chain::Tx) -> bool {
 /// wallet made, handle claimed or being claimed, test coins asked for or here.
 pub fn start_status(node: &Node) -> serde_json::Value {
     use serde_json::json;
-    let p = node.params;
+    let p = node.ledger_home();
     let wallet = node.app.has_wallet().unwrap_or(false);
     if !wallet {
         return json!({"wallet": false});

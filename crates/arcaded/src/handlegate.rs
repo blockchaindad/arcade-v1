@@ -78,7 +78,7 @@ fn own() -> std::sync::MutexGuard<'static, Option<(String, Value)>> {
 pub fn own_proof(node: &Node) -> Option<(String, Value)> {
     let made = match crate::msgsvc::sender_key(node) {
         Ok((addr, Some(tag), sk)) => {
-            let net = node.params.key;
+            let net = node.ledger_home().key;
             let sig = arcade_wallet::keys::signmessage(&sk, arcade_wallet::keys::PEPECOIN_MAGIC, &words(&node.id_hex(), &tag, net));
             Some((tag, json!({"net": net, "addr": addr, "sig": sig})))
         }

@@ -160,7 +160,7 @@ fn take(node: &Node, me: &[u8; 32], o: &env::Opened, group: Option<String>, cand
 fn rescan_group(node: &Node, gid: &str) -> Result<(), String> {
     let Some((secret, _)) = crate::grpsvc::secrets(node).into_iter().find(|(_, id)| id == gid) else { return Ok(()) };
     let me = keys(node)?.public_bytes();
-    let c = node.params.chain_no;
+    let c = node.ledger_home().chain_no;
     let mut cursor = None;
     loop {
         let batch = arcade_ledger::messages::candidates(&node.chain, c, cursor, 500).map_err(|e| e.to_string())?;
@@ -191,7 +191,7 @@ pub fn scan(node: &Node) -> Result<usize, String> {
     }
     let k = keys(node)?;
     let me = k.public_bytes();
-    let c = node.params.chain_no;
+    let c = node.ledger_home().chain_no;
     let ck = cursor_key(&k.fingerprint());
     let mut cursor: Option<(u32, u32)> = node
         .app
@@ -281,7 +281,7 @@ pub fn scan(node: &Node) -> Result<usize, String> {
 }
 
 fn block_time(node: &Node, h: u32) -> u64 {
-    let c = node.params.chain_no;
+    let c = node.ledger_home().chain_no;
     node.chain.hash_at(c, h).ok().flatten().and_then(|hash| node.chain.header(c, &hash).ok().flatten()).map(|r| r.header.time as u64).unwrap_or_else(arcade_app::now)
 }
 
@@ -311,7 +311,7 @@ pub fn run(node: std::sync::Arc<Node>) {
 
 /// Published profiles on the home chain by messaging key (hex).
 fn profiles_by_key(node: &Node) -> BTreeMap<String, Value> {
-    let c = node.params.chain_no;
+    let c = node.ledger_home().chain_no;
     let pre = KeyBuf::new().u16(c).done();
     let mut out: BTreeMap<String, Value> = BTreeMap::new();
     for (_, v) in node.chain.store(c).read(|r| r.scan_prefix(arcade_ledger::index::PROFILE, &pre)).unwrap_or_default() {
@@ -348,7 +348,7 @@ pub fn mutes(node: &Node) -> BTreeMap<String, u64> {
 
 /// Who a messaging key is: contact name, published name, @tag, address.
 fn person(node: &Node, key: &str, fallback_address: &str, profiles: &BTreeMap<String, Value>, contacts: &BTreeMap<String, Value>) -> Value {
-    let c = node.params.chain_no;
+    let c = node.ledger_home().chain_no;
     let prof = profiles.get(key);
     let address = prof.and_then(|p| p["address"].as_str()).filter(|_| prof.is_some_and(|p| p["stated"] == true)).unwrap_or(fallback_address).to_string();
     let tag = if address.is_empty() { None } else { arcade_ledger::index::tag_of(&node.chain, c, &address).ok().flatten() };
@@ -363,10 +363,10 @@ fn person(node: &Node, key: &str, fallback_address: &str, profiles: &BTreeMap<St
 
 /// Who `name` is (@tag or address) and their published messaging key.
 pub fn who(node: &Node, name: &str) -> Result<Value, String> {
-    let c = node.params.chain_no;
+    let c = node.ledger_home().chain_no;
     let n = name.trim();
     // "@name", or a bare name that isn't an address (people type handles without the @).
-    let tag = n.strip_prefix('@').or_else(|| arcade_ledger::address::p2pkh_hash_of(node.params, n).is_none().then_some(n));
+    let tag = n.strip_prefix('@').or_else(|| arcade_ledger::address::p2pkh_hash_of(node.ledger_home(), n).is_none().then_some(n));
     let address = match tag {
         Some(t) => arcade_ledger::index::tag_row(&node.chain, c, &t.to_lowercase()).map_err(|e| e.to_string())?.ok_or_else(|| format!("@{t} is not claimed"))?.address,
         None => n.to_string(),
@@ -521,7 +521,7 @@ pub fn mute(node: &Node, address: &str, on: bool) -> Result<Value, String> {
 
 /// The key we send from: the one holding our @tag on the home chain (else slot 0).
 pub fn sender_key(node: &Node) -> Result<(String, Option<String>, arcade_wallet::SecretKey), String> {
-    let p = node.params;
+    let p = node.ledger_home();
     let keys = node.app.tag_keys(p.chain_no).map_err(|e| e.to_string())?;
     for k in &keys {
         if let Ok(Some(t)) = arcade_ledger::index::tag_of(&node.chain, p.chain_no, &k.address) {
@@ -544,7 +544,7 @@ fn coins_text(p: &arcade_chain::params::ChainParams, sats: u64) -> String {
 }
 
 pub fn send_payloads_with(node: &Node, payloads: &[Vec<u8>], mut extra: Vec<arcade_wallet::tx::TxOutSpec>) -> Result<(Vec<String>, u64), String> {
-    let p = node.params;
+    let p = node.ledger_home();
     let (_, _, sk) = sender_key(node)?;
     let pk = arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
     let script = arcade_wallet::keys::p2pkh_script_for(&pk);
@@ -643,7 +643,7 @@ pub fn announce_if_needed(node: &Node) -> Result<Option<String>, String> {
     let Some(tag) = tag else { return Ok(None) };
     let k = keys(node)?;
     let key = hex::encode(k.public_bytes());
-    let c = node.params.chain_no;
+    let c = node.ledger_home().chain_no;
     let prof = arcade_ledger::index::profile(&node.chain, c, &address).map_err(|e| e.to_string())?;
     if prof.as_ref().is_some_and(|p| p["pubkey"] == key.as_str() && p["stated"] == true) {
         return Ok(None);
@@ -655,7 +655,7 @@ pub fn announce_if_needed(node: &Node) -> Result<Option<String>, String> {
             return Ok(None);
         }
     }
-    let h160 = arcade_ledger::address::p2pkh_hash_of(node.params, &address).ok_or("bad address")?;
+    let h160 = arcade_ledger::address::p2pkh_hash_of(node.ledger_home(), &address).ok_or("bad address")?;
     let a = arcade_msg::public::Announce { key: k.public_bytes(), hash160: Some(h160), name: tag.clone(), tag: Some(tag.clone()), ..Default::default() };
     let (txids, fee) = send_payloads(node, &[a.encode()])?;
     node.app.store.write(|w| w.put(arcade_app::META, flag.as_bytes(), &arcade_app::now().to_be_bytes())).map_err(|e| e.to_string())?;
@@ -675,7 +675,7 @@ fn talks(node: &Node, page: &str) -> Vec<Value> {
 pub fn node_identity(node: &Node) -> Result<Value, String> {
     let k = keys(node)?;
     let pk = hex::encode(k.public_bytes());
-    Ok(json!({"pubkey": pk, "contactcode": pk, "network": node.params.net, "maxbytes": env::MAX_PAYLOAD - 134 - 8}))
+    Ok(json!({"pubkey": pk, "contactcode": pk, "network": node.ledger_home().net, "maxbytes": env::MAX_PAYLOAD - 134 - 8}))
 }
 
 /// Seal and send an API message (type 6: stamp + JSON) from this wallet's messaging key.

@@ -64,7 +64,7 @@ fn ledger_chains(node: &Node) -> Vec<&'static ChainParams> {
 /// address when the testnet's ledger snapshot carried it over; failing both, the home chain's own tag.
 fn creator_tag(node: &Node, p: &ChainParams, creator: &str) -> Option<String> {
     use arcade_ledger::index::tag_of;
-    let home = node.params;
+    let home = node.ledger_home();
     if p.chain_no == home.chain_no {
         return tag_of(&node.chain, p.chain_no, creator).ok().flatten();
     }
@@ -129,7 +129,7 @@ fn borrowed_card_rows(node: &Node, kept: &[&'static ChainParams]) -> Vec<(&'stat
 /// Every app on every ledger chain (this arcade's, and the chains it borrows), grouped and resolved.
 fn gather(node: &Node) -> Vec<App> {
     let mut apps = Vec::new();
-    let home = node.params.chain_no;
+    let home = node.ledger_home().chain_no;
     let acts = arcade_ledger::messages::rows(&node.chain, arcade_ledger::messages::ACT, home).unwrap_or_default();
     let kept = ledger_chains(node);
     let mut chains: Vec<(&'static ChainParams, Vec<Value>)> = kept.iter().map(|p| (*p, card_rows(node, p))).collect();
@@ -403,7 +403,7 @@ pub fn categories() -> Value {
 pub fn store(node: &Node, sort: &str, q: &str, show_flagged: bool, category: &str) -> Value {
     let apps = gather(node);
     let fl = flags(node, &apps);
-    let acts = arcade_ledger::messages::rows(&node.chain, arcade_ledger::messages::ACT, node.params.chain_no).unwrap_or_default();
+    let acts = arcade_ledger::messages::rows(&node.chain, arcade_ledger::messages::ACT, node.ledger_home().chain_no).unwrap_or_default();
     let fx = fixes(&acts);
     let me = me(node);
     let installed: BTreeSet<String> = installed_ids(node).iter().filter_map(|x| x["id"].as_str().map(String::from)).collect();
@@ -445,7 +445,7 @@ pub fn installed(node: &Node) -> Value {
     let ids = installed_ids(node);
     let apps = gather(node);
     let fl = flags(node, &apps);
-    let acts = arcade_ledger::messages::rows(&node.chain, arcade_ledger::messages::ACT, node.params.chain_no).unwrap_or_default();
+    let acts = arcade_ledger::messages::rows(&node.chain, arcade_ledger::messages::ACT, node.ledger_home().chain_no).unwrap_or_default();
     let fx = fixes(&acts);
     let me = me(node);
     let set: BTreeSet<String> = ids.iter().filter_map(|x| x["id"].as_str().map(String::from)).collect();
@@ -505,7 +505,7 @@ pub fn card(node: &Node, chain: &str, txid: &str) -> Result<Value, String> {
     let (a, id) = find(node, chain, txid)?;
     let apps = vec![a];
     let fl = flags(node, &gather(node));
-    let acts = arcade_ledger::messages::rows(&node.chain, arcade_ledger::messages::ACT, node.params.chain_no).unwrap_or_default();
+    let acts = arcade_ledger::messages::rows(&node.chain, arcade_ledger::messages::ACT, node.ledger_home().chain_no).unwrap_or_default();
     let fx = fixes(&acts);
     let installed: BTreeSet<String> = installed_ids(node).iter().filter_map(|x| x["id"].as_str().map(String::from)).collect();
     let mut e = entry(node, &apps[0], &acts, &fx, &me(node), fl.get(&apps[0].versions[0].txid), &installed, &starred_ids(node));

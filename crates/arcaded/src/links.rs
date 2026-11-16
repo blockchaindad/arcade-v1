@@ -49,7 +49,7 @@ fn address_of_pubkey(pk_hex: &str, p: &ChainParams) -> Option<String> {
 /// Check a record against this arcade's chain: both signatures, the address, and that the
 /// owner key still holds the @tag.
 pub fn verify(node: &Node, r: &Value) -> Result<(), String> {
-    let home = node.params;
+    let home = node.ledger_home();
     let row = arcade_ledger::index::tag_row(&node.chain, home.chain_no, s(r, "tag"))
         .map_err(|e| e.to_string())?
         .ok_or("the @tag is not claimed")?;
@@ -125,7 +125,7 @@ pub fn for_tag(node: &Node, tag: &str, net: &str) -> Vec<Value> {
 
 /// Our own tag key for `tag` (the slot whose address the tag row names).
 fn owner_key(node: &Node, tag: &str) -> Result<(String, arcade_wallet::SecretKey), String> {
-    let home = node.params;
+    let home = node.ledger_home();
     let row = arcade_ledger::index::tag_row(&node.chain, home.chain_no, tag)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("@{tag} is not claimed"))?;
@@ -154,7 +154,7 @@ pub fn link(node: &Node, chain: &str, wif: &str, tag: &str) -> Result<Value, Str
     let pk_hex = hex::encode(if compressed { pk.serialize().to_vec() } else { pk.serialize_uncompressed().to_vec() });
     let a = address_of_pubkey(&pk_hex, p).ok_or("bad key")?;
     let (opk, osk) = owner_key(node, &tag)?;
-    let mut r = json!({"k": "link", "v": 1, "home": node.params.net, "tag": tag, "net": p.net, "a": a, "pk": pk_hex,
+    let mut r = json!({"k": "link", "v": 1, "home": node.ledger_home().net, "tag": tag, "net": p.net, "a": a, "pk": pk_hex,
                        "opk": opk, "at": arcade_app::now(), "on": true});
     r["ws"] = json!(sign_message(&sk, wallet_msg(&r).as_bytes()));
     r["os"] = json!(sign_message(&osk, owner_msg(&r).as_bytes()));
@@ -172,7 +172,7 @@ pub fn unlink(node: &Node, chain: &str, address: &str, tag: &str) -> Result<Valu
     let tag = tag.trim_start_matches('@').to_lowercase();
     let old = stored(node, &format!("{PREFIX}{tag}/{}/{address}", p.net)).ok_or("no such link")?;
     let (opk, osk) = owner_key(node, &tag)?;
-    let mut r = json!({"k": "link", "v": 1, "home": node.params.net, "tag": tag, "net": p.net, "a": address, "pk": old["pk"],
+    let mut r = json!({"k": "link", "v": 1, "home": node.ledger_home().net, "tag": tag, "net": p.net, "a": address, "pk": old["pk"],
                        "opk": opk, "at": arcade_app::now().max(old["at"].as_u64().unwrap_or(0) + 1), "on": false});
     r["os"] = json!(sign_message(&osk, owner_msg(&r).as_bytes()));
     verify(node, &r)?;
@@ -186,7 +186,7 @@ pub fn unlink(node: &Node, chain: &str, address: &str, tag: &str) -> Result<Valu
 /// Our links (with a note whether we hold the key) for the Wallet tab.
 pub fn mine(node: &Node, chain: &str) -> Result<Vec<Value>, String> {
     let p = by_key(chain).ok_or_else(|| format!("unknown chain {chain}"))?;
-    let installed = (p.chain_no == node.params.chain_no || node.extra.lock().unwrap().contains_key(p.key)) && node.chain.addresses_on(p.chain_no).unwrap_or(false);
+    let installed = (p.chain_no == node.ledger_home().chain_no || node.extra.lock().unwrap().contains_key(p.key)) && node.chain.addresses_on(p.chain_no).unwrap_or(false);
     Ok(all(node)
         .into_iter()
         .filter(|r| r["on"] == true && r["net"] == p.net && owner_key(node, s(r, "tag")).is_ok())
