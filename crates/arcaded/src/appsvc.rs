@@ -100,27 +100,40 @@ pub fn card_rows(node: &Node, p: &ChainParams) -> Vec<Value> {
 /// ledger: kept here, asked again in the background every 10 minutes (the store never waits).
 static BORROWED_CARDS: std::sync::Mutex<BTreeMap<String, (std::time::Instant, Vec<Value>)>> = std::sync::Mutex::new(BTreeMap::new());
 
+/// The app card rows of a chain from the mesh, kept 10 minutes; asked again in the background when older. `kept`: the
+/// chain's ledger is kept here too (catching up), so the question goes to the mesh rather than being answered here.
+fn mesh_card_rows(node: &Node, p: &'static ChainParams, kept: bool) -> Vec<Value> {
+    let (stale, rows) = match BORROWED_CARDS.lock().unwrap().get(p.key) {
+        Some((at, rows)) => (at.elapsed().as_secs() > 600, rows.clone()),
+        None => (true, Vec::new()),
+    };
+    if stale {
+        // Marked fresh now, so one ask at a time; the answer replaces it when it comes.
+        BORROWED_CARDS.lock().unwrap().insert(p.key.to_string(), (std::time::Instant::now(), rows.clone()));
+        let n = node.self_arc();
+        std::thread::spawn(move || {
+            let q = json!({"chain": p.key});
+            let got = if kept {
+                crate::explorer::mesh_ask(&n, p, "ledger", "explorer.app_cards", &q).map(|(v, _)| v)
+            } else {
+                crate::explorer::handle(&n, "explorer.app_cards", &q)
+            };
+            if let Ok(v) = got {
+                let rows = v["rows"].as_array().cloned().unwrap_or_default();
+                BORROWED_CARDS.lock().unwrap().insert(p.key.to_string(), (std::time::Instant::now(), rows));
+            }
+        });
+    }
+    rows
+}
+
 fn borrowed_card_rows(node: &Node, kept: &[&'static ChainParams]) -> Vec<(&'static ChainParams, Vec<Value>)> {
     let mut out = Vec::new();
     for p in arcade_chain::params::ALL_CHAINS.iter().copied() {
         if kept.iter().any(|k| k.chain_no == p.chain_no) || !crate::borrow::is_borrowed(p.key) {
             continue;
         }
-        let (stale, rows) = match BORROWED_CARDS.lock().unwrap().get(p.key) {
-            Some((at, rows)) => (at.elapsed().as_secs() > 600, rows.clone()),
-            None => (true, Vec::new()),
-        };
-        if stale {
-            // Marked fresh now, so one ask at a time; the answer replaces it when it comes.
-            BORROWED_CARDS.lock().unwrap().insert(p.key.to_string(), (std::time::Instant::now(), rows.clone()));
-            let n = node.self_arc();
-            std::thread::spawn(move || {
-                if let Ok(v) = crate::explorer::handle(&n, "explorer.app_cards", &json!({"chain": p.key})) {
-                    let got = v["rows"].as_array().cloned().unwrap_or_default();
-                    BORROWED_CARDS.lock().unwrap().insert(p.key.to_string(), (std::time::Instant::now(), got));
-                }
-            });
-        }
+        let rows = mesh_card_rows(node, p, false);
         out.push((p, rows));
     }
     out
@@ -133,6 +146,14 @@ fn gather(node: &Node) -> Vec<App> {
     let acts = arcade_ledger::messages::rows(&node.chain, arcade_ledger::messages::ACT, home).unwrap_or_default();
     let kept = ledger_chains(node);
     let mut chains: Vec<(&'static ChainParams, Vec<Value>)> = kept.iter().map(|p| (*p, card_rows(node, p))).collect();
+    // A chain kept here that is still catching up (borrowed meanwhile) hasn't reached the blocks most apps were
+    // published in: the cards an arcade on the mesh keeps are added, until this one has them itself.
+    for (p, rows) in chains.iter_mut() {
+        if crate::borrow::is_borrowed(p.key) {
+            let have: BTreeSet<String> = rows.iter().filter_map(|r| r["txid"].as_str().map(String::from)).collect();
+            rows.extend(mesh_card_rows(node, p, true).into_iter().filter(|r| r["txid"].as_str().is_some_and(|t| !have.contains(t))));
+        }
+    }
     chains.extend(borrowed_card_rows(node, &kept));
     for (p, rows) in chains {
         let c = p.chain_no;
