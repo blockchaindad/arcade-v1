@@ -458,9 +458,12 @@ pub fn reconcile<T: TimeProofs, S: Storage>(db: &ChainDb, p: &ChainParams, chain
     }
     let top = chain.tip().height;
     let mut next = tip.map_or(0, |t| t.height as u64 + 1);
+    // A copy made new (or made again, above) takes block 0 alone, then the ledger snapshot it
+    // names, then the rest: the snapshot's tags are there before any record that uses them.
+    let mut fresh = tip.is_none();
     while next <= top {
         let mut batch = Vec::new();
-        while next <= top && batch.len() < 200 {
+        while next <= top && batch.len() < if fresh { 1 } else { 200 } {
             let id = chain.id_at(next).expect("a height of the branch");
             batch.push(match chain.block(&id) {
                 Some(b) => store::stored_block(b),
@@ -469,7 +472,37 @@ pub fn reconcile<T: TimeProofs, S: Storage>(db: &ChainDb, p: &ChainParams, chain
             next += 1;
         }
         db.connect_blocks_checked(p, &batch, false).map_err(db_err)?;
+        if std::mem::take(&mut fresh) {
+            carry_in(db, p)?;
+        }
     }
+    Ok(())
+}
+
+/// The ledger snapshot the running ARCADE chain's block 0 names, checked against it (set at start).
+static SNAPSHOT: Mutex<Option<(u16, [u8; 32], Arc<Value>)>> = Mutex::new(None);
+/// The chain store's note that its ledger holds the snapshot (the snapshot's hash). It lives with
+/// the chain's rows, so a copy made again forgets it and takes the snapshot again (an app-store flag
+/// outlived such a wipe, and the JB20B and Ashburn lost the 322 snapshot tags, 2026-11-15).
+const SNAPSHOT_NOTE: &str = "ledger_snapshot";
+
+/// The ledger's indexers on the ARCADE chain: tags, profiles and every arcade record.
+fn ledger_indexers() -> [Arc<dyn arcade_chaindb::Indexer>; 2] {
+    [Arc::new(arcade_ledger::engine::LedgerIndexer), Arc::new(arcade_ledger::index::ProfileIndexer)]
+}
+
+/// Carry the snapshot into the store's ledger (only rows not there yet) and note it there.
+fn carry_in(db: &ChainDb, p: &ChainParams) -> Result<(), String> {
+    let Some((c, want, snap)) = SNAPSHOT.lock().unwrap().clone().filter(|x| x.0 == p.chain_no) else { return Ok(()) };
+    let st = db.wstore(c).map_err(db_err)?;
+    for ix in ledger_indexers() {
+        for t in ix.tables() {
+            st.add_table(t).map_err(db_err)?;
+        }
+    }
+    let n = arcade_ledger::snapshot::import(db, p, &snap).map_err(db_err)?;
+    db.set_chain_note(c, SNAPSHOT_NOTE, &want).map_err(db_err)?;
+    eprintln!("arc: the ledger snapshot of {} at block {} carried in: {} tags, {} tokens, {} balances", snap["chain"], snap["height"], n.tags, n.tokens, n.balances);
     Ok(())
 }
 
@@ -1058,33 +1091,47 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
     // The ledger on ARCADE (§15 step 7): tags, profiles and every arcade record, indexed in the same commit as each block
     // the store takes; an arcade that stored blocks before it had them walks those once, below.
     arcade_ledger::tags::set_expiry(p.chain_no, Some(s.tag_expiry));
-    let ledger: [Arc<dyn arcade_chaindb::Indexer>; 2] = [Arc::new(arcade_ledger::engine::LedgerIndexer), Arc::new(arcade_ledger::index::ProfileIndexer)];
+    // The home chain's ledger, carried in (§15 step 19) right after block 0, before any record (`carry_in`). A store
+    // that has blocks but no note of it built its ledger without the snapshot (its copy made again under an old
+    // arcade's app-store flag, or from before the note): its ledger rows go and are made again, the snapshot first,
+    // then every record walked once more, so each record is judged with the snapshot's tags there.
+    *SNAPSHOT.lock().unwrap() = None;
+    if let Some(want) = s.genesis.ledger {
+        // A file the settings name (local test chains), else the one built in with the testnet's settings.
+        let text = match &s.ledger_snapshot {
+            Some(path) => std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?,
+            None if !LOCAL.load(Ordering::Relaxed) => TESTNET_LEDGER.as_bytes().to_vec(),
+            None => return Err("block 0 names a ledger snapshot: the settings' ledger_snapshot must say where it is".into()),
+        };
+        let snap: Value = serde_json::from_slice(&text).map_err(|e| format!("ledger snapshot: {e}"))?;
+        if arcade_ledger::snapshot::hash(&snap) != want {
+            return Err("the ledger snapshot isn't the one block 0 names".into());
+        }
+        *SNAPSHOT.lock().unwrap() = Some((p.chain_no, want, Arc::new(snap)));
+    }
+    let stale = match SNAPSHOT.lock().unwrap().as_ref() {
+        Some((_, want, _)) => {
+            node.chain.hash_at(p.chain_no, 0).ok().flatten().is_some()
+                && node.chain.chain_note(p.chain_no, SNAPSHOT_NOTE).map_err(db_err)?.as_deref() != Some(&want[..])
+        }
+        None => false,
+    };
+    let ledger = ledger_indexers();
+    if stale {
+        for ix in &ledger {
+            let tables: Vec<String> = ix.tables().iter().map(|t| t.name.to_string()).collect();
+            while node.chain.remove_index_batch(p.chain_no, ix.name(), &tables, 50_000).map_err(db_err)? > 0 {}
+        }
+        eprintln!("arc: the ledger was built without its snapshot: made again, the snapshot first");
+    }
     let ledger_names: Vec<&'static str> = ledger.iter().map(|ix| ix.name()).collect();
     for ix in ledger {
         node.chain.add_indexer(p.chain_no, ix).map_err(db_err)?;
     }
-    reconcile(&node.chain, p, &chain)?;
-    // The home chain's ledger, carried in (§15 step 19): once, after the store is settled on this block 0 (a store
-    // made again for a new block 0 drops every table of the chain: an import before it was wiped on the GX10 and the
-    // JB20B, 2026-11-15), only rows not there yet. The flag's _v2 repairs the arcades that lost it so.
-    if let Some(want) = s.genesis.ledger {
-        let done = node.app.store.read(|r| r.get(arcade_app::META, b"arc_ledger_snapshot_v2")).ok().flatten().is_some();
-        if !done {
-            // A file the settings name (local test chains), else the one built in with the testnet's settings.
-            let text = match &s.ledger_snapshot {
-                Some(path) => std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?,
-                None if !LOCAL.load(Ordering::Relaxed) => TESTNET_LEDGER.as_bytes().to_vec(),
-                None => return Err("block 0 names a ledger snapshot: the settings' ledger_snapshot must say where it is".into()),
-            };
-            let snap: Value = serde_json::from_slice(&text).map_err(|e| format!("ledger snapshot: {e}"))?;
-            if arcade_ledger::snapshot::hash(&snap) != want {
-                return Err("the ledger snapshot isn't the one block 0 names".into());
-            }
-            let n = arcade_ledger::snapshot::import(&node.chain, p, &snap).map_err(db_err)?;
-            node.app.store.write(|w| w.put(arcade_app::META, b"arc_ledger_snapshot_v2", &want)).map_err(|e| e.to_string())?;
-            eprintln!("arc: the ledger snapshot of {} at block {} carried in: {} tags, {} tokens, {} balances", snap["chain"], snap["height"], n.tags, n.tokens, n.balances);
-        }
+    if stale {
+        carry_in(&node.chain, p)?;
     }
+    reconcile(&node.chain, p, &chain)?;
     {
         let n = node.clone();
         std::thread::Builder::new()
@@ -2710,6 +2757,34 @@ mod tests {
         assert!(Settings::parse(&NET, &settings().replace("\"1099511627776\"", "\"0\"")).is_err());
         assert!(Settings::parse(&NET, &settings().replace("closed_list", "closed")).is_err());
         assert!(Settings::parse(&NET, "{").is_err());
+    }
+
+    #[test]
+    fn a_copy_made_again_takes_the_ledger_snapshot_again_right_after_block_0() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ChainDb::open(dir.path().join("chain.mdbx")).unwrap();
+        let mut c = chain();
+        // A chain number of its own: SNAPSHOT is the process's, and other tests reconcile too.
+        let p0 = store::chain_params(&NET, &c.id_at(0).unwrap());
+        let p: &'static ChainParams = Box::leak(Box::new(ChainParams { chain_no: 4321, ..*p0 }));
+        let snap = json!({"chain": "peptest", "height": 7, "tags": [["snaptag", 0, "11".repeat(20)]], "tokens": [], "balances": []});
+        *SNAPSHOT.lock().unwrap() = Some((p.chain_no, arcade_ledger::snapshot::hash(&snap), Arc::new(snap)));
+        let tag = |db: &ChainDb| arcade_ledger::index::tag_of(db, p.chain_no, &arcade_ledger::address::base58check(p.p2pkh_version, &[0x11; 20])).unwrap();
+
+        reconcile(&db, p, &c).unwrap();
+        assert_eq!(tag(&db).as_deref(), Some("snaptag"), "a new copy takes it after block 0");
+        assert!(db.chain_note(p.chain_no, SNAPSHOT_NOTE).unwrap().is_some());
+        grow(&mut c, 1, 3);
+        reconcile(&db, p, &c).unwrap();
+
+        // The copy is made again (as the old-log path and a branch past the undo window do):
+        // the note goes with its rows, and the next reconcile takes the snapshot in again.
+        while db.remove_chain_batch(p.chain_no, 50_000).unwrap() > 0 {}
+        assert!(db.chain_note(p.chain_no, SNAPSHOT_NOTE).unwrap().is_none(), "the note goes with the chain's rows");
+        reconcile(&db, p, &c).unwrap();
+        assert_eq!(tag(&db).as_deref(), Some("snaptag"));
+        assert!(db.chain_note(p.chain_no, SNAPSHOT_NOTE).unwrap().is_some());
+        *SNAPSHOT.lock().unwrap() = None;
     }
 
     #[test]
