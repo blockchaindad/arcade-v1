@@ -9,7 +9,11 @@
 //! - **it carries an inscription**, or a piece of one still being written, as this arcade's own
 //!   ord index knows (once the index has read the block the coin is in);
 //! - **an arcade on the mesh keeping the chain's ord index says so** (asked when this arcade
-//!   does not know: the chain is borrowed, its ord index is not kept here or still catching up);
+//!   does not know: the chain is borrowed, its ord index is not kept here or still catching up),
+//!   or **the arcades asked disagree** about it. Up to three independent ones are asked at once
+//!   (no two with the same node id or host). A coin is free on green (two or more agree) or
+//!   yellow (only one answered): one source is still used, and the send's preview carries a
+//!   caution saying so ([`caution`]), so the user can double-check before approving;
 //! - **nobody can tell and the coin is small** (at most [`POSTAGE_MAX`], 0.01: the size
 //!   inscriptions are sent in). Bigger coins nobody can read may be spent (the original arcade's
 //!   rule, doginals.py `spendable`).
@@ -21,6 +25,7 @@
 //! Chains without ord inscriptions (`ord_start` None) are not checked.
 
 use crate::node::Node;
+use crate::shares::Trust;
 use arcade_chain::params::ChainParams;
 use arcade_chain::{OutPoint, Tx};
 use arcade_ledger::ord;
@@ -102,18 +107,61 @@ fn pooled(node: &Node, p: &ChainParams, start: u32, read_to: Option<u32>, tx: &T
 
 // ---------------- asking the mesh ----------------
 
-/// Answers heard from the mesh, per (chain, coin): kept while the coin may still be spent here.
-static HEARD: Mutex<Option<HashMap<(u16, OutPoint), bool>>> = Mutex::new(None);
+/// Answers heard from the mesh, per (chain, coin): (carries one, how well backed), kept while
+/// the coin may still be spent here.
+static HEARD: Mutex<Option<HashMap<(u16, OutPoint), (bool, Trust)>>> = Mutex::new(None);
 const HEARD_MOST: usize = 20_000;
 
-/// How long a send waits for an arcade keeping the ord index.
+/// How long a send waits for the arcades keeping the ord index.
 const ASK_MS: u64 = 6000;
 
-fn heard(c: u16, op: &OutPoint) -> Option<bool> {
+/// How many arcades keeping the index are asked at once: one more than it takes to call a
+/// coin free on green, so one that doesn't answer still leaves two.
+const ASK_MOST: usize = 3;
+
+fn heard(c: u16, op: &OutPoint) -> Option<(bool, Trust)> {
     HEARD.lock().unwrap().as_ref().and_then(|m| m.get(&(c, *op)).copied())
 }
 
-/// Ask an arcade keeping chain `p`'s ord index about coins this arcade can't read.
+/// What the arcades asked say of one coin, from how many independent ones called it held and
+/// how many free: green from two that agree, yellow from one, and red (kept out as held) when
+/// they disagree. None when none could tell.
+pub fn mesh_verdict(held: usize, free: usize) -> Option<(Held, Trust)> {
+    match (held, free) {
+        (0, 0) => None,
+        (h, f) if h > 0 && f > 0 => Some((Held::Yes, Trust::Red)),
+        (h, 0) => Some((Held::Yes, Trust::of_sources(h))),
+        (_, f) => Some((Held::No, Trust::of_sources(f))),
+    }
+}
+
+/// The answers (answer, node id) of independent arcades, counted per coin asked about:
+/// (held, free). One answer per arcade counts.
+fn tally(answers: &[(Value, String)], ops: &[OutPoint]) -> HashMap<OutPoint, (usize, usize)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut n: HashMap<OutPoint, (usize, usize)> = HashMap::new();
+    for (v, id) in answers {
+        if !seen.insert(id.as_str()) {
+            continue;
+        }
+        let said = |key: &str| -> std::collections::HashSet<OutPoint> {
+            v[key].as_array().into_iter().flatten().filter_map(|x| x.as_str()).filter_map(parse_op).filter(|o| ops.contains(o)).collect()
+        };
+        let held = said("held");
+        for op in &held {
+            n.entry(*op).or_default().0 += 1;
+        }
+        // A coin one arcade names both held and free counts as held.
+        for op in said("free").difference(&held) {
+            n.entry(*op).or_default().1 += 1;
+        }
+    }
+    n
+}
+
+/// Ask the arcades keeping chain `p`'s ord index about coins this arcade can't read: up to
+/// ASK_MOST independent ones at once (crate::shares::ask_explorer_each), their verdicts
+/// compared (see [`mesh_verdict`]).
 fn ask_mesh(node: &Node, p: &'static ChainParams, ops: &[OutPoint]) {
     if ops.is_empty() || crate::shares::index_holders(node, p.net, "ord").is_empty() {
         return;
@@ -123,33 +171,26 @@ fn ask_mesh(node: &Node, p: &'static ChainParams, ops: &[OutPoint]) {
     if FAILED.lock().unwrap().iter().any(|(c, at)| *c == p.chain_no && at.elapsed().as_secs() < 60) {
         return;
     }
-    let failed = || {
+    let list: Vec<String> = ops.iter().map(|o| format!("{}:{}", o.txid.to_hex(), o.vout)).collect();
+    let q = json!({"chain": p.key, "outpoints": list});
+    let answers = crate::shares::ask_explorer_each(node, p, "ord", "explorer.ord_outpoints", &q, ASK_MOST, ASK_MS);
+    if answers.is_empty() {
         let mut f = FAILED.lock().unwrap();
         f.retain(|(c, _)| *c != p.chain_no);
         f.push((p.chain_no, std::time::Instant::now()));
-    };
-    let list: Vec<String> = ops.iter().map(|o| format!("{}:{}", o.txid.to_hex(), o.vout)).collect();
-    let q = json!({"chain": p.key, "outpoints": list});
-    let (tx, rx) = std::sync::mpsc::channel();
-    let n = node.self_arc();
-    std::thread::spawn(move || {
-        let _ = tx.send(crate::shares::ask_explorer(&n, p, "ord", "explorer.ord_outpoints", &q));
-    });
-    let Ok(Ok((v, _))) = rx.recv_timeout(std::time::Duration::from_millis(ASK_MS)) else {
-        failed();
         return;
-    };
+    }
     let mut g = HEARD.lock().unwrap();
     let m = g.get_or_insert_with(HashMap::new);
     if m.len() > HEARD_MOST {
         m.clear();
     }
-    for (key, yes) in [("held", true), ("free", false)] {
-        for s in v[key].as_array().into_iter().flatten().filter_map(|x| x.as_str()) {
-            if let Some(op) = parse_op(s).filter(|o| ops.contains(o)) {
-                m.insert((p.chain_no, op), yes);
-            }
+    for (op, (held, free)) in tally(&answers, ops) {
+        let Some((v, trust)) = mesh_verdict(held, free) else { continue };
+        if trust == Trust::Red {
+            let _ = node.app.event("wallet", &format!("arcades disagree whether coin {}:{} on {} carries an inscription ({held} say yes, {free} no); it stays out of sends", op.txid.to_hex(), op.vout, p.name));
         }
+        m.insert((p.chain_no, op), (v == Held::Yes, trust));
     }
 }
 
@@ -183,15 +224,8 @@ pub fn keep_free(node: &Node, p: &'static ChainParams, coins: Vec<Utxo>) -> Vec<
     let Some(start) = ord::ord_start(p) else { return coins };
     let read_to = local_ord(node, p);
     let mut verdicts: Vec<Held> = coins.iter().map(|u| here_at(node, p, start, read_to, &u.outpoint, 0)).collect();
-    for (v, u) in verdicts.iter_mut().zip(&coins) {
-        if *v == Held::Unknown {
-            if let Some(yes) = heard(p.chain_no, &u.outpoint) {
-                *v = if yes { Held::Yes } else { Held::No };
-            }
-        }
-    }
     // Kept: a waiting coin found free (this arcade's own change) stays known once it confirms,
-    // also where no ord index can be read.
+    // also where no ord index can be read. This arcade's own word: green.
     {
         let mut g = HEARD.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
@@ -201,22 +235,54 @@ pub fn keep_free(node: &Node, p: &'static ChainParams, coins: Vec<Utxo>) -> Vec<
         for (v, u) in verdicts.iter().zip(&coins) {
             // (Confirmed coins this arcade reads itself are read again: cheap, and always current.)
             if *v != Held::Unknown && node.chain.coin(p, &u.outpoint).ok().flatten().is_none() {
-                m.insert((p.chain_no, u.outpoint), *v == Held::Yes);
+                m.insert((p.chain_no, u.outpoint), (*v == Held::Yes, Trust::Green));
             }
         }
     }
-    let ask: Vec<OutPoint> = coins.iter().zip(&verdicts).filter(|(_, v)| **v == Held::Unknown).map(|(u, _)| u.outpoint).collect();
-    if !ask.is_empty() {
-        ask_mesh(node, p, &ask);
+    let from_heard = |verdicts: &mut Vec<Held>| {
         for (v, u) in verdicts.iter_mut().zip(&coins) {
             if *v == Held::Unknown {
-                if let Some(yes) = heard(p.chain_no, &u.outpoint) {
+                if let Some((yes, _)) = heard(p.chain_no, &u.outpoint) {
                     *v = if yes { Held::Yes } else { Held::No };
                 }
             }
         }
+    };
+    from_heard(&mut verdicts);
+    let ask: Vec<OutPoint> = coins.iter().zip(&verdicts).filter(|(_, v)| **v == Held::Unknown).map(|(u, _)| u.outpoint).collect();
+    if !ask.is_empty() {
+        ask_mesh(node, p, &ask);
+        from_heard(&mut verdicts);
     }
     coins.into_iter().zip(verdicts).filter(|(u, v)| free_to_spend(*v, u.value)).map(|(u, _)| u).collect()
+}
+
+/// How well backed the "free" of the coins a send spends is (they came through [`keep_free`]):
+/// a caution for its preview when it rests on one arcade (yellow) or on nobody (grey: a coin
+/// over 0.01 nobody could read). None when this arcade's own index, or two or more independent
+/// arcades, vouch for every coin (green), and on chains without inscriptions.
+pub fn caution(node: &Node, p: &ChainParams, spent: &[OutPoint]) -> Option<Value> {
+    let start = ord::ord_start(p)?;
+    let read_to = local_ord(node, p);
+    let worst = spent
+        .iter()
+        .map(|op| match here_at(node, p, start, read_to, op, 0) {
+            Held::Unknown => heard(p.chain_no, op).map(|(_, t)| t).unwrap_or(Trust::Grey),
+            _ => Trust::Green,
+        })
+        .max()?;
+    caution_for(worst)
+}
+
+/// The words for a send's coins backed only so well (see [`caution`]).
+pub fn caution_for(t: Trust) -> Option<Value> {
+    match t {
+        Trust::Green => None,
+        Trust::Yellow => Some(crate::shares::caution(t, "Only one arcade vouched that these coins carry no inscription. Double-check before sending: an inscription sent by mistake can't be taken back.")),
+        Trust::Grey => Some(crate::shares::caution(t, "No arcade could check these coins for inscriptions; they are spent because they are bigger than 0.01, the size inscriptions are sent in. If this wallet holds inscriptions, double-check before sending.")),
+        // Coins arcades disagree about stay out of sends, so none is ever spent.
+        Trust::Red => Some(crate::shares::caution(t, "Arcades disagree whether these coins carry an inscription. Don't send until that is cleared up.")),
+    }
 }
 
 /// The rule: known free coins go; known carriers stay; unknown ones go only when big.
@@ -273,7 +339,27 @@ mod tests {
         t.node.app.store.write(|w| w.put(arcade_app::META, b"home_indexes", br#"["addresses","messages"]"#)).unwrap();
         assert!(keep_free(&t.node, p, vec![change.clone()]).is_empty());
         let big = Utxo { value: POSTAGE_MAX + 1, ..change.clone() };
-        assert_eq!(keep_free(&t.node, p, vec![big]).len(), 1);
+        assert_eq!(keep_free(&t.node, p, vec![big.clone()]).len(), 1);
+        // ... and its send says nobody could check it (grey).
+        HEARD.lock().unwrap().take();
+        assert_eq!(caution(&t.node, p, &[big.outpoint]).unwrap()["level"], "grey");
+
+        // What the mesh said, as ask_mesh keeps it. One arcade said free: spent, with a yellow caution.
+        let say = |held: bool, t: Trust| HEARD.lock().unwrap().get_or_insert_with(HashMap::new).insert((c, change.outpoint), (held, t));
+        say(false, Trust::Yellow);
+        assert_eq!(ops(&keep_free(&t.node, p, vec![change.clone()])), vec![change.outpoint]);
+        let warn = caution(&t.node, p, &[change.outpoint]).expect("a caution on one source");
+        assert_eq!(warn["level"], "yellow");
+        assert!(warn["note"].as_str().unwrap().contains("Only one arcade vouched"));
+        // Two independent arcades agree: free, no caution.
+        say(false, Trust::Green);
+        assert_eq!(keep_free(&t.node, p, vec![change.clone()]).len(), 1);
+        assert!(caution(&t.node, p, &[change.outpoint]).is_none());
+        // Arcades disagree: held, whatever its size.
+        say(true, Trust::Red);
+        assert!(keep_free(&t.node, p, vec![change.clone()]).is_empty());
+        assert!(keep_free(&t.node, p, vec![big.clone()]).is_empty(), "a coin arcades disagree about stays out");
+        HEARD.lock().unwrap().take();
 
         // The ord index kept and read past the coin's block: it is free.
         t.node.app.store.write(|w| w.put(arcade_app::META, b"home_indexes", br#"["addresses","messages","ord"]"#)).unwrap();
@@ -281,6 +367,10 @@ mod tests {
         t.node.chain.add_indexer(c, std::sync::Arc::new(ord::OrdIndexer::new(&[]))).unwrap();
         t.node.chain.set_indexed_to(c, "ord.v1", Some(3)).unwrap();
         assert_eq!(ops(&keep_free(&t.node, p, vec![change.clone()])), vec![change.outpoint]);
+        // This arcade's own index: green, no caution, whatever the mesh said before.
+        HEARD.lock().unwrap().get_or_insert_with(HashMap::new).insert((c, change.outpoint), (false, Trust::Yellow));
+        assert!(caution(&t.node, p, &[change.outpoint]).is_none());
+        HEARD.lock().unwrap().take();
         // Not yet read that far: unknown again.
         t.node.chain.set_indexed_to(c, "ord.v1", Some(1)).unwrap();
         assert!(keep_free(&t.node, p, vec![change.clone()]).is_empty());
@@ -303,6 +393,56 @@ mod tests {
         let v = answer(&t.node, p, &json!({"outpoints": [format!("{}:1", t.spend.txid.to_hex()), format!("{}:0", t.spend.txid.to_hex()), "junk"]})).unwrap();
         assert_eq!(v["held"], json!([format!("{}:1", t.spend.txid.to_hex())]));
         assert_eq!(v["free"], json!([format!("{}:0", t.spend.txid.to_hex())]));
+    }
+
+    #[test]
+    fn the_mesh_verdict() {
+        // Nobody could tell.
+        assert_eq!(mesh_verdict(0, 0), None);
+        // Free: green from two independent arcades, yellow from one.
+        assert_eq!(mesh_verdict(0, 2), Some((Held::No, Trust::Green)));
+        assert_eq!(mesh_verdict(0, 3), Some((Held::No, Trust::Green)));
+        assert_eq!(mesh_verdict(0, 1), Some((Held::No, Trust::Yellow)));
+        // Held: kept out either way.
+        assert_eq!(mesh_verdict(1, 0), Some((Held::Yes, Trust::Yellow)));
+        assert_eq!(mesh_verdict(2, 0), Some((Held::Yes, Trust::Green)));
+        // They disagree: red, and held.
+        assert_eq!(mesh_verdict(1, 1), Some((Held::Yes, Trust::Red)));
+        assert_eq!(mesh_verdict(1, 5), Some((Held::Yes, Trust::Red)));
+        assert!(!free_to_spend(mesh_verdict(1, 5).unwrap().0, 50 * 100_000_000));
+    }
+
+    #[test]
+    fn answers_are_counted_once_per_arcade() {
+        let t = "ab".repeat(32);
+        let (a, b, z) = (format!("{t}:0"), format!("{t}:1"), format!("{}:0", "cd".repeat(32)));
+        let ops: Vec<OutPoint> = [&a, &b].iter().map(|s| parse_op(s).unwrap()).collect();
+        let answers = vec![
+            (json!({"held": [], "free": [a, b]}), "n1".to_string()),
+            // The same arcade again: not a second source.
+            (json!({"held": [], "free": [a, b]}), "n1".to_string()),
+            // Another one: agrees on a, names b both held and free (held), and a coin not asked about.
+            (json!({"held": [b, z], "free": [a, b]}), "n2".to_string()),
+        ];
+        let n = tally(&answers, &ops);
+        assert_eq!(n[&ops[0]], (0, 2));
+        assert_eq!(n[&ops[1]], (1, 1));
+        assert_eq!(n.len(), 2);
+        assert_eq!(mesh_verdict(n[&ops[0]].0, n[&ops[0]].1), Some((Held::No, Trust::Green)));
+        assert_eq!(mesh_verdict(n[&ops[1]].0, n[&ops[1]].1), Some((Held::Yes, Trust::Red)));
+        // One arcade only: yellow.
+        let n = tally(&answers[..2], &ops);
+        assert_eq!(mesh_verdict(n[&ops[0]].0, n[&ops[0]].1), Some((Held::No, Trust::Yellow)));
+    }
+
+    #[test]
+    fn cautions_by_colour() {
+        assert!(caution_for(Trust::Green).is_none());
+        for (t, level) in [(Trust::Yellow, "yellow"), (Trust::Grey, "grey"), (Trust::Red, "red")] {
+            let c = caution_for(t).unwrap();
+            assert_eq!(c["level"], level);
+            assert!(c["note"].as_str().is_some_and(|n| !n.is_empty()));
+        }
     }
 
     #[test]

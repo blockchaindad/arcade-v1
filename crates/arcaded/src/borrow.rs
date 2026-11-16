@@ -1427,7 +1427,8 @@ pub fn send(node: &Node, key: &str, to: &str, amount: u64, from: Option<&str>, k
     let vsize = (tx.encode_legacy().len() * 3 + tx.raw.len()).div_ceil(4);
     let mut out = json!({"txid": tx.txid.to_hex(), "from": change.0, "to": to, "amount": amount, "fee": fee, "size": tx.raw.len(), "vsize": vsize, "sent": false,
                          "kind": kd.map(arcade_wallet::keys::AddrKind::id), "kind_label": kd.map(arcade_wallet::keys::AddrKind::label),
-                         "kinds_spent": crate::coinsend::kinds_spent(&tx, &coins, &kinds)});
+                         "kinds_spent": crate::coinsend::kinds_spent(&tx, &coins, &kinds),
+                         "caution": crate::ordsafe::caution(node, p, &tx.inputs.iter().map(|i| i.prevout).collect::<Vec<arcade_chain::OutPoint>>())});
     if !broadcast {
         return Ok(out);
     }

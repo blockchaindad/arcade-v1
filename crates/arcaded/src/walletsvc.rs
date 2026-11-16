@@ -588,14 +588,21 @@ pub(crate) fn file_market(node: &Node, page: &str, what: &str, to: Option<String
 
 /// Build (and, when `send`, broadcast) a request's transaction: (txid, fee, outputs).
 fn build(node: &Node, r: &Value, send: bool) -> Result<(String, u64, Vec<Value>), String> {
+    build_with_caution(node, r, send).map(|(txid, fee, outs, _)| (txid, fee, outs))
+}
+
+/// [`build`], with the caution for its card: how well the coins it spends are known to carry
+/// no inscription (crate::ordsafe::caution).
+fn build_with_caution(node: &Node, r: &Value, send: bool) -> Result<(String, u64, Vec<Value>, Option<Value>), String> {
     let p = node.params;
     if r["kind"] == "market" {
         // An order, cancel or take (marketsvc.rs): (txid, fee, outputs) as the card shows them.
-        return crate::marketsvc::build_request(node, &r["market"], send);
+        return crate::marketsvc::build_request(node, &r["market"], send).map(|(t, f, o)| (t, f, o, None));
     }
     if r["kind"] == "repo" {
         // A repository write (reposvc.rs): on the ARCADE chain, signed by this wallet's @tag there.
-        return if send { crate::reposvc::start(node, r) } else { crate::reposvc::preview(node, r).map(|(fee, outs)| (String::new(), fee, outs)) };
+        let built = if send { crate::reposvc::start(node, r) } else { crate::reposvc::preview(node, r).map(|(fee, outs)| (String::new(), fee, outs)) };
+        return built.map(|(t, f, o)| (t, f, o, None));
     }
     let to = r["to"].as_str().unwrap_or("");
     let to_script = arcade_ledger::address::script_for_address(p, to).ok_or("bad address")?;
@@ -658,7 +665,9 @@ fn build(node: &Node, r: &Value, send: bool) -> Result<(String, u64, Vec<Value>)
         crate::claims::mark_spent(node, &tx);
         node.tx_outbox.lock().unwrap().push(tx.raw.clone());
     }
-    Ok((tx.txid.to_hex(), fee, outs))
+    let spent: Vec<arcade_chain::OutPoint> = tx.inputs.iter().map(|i| i.prevout).collect();
+    let caution = if send { None } else { crate::ordsafe::caution(node, node.ledger_home(), &spent) };
+    Ok((tx.txid.to_hex(), fee, outs, caution))
 }
 
 /// An arcade token send from this wallet itself (the Wallet's Send, not a page's request): built as a page's is,
@@ -670,10 +679,11 @@ pub fn token_send(node: &Node, pid: u32, units: u64, to: &str, send: bool) -> Re
 /// What a request would send, as built now (for the approval card).
 pub fn preview(node: &Node, id: &str) -> Result<Value, String> {
     let r = get_req(node, id).ok_or("no such request")?;
-    let (_, fee, outs) = build(node, &r, false)?;
+    let (_, fee, outs, caution) = build_with_caution(node, &r, false)?;
     let mut v = r.clone();
     v["fee"] = json!(fee);
     v["outputs"] = json!(outs);
+    v["caution"] = json!(caution);
     v["page_card"] = page_card(node, r["page"].as_str().unwrap_or(""));
     Ok(v)
 }

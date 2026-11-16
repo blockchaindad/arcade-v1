@@ -902,6 +902,19 @@ mod tests {
 mod clash_tests {
     use super::*;
     #[test]
+    fn trust_from_sources_and_the_worse_caution() {
+        assert_eq!(Trust::of_sources(0), Trust::Grey);
+        assert_eq!(Trust::of_sources(1), Trust::Yellow);
+        assert_eq!(Trust::of_sources(2), Trust::Green);
+        let y = caution(Trust::Yellow, "one said so.");
+        let g = caution(Trust::Grey, "nobody could tell.");
+        assert_eq!(worse_caution(None, None), None);
+        assert_eq!(worse_caution(Some(y.clone()), None), Some(y.clone()));
+        let both = worse_caution(Some(y), Some(g)).unwrap();
+        assert_eq!(both["level"], "grey");
+        assert_eq!(both["note"], "nobody could tell. one said so.");
+    }
+    #[test]
     fn a_holder_still_syncing_is_asked_only_when_nobody_is_caught_up() {
         let v = vec![("a".to_string(), 1_565_654), ("b".to_string(), 1_565_000), ("c".to_string(), 134_000)];
         assert_eq!(caught_up(v, None).iter().map(|x| x.0.as_str()).collect::<Vec<_>>(), ["a", "b"]);
@@ -1013,23 +1026,7 @@ pub fn ask_explorer(node: &Node, p: &ChainParams, ix: &str, cmd: &str, req: &Val
     let mut holders = index_holders(node, p.net, ix);
     holders.sort_by_key(|(id, _)| !is_linked(node, id));
     for (id, _) in holders.into_iter().take(4) {
-        let q = json!({"net": p.net, "what": "x", "arg": q});
-        let r = if is_linked(node, &id) {
-            ask_linked(&id, q)
-        } else {
-            // Not linked: dial it, unless dialing it failed lately (then only the introduction
-            // asked for above helps; waiting out a dial on every page made the Explorer slow).
-            match addr_of(node, &id) {
-                Some(addr) if !dial_failed_lately(&addr) => {
-                    let r = ask_with(node, &addr, q, Duration::from_secs(4)).map(|(v, _)| v);
-                    if r.is_err() {
-                        note_dial_failed(&addr);
-                    }
-                    r
-                }
-                _ => continue,
-            }
-        };
+        let Some(r) = ask_holder(node, p, &id, &q) else { continue };
         match r {
             Ok(v) => return Ok((v, id)),
             Err(e) if is_linked(node, &id) => last = format!("arcade {}: {e}", &id[..id.len().min(8)]),
@@ -1037,6 +1034,120 @@ pub fn ask_explorer(node: &Node, p: &ChainParams, ix: &str, cmd: &str, req: &Val
         }
     }
     Err(last)
+}
+
+/// One Explorer question (`q`: {cmd, req} as text) to one holder: over its link when linked,
+/// else dialed (None: not dialed, as dialing it failed lately or it has no address).
+fn ask_holder(node: &Node, p: &ChainParams, id: &str, q: &str) -> Option<Result<Value, String>> {
+    let q = json!({"net": p.net, "what": "x", "arg": q});
+    if is_linked(node, id) {
+        return Some(ask_linked(id, q));
+    }
+    // Not linked: dial it, unless dialing it failed lately (then only an introduction helps;
+    // waiting out a dial on every page made the Explorer slow).
+    let addr = addr_of(node, id).filter(|a| !dial_failed_lately(a))?;
+    let r = ask_with(node, &addr, q, Duration::from_secs(4)).map(|(v, _)| v);
+    if r.is_err() {
+        note_dial_failed(&addr);
+    }
+    Some(r)
+}
+
+/// How much a mesh answer is backed: by this arcade itself or two or more independent arcades
+/// (green), by one arcade only (yellow), by nobody (grey), or arcades that disagree (red).
+/// The colours the wallet shows before a send; one source is still used, with a caution.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Trust {
+    Green,
+    Yellow,
+    Grey,
+    Red,
+}
+
+impl Trust {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Trust::Green => "green",
+            Trust::Yellow => "yellow",
+            Trust::Grey => "grey",
+            Trust::Red => "red",
+        }
+    }
+
+    /// From how many independent arcades back an answer (none of them disagreeing).
+    pub fn of_sources(n: usize) -> Trust {
+        match n {
+            0 => Trust::Grey,
+            1 => Trust::Yellow,
+            _ => Trust::Green,
+        }
+    }
+}
+
+/// A caution for a send's preview: {level, note}, shown above Approve.
+pub fn caution(level: Trust, note: &str) -> Value {
+    json!({"level": level.as_str(), "note": note})
+}
+
+/// The more serious of two cautions (both notes kept when both say something).
+pub fn worse_caution(a: Option<Value>, b: Option<Value>) -> Option<Value> {
+    let rank = |c: &Value| match c["level"].as_str() {
+        Some("red") => 3,
+        Some("grey") => 2,
+        Some("yellow") => 1,
+        _ => 0,
+    };
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            let (hi, lo) = if rank(&b) > rank(&a) { (b, a) } else { (a, b) };
+            Some(json!({"level": hi["level"], "note": format!("{} {}", hi["note"].as_str().unwrap_or(""), lo["note"].as_str().unwrap_or("")).trim()}))
+        }
+        (a, b) => a.or(b),
+    }
+}
+
+/// Ask an Explorer question of several holders at once, for an answer one arcade alone
+/// shouldn't decide (which coins carry inscriptions, who wrote a post): up to `most` holders,
+/// no two with the same node id or the same host (crate::refill::independent, as for blocks).
+/// Every answer in within `ms`: (answer, node id). The caller compares them.
+pub fn ask_explorer_each(node: &Node, p: &'static ChainParams, ix: &str, cmd: &str, req: &Value, most: usize, ms: u64) -> Vec<(Value, String)> {
+    if crate::handlegate::is_gated_read(cmd) && crate::handlegate::check_local(node).is_err() {
+        return Vec::new();
+    }
+    let mut holders = index_holders(node, p.net, ix);
+    holders.sort_by_key(|(id, _)| !is_linked(node, id));
+    let who: Vec<(String, String)> = holders.into_iter().filter_map(|(id, _)| host_of_holder(node, &id).map(|h| (id, h))).collect();
+    let picked: Vec<String> = crate::refill::independent(&who).into_iter().take(most).collect();
+    if picked.is_empty() {
+        return Vec::new();
+    }
+    let q = json!({"cmd": cmd, "req": req}).to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    for id in &picked {
+        let (tx, n, q, id) = (tx.clone(), node.self_arc(), q.clone(), id.clone());
+        std::thread::spawn(move || {
+            let r = ask_holder(&n, p, &id, &q);
+            let _ = tx.send((id, r));
+        });
+    }
+    drop(tx);
+    let until = Instant::now() + Duration::from_millis(ms);
+    let mut out = Vec::new();
+    for _ in 0..picked.len() {
+        let Some(left) = until.checked_duration_since(Instant::now()) else { break };
+        match rx.recv_timeout(left) {
+            Ok((id, Some(Ok(v)))) => out.push((v, id)),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+/// The host an arcade answers from: its link's address when linked, else where it is dialed.
+fn host_of_holder(node: &Node, id: &str) -> Option<String> {
+    let linked = node.links.lock().unwrap().values().find(|l| l.node_id == id).map(|l| l.addr.clone()).filter(|a| !a.is_empty());
+    linked.or_else(|| addr_of(node, id)).map(|a| crate::refill::host_of(&a))
 }
 
 // ---------------- questions over the links already open ----------------
