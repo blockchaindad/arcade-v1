@@ -304,7 +304,7 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 
 | method | route | needs | params | what |
 |---|---|---|---|---|
-| `apps.store` | `/api/v1/apps/store` | public | sort?, q?, flagged? | The App Store: app cards from every chain with the arcade ledger (popular or new; starred first). |
+| `apps.store` | `/api/v1/apps/store` | public | sort?, q?, flagged? | The App Store: app cards from every chain with the arcade ledger (popular or new; starred first). Each card's `trust` {level, holders, checked, note}: green = this arcade's ledger or 2+ arcades alike, yellow = one arcade's word. |
 | `apps.installed` | `/api/v1/apps/installed` | read | — | Apps installed on this arcade, each at its newest version. |
 | `apps.install` | `/api/v1/apps/install` | admin | chain, txid | Install an app (it follows its author's updates). |
 | `apps.uninstall` | `/api/v1/apps/uninstall` | admin | id | Uninstall an app. |
@@ -317,7 +317,7 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | `apps.owner` | `/api/v1/apps/owner` | read | page | arcade.owner.identity: whether this wallet created the page and still holds it. |
 | `apps.owner_send` | `/api/v1/apps/owner_send` | local | page, request | arcade.owner.send: a page this wallet created and holds sends at once (testnet). |
 | `apps.node` | `/api/v1/apps/node` | local | op, page, to?, body?, after?, limit? | arcade.node for a page: identity, send (sealed node-to-node), sent, replies. |
-| `apps.launch` | `/api/v1/apps/launch` | read | chain, txid | What an app window opens: the sandboxed page URL and the card. |
+| `apps.launch` | `/api/v1/apps/launch` | read | chain, txid | What an app window opens: the sandboxed page URL and the card; `caution` when the version that opens is one arcade's word. |
 
 ### Realtime
 

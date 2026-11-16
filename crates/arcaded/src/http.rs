@@ -872,15 +872,19 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
         // An ord inscription by its id (the pictures and pages a site names; the arcade ledger's
         // own content is asked by txid or number below).
         ["content", id] if arcade_ledger::sites::is_inscription_id(&id.to_lowercase()) => match crate::namesites::content(node, id, is_local) {
-            Some((ctype, bytes)) => respond(
+            Some((ctype, bytes, vouched)) => respond(
                 &mut s,
                 "200 OK",
                 if ctype.is_empty() { "application/octet-stream" } else { &ctype },
                 &[
-                    ("Cache-Control", "public, max-age=31536000, immutable".into()),
+                    // The chain's bytes never change; bytes only arcades on the mesh vouch for are not kept by the browser.
+                    ("Cache-Control", if vouched == crate::namesites::Vouched::Chain { "public, max-age=31536000, immutable".into() } else { "no-store".into() }),
                     // As main's ord route: recursive inscriptions load their parts from here.
                     ("Content-Security-Policy", ord_csp(node)),
                     ("Access-Control-Allow-Origin", "*".into()),
+                    ("Access-Control-Expose-Headers", "X-Arcade-Trust".into()),
+                    // green: the chain's (or 2+ arcades agree); yellow: one arcade's word, not checked here.
+                    ("X-Arcade-Trust", vouched.level().as_str().into()),
                 ],
                 if r.method == "HEAD" { &[] } else { &bytes },
             ),

@@ -609,6 +609,28 @@ fn addr_of(node: &Node, id: &str) -> Option<String> {
     node.offers.lock().unwrap().get(id).map(|o| o.addr.clone()).filter(|a| !a.is_empty())
 }
 
+/// One Explorer question to one holder, `id`: over its link when linked, else dialed. None when it
+/// isn't asked (dialing it failed lately, or it has no address). For answers compared between
+/// holders (crate::vouch), where each holder's own answer matters.
+pub(crate) fn ask_explorer_at(node: &Node, p: &ChainParams, id: &str, cmd: &str, req: &Value) -> Option<Result<Value, String>> {
+    let q = json!({"net": p.net, "what": "x", "arg": json!({"cmd": cmd, "req": req}).to_string()});
+    if is_linked(node, id) {
+        return Some(ask_linked(id, q));
+    }
+    let addr = addr_of(node, id).filter(|a| !dial_failed_lately(a))?;
+    let r = ask_with(node, &addr, q, Duration::from_secs(4)).map(|(v, _)| v);
+    if r.is_err() {
+        note_dial_failed(&addr);
+    }
+    Some(r)
+}
+
+/// The host a holder answers from: its link's address when linked, else where it is dialed.
+pub(crate) fn holder_host(node: &Node, id: &str) -> Option<String> {
+    let linked = node.links.lock().unwrap().values().find(|l| l.node_id == id).map(|l| l.addr.clone()).filter(|a| !a.is_empty());
+    linked.or_else(|| addr_of(node, id)).map(|a| crate::refill::host_of(&a))
+}
+
 /// Ask the arcades holding `unit` of `kind` until one answers.
 pub fn ask_holders(node: &Node, p: &ChainParams, kind: &str, unit: u64, what: &str, arg: &str) -> Result<(Value, String), String> {
     ask_holders_with(node, p, kind, unit, what, arg, json!({}))

@@ -62,6 +62,21 @@ pub fn first_piece_head(payload: &[u8]) -> Result<(u64, [u8; 32], String), Strin
     Ok((total, digest, ctype))
 }
 
+/// Whether `json` can be the manifest JSON of the inscription whose first piece is in `payload`:
+/// the length the manifest gives it is the same, and so are the bytes the first piece holds of it
+/// (all of them when the JSON fits in that piece). The App Store checks a card another arcade
+/// sends for an inscription against its first transaction with this.
+pub fn first_piece_json_matches(payload: &[u8], json: &str) -> Result<bool, String> {
+    let d = payload.get(4..).ok_or("short payload")?;
+    let clen = u16::from_be_bytes([*d.get(16).ok_or("short chunk")?, d[17]]) as usize;
+    let body = d.get(18..18 + clen).ok_or("short chunk body")?;
+    let cl = *body.get(36).ok_or("the inscription's first piece is too short to check")? as usize;
+    let at = 37 + cl;
+    let jl = u16::from_be_bytes([*body.get(at).ok_or("the JSON length is not in the first piece")?, *body.get(at + 1).ok_or("the JSON length is not in the first piece")?]) as usize;
+    let have = &body[(at + 2).min(body.len())..(at + 2 + jl).min(body.len())];
+    Ok(if have.len() == jl { String::from_utf8_lossy(have) == json } else { json.len() == jl && json.as_bytes().starts_with(have) })
+}
+
 /// The arcade payload of a stored transaction (for first_piece_head).
 pub fn payload_by_txid(db: &ChainDb, p: &ChainParams, txid: &str) -> Result<Vec<u8>, String> {
     payload_of(db, p, txid)
@@ -95,4 +110,47 @@ pub fn content(db: &ChainDb, p: &ChainParams, id: &str) -> Result<Content, Strin
         return Err("content does not match its hash".into());
     }
     Ok(Content { content_type: ctype, sha256: hex::encode(digest), bytes })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An arcade payload whose first piece's body is `body` (4 bytes of marker, 16 of chunk head, its length).
+    fn payload(body: &[u8]) -> Vec<u8> {
+        let mut p = vec![0u8; 4 + 16];
+        p.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        p.extend_from_slice(body);
+        p
+    }
+
+    fn head(ctype: &str, json: &str, cut: Option<usize>) -> Vec<u8> {
+        let mut b = 5u32.to_be_bytes().to_vec();
+        b.extend_from_slice(&[7u8; 32]);
+        b.push(ctype.len() as u8);
+        b.extend_from_slice(ctype.as_bytes());
+        b.extend_from_slice(&(json.len() as u16).to_be_bytes());
+        b.extend_from_slice(json.as_bytes());
+        b.extend_from_slice(b"hello");
+        if let Some(n) = cut {
+            b.truncate(n);
+        }
+        b
+    }
+
+    #[test]
+    fn a_card_json_is_checked_against_the_first_piece() {
+        let json = r#"{"app":{"name":"Frogger","version":"2"}}"#;
+        let p = payload(&head("text/html", json, None));
+        assert_eq!(first_piece_head(&p).unwrap().2, "text/html");
+        assert_eq!(first_piece_json_matches(&p, json), Ok(true));
+        assert_eq!(first_piece_json_matches(&p, r#"{"app":{"name":"Frogger","version":"9"}}"#), Ok(false));
+        assert_eq!(first_piece_json_matches(&p, ""), Ok(false));
+        // A first piece that holds only part of the JSON: what it holds must match, and the length.
+        let cut = payload(&head("text/html", json, Some(37 + 9 + 2 + 12)));
+        assert_eq!(first_piece_json_matches(&cut, json), Ok(true));
+        assert_eq!(first_piece_json_matches(&cut, r#"{"app":{"nXme":"Frogger","version":"2"}}"#), Ok(false));
+        assert_eq!(first_piece_json_matches(&cut, r#"{"app":{"name":"Frogger","version":"22"}}"#), Ok(false));
+        assert!(first_piece_json_matches(&payload(&[1, 2, 3]), json).is_err());
+    }
 }

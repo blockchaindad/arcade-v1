@@ -451,7 +451,7 @@ fn settle(db: &ChainDb, p: &ChainParams, n: u64, iid: &[u8; 36], before: Option<
     let rec = record(db, c, iid).unwrap_or(Value::Null);
     let mut row = json!({"id": id, "n": n, "h": rec["h"], "publisher": publisher(db, p, &rec), "name": root.name, "chain": root.chain,
                          "supply": root.supply, "traits": root.traits, "description": root.description, "cover": root.cover,
-                         "replaces": root.replaces, "parts": root.parts.len(), "count": 0});
+                         "replaces": root.replaces, "parts": root.parts.len(), "count": 0, "sha256": root.sha256});
     let say = |mut row: Value, status: &str, reason: String| {
         row["status"] = json!(status);
         row["reason"] = json!(reason);
