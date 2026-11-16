@@ -137,6 +137,9 @@ pub fn set(node: &Node, req: &Value) -> Result<Value, String> {
 
 // ---------------- shared state ----------------
 
+/// A link's session keys: which of a peer's links a share is (kept beside it, so finding one locks no share).
+type LinkKeys = ([u8; 32], [u8; 32]);
+
 #[derive(Default)]
 struct Nat {
     kind: String,
@@ -169,7 +172,9 @@ struct G {
     peer_stun: HashMap<String, Vec<SocketAddr>>,
     nat: Nat,
     outq: HashMap<String, Vec<Frame>>,
-    shares: HashMap<String, Arc<Mutex<Share>>>,
+    /// One per link up, by peer: two links to one arcade (one dialed, one accepted) can be up at once, and each has
+    /// its own session keys (the path keys come from them).
+    shares: HashMap<String, Vec<(LinkKeys, Arc<Mutex<Share>>)>>,
     last_round: Option<Instant>,
     cooling: HashMap<String, (u64, u32)>,
     pend: HashMap<String, Pend>,
@@ -612,11 +617,19 @@ pub fn link_up(node: &Node, link: &mut Link) {
     let peer = link.peer_id.clone();
     let udp_only = link.describe().starts_with("udp");
     let now = Instant::now();
-    let sh = Arc::new(Mutex::new(Share {
-        asks: me(node) < peer,
-        peer: peer.clone(),
+    let sh = Arc::new(Mutex::new(new_share(me(node) < peer, &peer, udp_only, link.session_keys(), now)));
+    g().lock().unwrap().shares.entry(peer).or_default().push((link.session_keys(), sh.clone()));
+    if !udp_only && enabled(node) {
+        link.set_side(Some(Box::new(ShareSide(sh))));
+    }
+}
+
+fn new_share(asks: bool, peer: &str, udp_only: bool, keys: LinkKeys, now: Instant) -> Share {
+    Share {
+        asks,
+        peer: peer.to_string(),
         udp_only,
-        keys: link.session_keys(),
+        keys,
         up: now,
         next_try: now + TRY_AFTER,
         fails: 0,
@@ -627,33 +640,60 @@ pub fn link_up(node: &Node, link: &mut Link) {
         off: false,
         paths_up: 0,
         fallbacks: 0,
-    }));
-    g().lock().unwrap().shares.insert(peer, sh.clone());
-    if !udp_only && enabled(node) {
-        link.set_side(Some(Box::new(ShareSide(sh))));
     }
 }
 
-pub fn link_down(peer: &str) {
+/// A link is down: its own share goes (by its session keys). Another link to the same arcade keeps its share, and the
+/// arcade's queued frames and STUN servers stay while one is up: a duplicate link closed by either side (dialed and
+/// accepted at once) used to take the surviving link's share with it, and that link then ignored every "ud" frame
+/// and never asked again.
+pub fn link_down(peer: &str, keys: LinkKeys) {
     let mut st = g().lock().unwrap();
-    st.outq.remove(peer);
-    st.peer_stun.remove(peer);
-    if let Some(sh) = st.shares.remove(peer) {
-        drop(st);
+    let mine = st.shares.get_mut(peer).and_then(|v| {
+        let i = v.iter().position(|(k, _)| *k == keys)?;
+        Some(v.remove(i).1)
+    });
+    if st.shares.get(peer).is_some_and(|v| v.is_empty()) {
+        st.shares.remove(peer);
+    }
+    if !st.shares.contains_key(peer) {
+        st.outq.remove(peer);
+        st.peer_stun.remove(peer);
+    }
+    drop(st);
+    if let Some(sh) = mine {
         if let Some(p) = sh.lock().unwrap().path.take() {
             p.hub.remove(&p.cell);
         }
     }
 }
 
-fn share_of(peer: &str) -> Option<Arc<Mutex<Share>>> {
-    g().lock().unwrap().shares.get(peer).cloned()
+/// This link's share (by its session keys).
+fn share_of(link: &Link) -> Option<Arc<Mutex<Share>>> {
+    let keys = link.session_keys();
+    g().lock().unwrap().shares.get(&link.peer_id)?.iter().find(|(k, _)| *k == keys).map(|(_, sh)| sh.clone())
+}
+
+/// A line for the operator's log about one peer's UDP negotiation, at most one per peer and kind a minute (`n`: the
+/// "ud" nonce, so both ends' lines of one exchange can be matched).
+fn say(peer: &str, kind: &'static str, line: String) {
+    static LAST: OnceLock<Mutex<HashMap<(String, &'static str), Instant>>> = OnceLock::new();
+    let mut m = LAST.get_or_init(Default::default).lock().unwrap();
+    let k = (short(peer).to_string(), kind);
+    if m.get(&k).is_some_and(|t| t.elapsed() < Duration::from_secs(60)) {
+        return;
+    }
+    if m.len() > 4096 {
+        m.retain(|_, t| t.elapsed() < Duration::from_secs(60));
+    }
+    m.insert(k, Instant::now());
+    eprintln!("udp: {} {line}", short(peer));
 }
 
 /// With every ping: a keepalive over TCP while frames go over UDP (the peer's TCP read
 /// would time out otherwise).
 pub fn keepalive(link: &mut Link) -> Result<(), LinkError> {
-    if share_of(&link.peer_id).is_some_and(|s| s.lock().unwrap().on_udp()) {
+    if share_of(link).is_some_and(|s| s.lock().unwrap().on_udp()) {
         link.send_direct(&Frame::new(json!({"t": "ka"})))?;
     }
     Ok(())
@@ -662,7 +702,7 @@ pub fn keepalive(link: &mut Link) -> Result<(), LinkError> {
 /// Every turn of a link's serve loop.
 pub fn tick(node: &Node, link: &mut Link) -> Result<(), LinkError> {
     let peer = link.peer_id.clone();
-    let Some(sh) = share_of(&peer) else { return Ok(()) };
+    let Some(sh) = share_of(link) else { return Ok(()) };
     let on = enabled(node);
     // Proofs and routed frames waiting for this link.
     let first_st = {
@@ -691,8 +731,9 @@ pub fn tick(node: &Node, link: &mut Link) -> Result<(), LinkError> {
         let mut s = sh.lock().unwrap();
         let now = Instant::now();
         // Waiting for "ready".
-        if let Some((_, at)) = &s.asked {
+        if let Some((n, at)) = &s.asked {
             if at.elapsed() > READY_WAIT {
+                say(&peer, "no-answer", format!("no answer to \"ud\" try n={} within {} s (its arcade may not take UDP paths)", &n[..8.min(n.len())], READY_WAIT.as_secs()));
                 s.asked = None;
                 s.fails += 1;
                 s.next_try = now + backoff(s.fails);
@@ -750,6 +791,7 @@ pub fn tick(node: &Node, link: &mut Link) -> Result<(), LinkError> {
             drop(s);
             refresh_nat(node);
             let offer = our_offer(node, None, false);
+            let nat_kind = Some(g().lock().unwrap().nat.kind.clone()).filter(|k| !k.is_empty()).unwrap_or_else(|| "unknown".into());
             let mut s = sh.lock().unwrap();
             if offer.is_empty() && s.up.elapsed() < Duration::from_secs(60) {
                 s.next_try = now + Duration::from_secs(10);
@@ -757,8 +799,15 @@ pub fn tick(node: &Node, link: &mut Link) -> Result<(), LinkError> {
             } else if hub(node).is_some() {
                 let n = rand_hex(8);
                 send.push(Frame::new(json!({"t": "ud", "op": "try", "n": n, "a": offer_json(&offer)})));
+                s.note = if offer.is_empty() {
+                    // Still worth asking: the peer's own address may be reachable from here.
+                    say(&peer, "try", format!("\"ud\" try n={} with no address of ours (no STUN mapping: NAT {nat_kind})", &n[..8]));
+                    "asked without an address of ours (no STUN mapping)".into()
+                } else {
+                    say(&peer, "try", format!("\"ud\" try n={} with {} address(es)", &n[..8], offer.len()));
+                    "asked".into()
+                };
                 s.asked = Some((n, now));
-                s.note = "asked".into();
             }
         }
     }
@@ -779,7 +828,13 @@ fn new_path(sh: &mut Share, n: &str, targets: Vec<SocketAddr>, hub: Arc<Hub>) ->
 }
 
 fn on_ud(node: &Node, link: &mut Link, f: &Frame) -> Result<(), LinkError> {
-    let Some(sh) = share_of(&link.peer_id) else { return Ok(()) };
+    let Some(sh) = share_of(link) else {
+        // No share for this link (it is going down): a "try" still gets its answer.
+        if f.head["op"] == "try" && is_hex(f.head["n"].as_str().unwrap_or(""), 16) {
+            link.send_direct(&Frame::new(json!({"t": "ud", "op": "no", "n": f.head["n"], "why": "not now"})))?;
+        }
+        return Ok(());
+    };
     let h = &f.head;
     let n = h["n"].as_str().unwrap_or("").to_string();
     let op = h["op"].as_str().unwrap_or("");
@@ -806,16 +861,33 @@ fn on_ud(node: &Node, link: &mut Link, f: &Frame) -> Result<(), LinkError> {
                     refresh_nat(node);
                     let offer = our_offer(node, Some(&theirs), true);
                     let mut s = sh.lock().unwrap();
-                    new_path(&mut s, &n, theirs, hb);
-                    s.note = "answered".into();
-                    reply = Some(json!({"t": "ud", "op": "ready", "n": n, "a": offer_json(&offer)}));
+                    if offer.is_empty() && theirs.is_empty() {
+                        // Neither side has an address to knock at: say so instead of a path that can only fail.
+                        s.note = "refused a try: no address on either side (no STUN mapping)".into();
+                        say(&link.peer_id, "answer", format!("\"ud\" try n={}: no address on either side, answered no", &n[..8]));
+                        reply = Some(json!({"t": "ud", "op": "no", "n": n, "why": "no address"}));
+                    } else {
+                        new_path(&mut s, &n, theirs.clone(), hb);
+                        s.note = "answered".into();
+                        say(&link.peer_id, "answer", format!("\"ud\" try n={} ({} address(es) of theirs, {} of ours): ready", &n[..8], theirs.len(), offer.len()));
+                        reply = Some(json!({"t": "ud", "op": "ready", "n": n, "a": offer_json(&offer)}));
+                    }
                 }
-                (why, _) => reply = Some(json!({"t": "ud", "op": "no", "n": n, "why": why.unwrap_or("no socket")})),
+                (why, _) => {
+                    let why = why.unwrap_or("no socket");
+                    say(&link.peer_id, "answer", format!("\"ud\" try n={}: answered no ({why})", &n[..8.min(n.len())]));
+                    reply = Some(json!({"t": "ud", "op": "no", "n": n, "why": why}));
+                }
             }
         }
         "ready" => {
             let mut s = sh.lock().unwrap();
+            if !s.asked.as_ref().is_some_and(|(x, _)| *x == n) || s.path.is_some() {
+                // An answer after READY_WAIT, or to a try of a link that has gone: not used.
+                say(&link.peer_id, "late", format!("\"ud\" ready n={} not used (late, or not ours)", &n[..8.min(n.len())]));
+            }
             if s.asked.as_ref().is_some_and(|(x, _)| *x == n) && s.path.is_none() {
+                say(&link.peer_id, "ready", format!("\"ud\" ready n={}: knocking at {} address(es)", &n[..8.min(n.len())], parse_addrs(&h["a"]).len()));
                 s.asked = None;
                 let theirs = parse_addrs(&h["a"]);
                 let publics: BTreeSet<IpAddr> = g().lock().unwrap().nat.mapped.iter().map(|a| a.ip()).collect();
@@ -833,6 +905,7 @@ fn on_ud(node: &Node, link: &mut Link, f: &Frame) -> Result<(), LinkError> {
         }
         "no" => {
             let mut s = sh.lock().unwrap();
+            say(&link.peer_id, "no", format!("\"ud\" no n={}: {}", &n[..8.min(n.len())], h["why"].as_str().unwrap_or("")));
             if s.asked.as_ref().is_some_and(|(x, _)| *x == n) {
                 s.asked = None;
                 s.fails += 1;
@@ -1361,7 +1434,7 @@ fn housekeeping(node: Arc<Node>) {
 
 pub fn status(node: &Node) -> Value {
     let st = g().lock().unwrap();
-    let shares: Vec<Arc<Mutex<Share>>> = st.shares.values().cloned().collect();
+    let shares: Vec<Arc<Mutex<Share>>> = st.shares.values().flatten().map(|(_, sh)| sh.clone()).collect();
     let addr_of: HashMap<String, String> = node.links.lock().unwrap().values().map(|l| (l.node_id.clone(), l.addr.clone())).collect();
     let mut out = json!({
         "on": enabled(node),
@@ -1440,7 +1513,7 @@ pub fn status(node: &Node) -> Value {
 
 /// Test hook (mesh.udp_set drop=<peer prefix>): fail a link's path at once, as a lost path would.
 pub fn drop_path(peer_prefix: &str) -> usize {
-    let shares: Vec<Arc<Mutex<Share>>> = g().lock().unwrap().shares.values().cloned().collect();
+    let shares: Vec<Arc<Mutex<Share>>> = g().lock().unwrap().shares.values().flatten().map(|(_, sh)| sh.clone()).collect();
     let mut n = 0;
     for sh in shares {
         let s = sh.lock().unwrap();
@@ -1458,6 +1531,30 @@ pub fn drop_path(peer_prefix: &str) -> usize {
 mod tests {
     use super::*;
     use ed25519_dalek::Signer;
+
+    /// Two links to one arcade (one dialed, one accepted): the one that closes takes only its own share. It used to
+    /// take the other's too, and the link left up then ignored every "ud" frame and never asked again.
+    #[test]
+    fn a_closed_duplicate_link_leaves_the_other_links_share() {
+        let peer = "f0".repeat(32);
+        let (k1, k2) = (([1u8; 32], [2u8; 32]), ([3u8; 32], [4u8; 32]));
+        let now = Instant::now();
+        for k in [k1, k2] {
+            let sh = Arc::new(Mutex::new(new_share(true, &peer, false, k, now)));
+            g().lock().unwrap().shares.entry(peer.clone()).or_default().push((k, sh));
+        }
+        g().lock().unwrap().outq.insert(peer.clone(), vec![Frame::new(json!({"t": "st"}))]);
+        link_down(&peer, k2);
+        {
+            let st = g().lock().unwrap();
+            let left: Vec<LinkKeys> = st.shares[&peer].iter().map(|(k, _)| *k).collect();
+            assert_eq!(left, vec![k1], "the first link keeps its share");
+            assert!(st.outq.contains_key(&peer), "and the arcade's queued frames, while a link to it is up");
+        }
+        link_down(&peer, k1);
+        let st = g().lock().unwrap();
+        assert!(!st.shares.contains_key(&peer) && !st.outq.contains_key(&peer), "all gone with the last link");
+    }
 
     #[test]
     fn ui_signature_over_canonical_json() {
