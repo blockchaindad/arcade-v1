@@ -120,11 +120,19 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
                 let pk = arcade_wallet::secp256k1::PublicKey::from_slice(&hex::decode(&k.pubkey).unwrap()).unwrap();
                 // Every address of the key (DigiByte: dgb1... to receive, its D... still counted).
                 let scripts = crate::coinsend::key_scripts(cp, &pk);
-                let bal = |sc: &[u8]| if installed { node.chain.balance_for_script(cp.chain_no, sc).ok() } else { crate::borrow::balance(node, cp, sc) };
-                let balance = scripts.iter().map(|(_, sc)| bal(sc)).try_fold(0u64, |a, b| b.map(|x| a + x));
-                // Home chain: coins still waiting in the mempool, spendable already.
-                let pending: u64 = if cp.chain_no == p.chain_no && !crate::borrow::is_borrowed(cp.key) { scripts.iter().flat_map(|(_, sc)| crate::claims::unconfirmed_coins(node, sc)).map(|u| u.value).sum() } else { 0 };
-                json!({"index": k.index, "address": scripts[0].0, "legacy": scripts.get(1).map(|x| x.0.clone()), "pending": pending,
+                // As tx.coins counts them, on any chain with a pool here: confirmed coins less those a waiting
+                // transaction spends, plus waiting outputs to this wallet (ARCADE #15).
+                let sc: Vec<Vec<u8>> = scripts.iter().map(|(_, s)| s.clone()).collect();
+                let f = if installed || crate::borrow::is_borrowed(cp.key) { crate::sitesvc::wallet_figures(node, cp, &sc) } else { None };
+                let balance = f.as_ref().map(|f| f.balance);
+                let waiting: Vec<_> = f.as_ref().map(|f| &f.waiting[..]).unwrap_or_default().iter()
+                    .map(|(id, received, spent)| json!({"txid": id.to_hex(), "received": received, "spent": spent})).collect();
+                json!({"index": k.index, "address": scripts[0].0, "legacy": scripts.get(1).map(|x| x.0.clone()),
+                       // confirmed: the blocks' figure; free: confirmed coins no waiting transaction spends (spendable
+                       // now); pending: waiting outputs arriving (pending_coins of them), spendable already.
+                       "confirmed": f.as_ref().map(|f| f.confirmed), "free": f.as_ref().map(|f| f.free),
+                       "pending": f.as_ref().map_or(0, |f| f.arriving), "pending_coins": f.as_ref().map_or(0, |f| f.arriving_coins),
+                       "waiting": waiting,
                        // @tags live on the home chain and on ARCADE (running here): there, the tag this address holds on
                        // ARCADE's own ledger, as tag.check reads it (a tag carried over at block 0 was never claimed
                        // from this wallet, so the key has none recorded).
