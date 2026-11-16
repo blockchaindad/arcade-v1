@@ -71,22 +71,24 @@ fn own() -> std::sync::MutexGuard<'static, Option<(String, Value)>> {
     S.get_or_init(Default::default).lock().unwrap()
 }
 
-/// Our operator's proof for `op me`, or None when our operator has no confirmed handle. Made
-/// while our own wallet is the active account (another signed-in account isn't the operator)
-/// and kept for the times it isn't.
+/// Our operator's proof for `op me`, or None when no handle can be proven here. The operator is
+/// whoever runs this arcade: its own wallet's @handle, or the handle of an account added here and
+/// in use (someone who brings their account into their own arcade with its words). An account in
+/// use without a handle keeps the last proof made; the own wallet without one has none.
 pub fn own_proof(node: &Node) -> Option<(String, Value)> {
-    if node.app.active_account().is_empty() {
-        let made = match crate::msgsvc::sender_key(node) {
-            Ok((addr, Some(tag), sk)) => {
-                let net = node.params.key;
-                let sig = arcade_wallet::keys::signmessage(&sk, arcade_wallet::keys::PEPECOIN_MAGIC, &words(&node.id_hex(), &tag, net));
-                Some((tag, json!({"net": net, "addr": addr, "sig": sig})))
-            }
-            _ => None,
-        };
-        *own() = made;
+    let made = match crate::msgsvc::sender_key(node) {
+        Ok((addr, Some(tag), sk)) => {
+            let net = node.params.key;
+            let sig = arcade_wallet::keys::signmessage(&sk, arcade_wallet::keys::PEPECOIN_MAGIC, &words(&node.id_hex(), &tag, net));
+            Some((tag, json!({"net": net, "addr": addr, "sig": sig})))
+        }
+        _ => None,
+    };
+    let mut o = own();
+    if made.is_some() || node.app.active_account().is_empty() {
+        *o = made;
     }
-    own().clone()
+    o.clone()
 }
 
 /// Does our own operator have a confirmed handle?
