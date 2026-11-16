@@ -805,6 +805,27 @@ mod tests {
         assert!(arcade_mesh::canon::verify_json(&back, &["sig"], "o", b""));
     }
 
+    #[test]
+    fn a_hold_too_big_to_send_is_not_passed_on() {
+        let t = crate::sitesvc::tests::setup();
+        let net = t.p.net;
+        let k = ed25519_dalek::SigningKey::from_bytes(&[4u8; 32]);
+        let kid = hex::encode(k.verifying_key().to_bytes());
+        let link = "ab".repeat(32);
+        let now = arcade_app::now();
+        let chains = json!({net: {"mode": "full", "h": 100, "blocks": "all"}});
+        // Signed and fresh, about 44 KB as received but about 130 KB as it would be sent.
+        let mut big = json!({"t": "sh", "op": "hold", "chains": chains, "o": kid, "at": now, "pad": "\u{e9}".repeat(22_000)});
+        arcade_mesh::canon::sign_json(&k, &mut big, &["sig"], b"");
+        on_hold(&t.node, &link, &big);
+        assert!(t.node.mesh_outbox.lock().unwrap().is_empty());
+        // A normal one from the same arcade still is.
+        let mut ok = json!({"t": "sh", "op": "hold", "chains": chains, "o": kid, "at": now + 1});
+        arcade_mesh::canon::sign_json(&k, &mut ok, &["sig"], b"");
+        on_hold(&t.node, &link, &ok);
+        assert_eq!(t.node.mesh_outbox.lock().unwrap().len(), 1);
+    }
+
     /// Arcades joining one by one, each choosing its place from those already there.
     fn join(n: usize) -> Vec<Place> {
         let mut v: Vec<Place> = Vec::new();

@@ -142,6 +142,17 @@ pub fn encode_plain(f: &Frame) -> Vec<u8> {
     p
 }
 
+/// The largest plaintext (`encode_plain`) a link sends: sealed, it gains the 16-byte AEAD tag,
+/// and the transports send at most MAX_FRAME.
+pub const MAX_PLAIN: usize = crate::transport::MAX_FRAME - 16;
+
+/// Whether `f` can go out on a link, measured as it is sent (compact JSON with every non-ASCII
+/// character escaped, so a head can be several times its size as received). Within MAX_PLAIN
+/// the JSON head's length always fits the u16 in front of it.
+pub fn fits(f: &Frame) -> bool {
+    encode_plain(f).len() <= MAX_PLAIN
+}
+
 pub fn decode_plain(p: &[u8]) -> Result<Frame> {
     if p.len() >= 3 && p[0] == 0xff && p[1] == 0xff && p[2] == 0x01 {
         return unpack_pub(p).ok_or_else(|| LinkError::BadFrame("bad binary pub".into()));
@@ -295,8 +306,11 @@ impl Link {
         Ok(link)
     }
 
+    /// Send `f`. A frame too big to send (see `fits`) is skipped with a log line and the link
+    /// goes on: it can never be sent, so failing would only end the link, and a queued frame
+    /// would then end every link it is offered to.
     pub fn send(&mut self, f: &Frame) -> Result<()> {
-        let p = encode_plain(f);
+        let Some(p) = self.plain(f) else { return Ok(()) };
         if let Some(mut side) = self.side.take() {
             // A side that refuses the frame (its path just failed) has fallback frames to go
             // first, so ask it again before the frame goes over the transport.
@@ -311,7 +325,19 @@ impl Link {
 
     /// Send over the transport even when a side route is attached (signaling, keepalives).
     pub fn send_direct(&mut self, f: &Frame) -> Result<()> {
-        self.seal_send(&encode_plain(f))
+        let Some(p) = self.plain(f) else { return Ok(()) };
+        self.seal_send(&p)
+    }
+
+    /// The plaintext of `f`, or None (logged) when it is over MAX_PLAIN. Checked before
+    /// sealing, so the send counter (the nonce) stays in step with the peer.
+    fn plain(&self, f: &Frame) -> Option<Vec<u8>> {
+        let p = encode_plain(f);
+        if p.len() > MAX_PLAIN {
+            eprintln!("mesh: not sending a {:?} frame of {} bytes to {} (over {MAX_PLAIN})", f.kind(), p.len(), self.peer_id.get(..12).unwrap_or("?"));
+            return None;
+        }
+        Some(p)
     }
 
     fn seal_send(&mut self, p: &[u8]) -> Result<()> {
@@ -458,6 +484,37 @@ mod tests {
                 Ok(_) => panic!("{a} was dialed"),
             }
         }
+    }
+
+    #[test]
+    fn a_frame_too_big_to_send_is_skipped_and_the_link_goes_on() {
+        // About 22 KB of non-ASCII text received is about 130 KB as sent (\uXXXX escapes).
+        let big = Frame::new(json!({"t": "sh", "op": "hold", "pad": "\u{e9}".repeat(22_000)}));
+        assert!(serde_json::to_vec(&big.head).unwrap().len() < MAX_PLAIN);
+        assert!(!fits(&big));
+        assert!(fits(&Frame::new(json!({"t": "ping", "n": "1"}))));
+        // A head over 64 KB would also wrap the u16 head length: never sent either.
+        assert!(!fits(&Frame::new(json!({"t": "x", "pad": "a".repeat(70_000)}))));
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let a = SigningKey::from_bytes(&[1; 32]);
+        let b = SigningKey::from_bytes(&[2; 32]);
+        let t = std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            let mut link = Link::handshake(s, "arcade-test", &b, false, None).unwrap();
+            (0..2).map(|_| link.recv().unwrap()).collect::<Vec<Frame>>()
+        });
+        let mut link = Link::dial(&addr, "arcade-test", &a, None).unwrap();
+        link.send(&big).unwrap();
+        link.send_direct(&big).unwrap();
+        link.send(&Frame::new(json!({"t": "ping", "n": "1"}))).unwrap();
+        // The largest frame that fits still goes out.
+        let head = json!({"t": "ping", "n": "2"});
+        let room = MAX_PLAIN - encode_plain(&Frame::new(head.clone())).len();
+        link.send(&Frame { head, blob: vec![7; room] }).unwrap();
+        let got = t.join().unwrap();
+        assert_eq!(got[0].head, json!({"t": "ping", "n": "1"}));
+        assert_eq!((got[1].head["n"].as_str(), got[1].blob.len()), (Some("2"), room));
     }
 
     #[test]

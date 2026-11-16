@@ -95,12 +95,21 @@ pub struct Outbox {
 pub const OUTBOX_RING: usize = 2000;
 
 impl Outbox {
-    pub fn push(&mut self, f: Value) {
-        self.frames.push_back(f);
+    /// Queue `f` for every link. One too big to send on a link (measured as it is sent, see
+    /// arcade_mesh::link::fits) is not queued: every link would only skip it. Returns whether
+    /// it was queued.
+    pub fn push(&mut self, f: Value) -> bool {
+        let f = arcade_mesh::link::Frame::new(f);
+        if !arcade_mesh::link::fits(&f) {
+            eprintln!("mesh: not passing on a {:?} frame too big to send", f.kind());
+            return false;
+        }
+        self.frames.push_back(f.head);
         while self.frames.len() > OUTBOX_RING {
             self.frames.pop_front();
             self.start += 1;
         }
+        true
     }
 
     #[cfg(test)]
@@ -122,6 +131,16 @@ impl Outbox {
     pub fn since(&self, from: usize) -> (Vec<Value>, usize) {
         (self.frames.iter().skip(from.saturating_sub(self.start)).cloned().collect(), self.start + self.frames.len())
     }
+}
+
+#[test]
+fn outbox_keeps_out_frames_too_big_to_send() {
+    let mut o = Outbox::default();
+    // Small as received, but about 130 KB as sent (every non-ASCII character escaped).
+    assert!(!o.push(serde_json::json!({"t": "wl", "recs": ["\u{e9}".repeat(22_000)]})));
+    assert!(o.is_empty());
+    assert!(o.push(serde_json::json!({"t": "wl", "recs": ["\u{e9}".repeat(100)]})));
+    assert_eq!(o.since(0).0.len(), 1);
 }
 
 #[test]
