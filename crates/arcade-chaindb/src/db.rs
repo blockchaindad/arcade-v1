@@ -1139,6 +1139,17 @@ impl ChainDb {
         Ok(0)
     }
 
+    /// A chain's own note `name` (kept with its rows: removing or making the chain's copy again
+    /// forgets it too).
+    pub fn chain_note(&self, c: u16, name: &str) -> Result<Option<Vec<u8>>> {
+        self.store(c).read(|r| r.get(STATE, &k_state(c, &format!("note:{name}"))))
+    }
+
+    /// Set a chain's note `name` (see [`chain_note`](Self::chain_note)).
+    pub fn set_chain_note(&self, c: u16, name: &str, v: &[u8]) -> Result<()> {
+        self.wstore(c)?.write(|w| w.put(STATE, &k_state(c, &format!("note:{name}")), v))
+    }
+
     /// Height an indexer has folded in on a chain (None = nothing yet).
     pub fn indexed_to(&self, c: u16, name: &str) -> Result<Option<u32>> {
         self.store(c).read(|r| Ok(r.get(STATE, &ix_key(c, name))?.map(|v| be_u32(&v, 0))))
