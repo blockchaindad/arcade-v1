@@ -448,7 +448,11 @@ function drawCard(ch) {
   if (ddOn) rows.push(["DigiDollar address", W.dd.address]);
   $("w-recv-list").replaceChildren(...[...rows.map(([l, a]) => h("div", { class: "wl-recv" }, h("span", { class: "lbl" }, l),
       h("div", {}, h("code", {}, a), " ", h("button", { class: "small", onclick: (e) => copyText(a, e.target) }, "Copy")))),
-    w.legacy ? h("p", { class: "note" }, `Coins sent to ${w.legacy} (the older D... form of the same key) are counted too. Give people the dgb1... address: D... addresses look the same on Dogecoin.`) : null,
+    // DigiByte's Legacy address is the D... form, the very same string as on Dogecoin (same key, same version byte).
+    /^D/.test(w.address || "") && ch.key === "dgb" ? h("p", { class: "note warn" }, "This address is the same on Dogecoin and DigiByte. Check the chain before sending.") : null,
+    w.legacy ? h("p", { class: "note" }, /^D/.test(w.address || "")
+      ? `Coins sent to ${w.legacy} (the SegWit form of the same key) are counted too.`
+      : `Coins sent to ${w.legacy} (the older D... form of the same key) are counted too. Give people the dgb1... address: D... addresses look the same on Dogecoin.`) : null,
     ddOn && !W.dd.whole ? h("p", { class: "note" }, "DigiByte is borrowed here, so DigiDollar coins received before this arcade began following it aren't seen. Installing DigiByte finds them all.") : null].filter(Boolean));
 }
 

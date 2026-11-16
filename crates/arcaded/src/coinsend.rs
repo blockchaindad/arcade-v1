@@ -106,7 +106,13 @@ pub fn kind_pubkeys(node: &Node, p: &ChainParams, k: &arcade_app::TagKey) -> Vec
 /// DigiByte its dgb1... address, then D...); every other kind its one address.
 pub fn kind_scripts(p: &ChainParams, kind: AddrKind, pk: &PublicKey) -> Vec<(String, Vec<u8>)> {
     if kind == AddrKind::Legacy {
-        return key_scripts(p, pk);
+        // Where the chain also has address types (DigiByte), Legacy is the plain key-hash address first, as the
+        // original arcade showed it (D... on DigiByte), with the same key's SegWit form still counted after it.
+        let mut v = key_scripts(p, pk);
+        if kinds_for(p).len() > 1 && v.len() > 1 {
+            v.rotate_left(1);
+        }
+        return v;
     }
     match arcade_wallet::keys::kind_address(p, kind, pk) {
         Some(a) => vec![(a, arcade_wallet::keys::kind_script(kind, pk))],
@@ -447,6 +453,22 @@ pub fn publish_blobs(node: &Node, items: &[(Vec<u8>, String, arcade_arc::blob::C
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// On DigiByte (a chain with address types) Legacy is the D... key-hash address first, as the original arcade
+    /// showed it, with the same key's dgb1q... form still counted; a chain with no types keeps its single address.
+    #[test]
+    fn digibyte_legacy_shows_the_d_address_first() {
+        let words = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let seed = arcade_wallet::keys::seed_from_phrase(words).unwrap();
+        let dgb = arcade_chain::params::by_key("dgb").unwrap();
+        let x = arcade_wallet::keys::tag_key(&seed[..], dgb.bip44_coin_type, 0).unwrap();
+        let v = kind_scripts(dgb, AddrKind::Legacy, &x.public());
+        assert_eq!(v[0].0, "DBus3bamQjgJULBJtYXpEzDWQRwF5iwxgC", "the original arcade's D... address");
+        assert_eq!(v.len(), 2);
+        assert!(v[1].0.starts_with("dgb1q"), "its SegWit form still counted: {}", v[1].0);
+        let doge = arcade_chain::params::by_key("doge").unwrap();
+        assert_eq!(kind_scripts(doge, AddrKind::Legacy, &x.public()).len(), 1);
+    }
     use arcade_chain::params::{DIGIBYTE_MAIN, DOGECOIN_MAIN, PEPECOIN_TEST};
 
     #[test]
