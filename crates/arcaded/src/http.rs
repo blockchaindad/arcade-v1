@@ -433,6 +433,18 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
     let Ok(rs) = s.try_clone() else { return };
     let mut rd = BufReader::new(Timed { s: rs, until: Instant::now() + HEAD_TIME });
     let Some(mut r) = read_head(&mut rd) else { return };
+    // A mesh link over WebSocket (wss://<host>/mesh; a proxy in front holds the TLS): handed to the mesh, which treats
+    // it as an inbound link from the client's address (the proxy's X-Forwarded-For, believed only from this computer).
+    if r.method == "GET" && r.path == "/mesh" && r.headers.get("upgrade").and_then(|v| v.as_str()).is_some_and(|u| u.eq_ignore_ascii_case("websocket")) {
+        let key = r.headers.get("sec-websocket-key").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let pre = rd.buffer().to_vec();
+        let Ok(peer) = s.peer_addr().map(|a| a.ip()) else { return };
+        let ip = match r.headers.get("x-forwarded-for").and_then(|v| v.as_str()) {
+            Some(xff) if peer.is_loopback() => xff.rsplit(',').next().and_then(|a| a.trim().parse().ok()).unwrap_or(peer),
+            _ => peer,
+        };
+        return crate::meshsvc::accept_ws(node.self_arc(), s, ip, &key, pre);
+    }
     let is_local = local(node, &s, &r, conf.behind_proxy);
     let n = content_length(&r);
     if n > body_cap(node, &r, is_local) {

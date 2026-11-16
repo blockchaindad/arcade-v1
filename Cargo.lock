@@ -212,6 +212,7 @@ dependencies = [
  "rand",
  "rustls",
  "serde_json",
+ "sha1",
  "thiserror 1.0.69",
  "webpki-roots 1.0.11",
  "x25519-dalek",
