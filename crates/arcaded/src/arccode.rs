@@ -111,6 +111,24 @@ struct State {
     have_told: HashMap<String, usize>,
     /// Files being fetched now.
     fetching: HashSet<String>,
+    /// The last failed fetch of a file not held yet: (when, why), shown in code.status.
+    fetch_err: HashMap<String, (u64, String)>,
+}
+
+/// A release version's order: "v1.2.3" (a "-windows" or other suffix after the numbers ignored) as numbers, so v0.1.10
+/// comes after v0.1.9; a version that isn't one sorts first.
+fn version_key(v: &str) -> (u64, u64, u64) {
+    let core = v.trim().trim_start_matches('v');
+    let core = core.split(|c: char| c != '.' && !c.is_ascii_digit()).next().unwrap_or("");
+    let mut it = core.split('.').map(|x| x.parse::<u64>().unwrap_or(0));
+    (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0))
+}
+
+/// Newest first: the higher version, then (one version signed again, as with the Windows program added to v0.1.85)
+/// the later signing time. A release signed later but of an older version never comes before a newer one (@maya_mesh,
+/// @strawberry/arcade-v1 #8).
+fn newest_first(a: &Release, b: &Release) -> std::cmp::Ordering {
+    version_key(&b.version).cmp(&version_key(&a.version)).then(b.time.cmp(&a.time)).then(b.id.cmp(&a.id))
 }
 
 static ST: OnceLock<Mutex<State>> = OnceLock::new();
@@ -135,7 +153,7 @@ fn wanted(s: &State) -> BTreeMap<String, u64> {
     }
     let mut out = BTreeMap::new();
     for (_, mut rs) in by_name {
-        rs.sort_by(|a, b| b.time.cmp(&a.time).then(b.id.cmp(&a.id)));
+        rs.sort_by(|a, b| newest_first(a, b));
         for (i, r) in rs.iter().enumerate() {
             for (name, (sha, bytes)) in &r.files {
                 if !Release::is_program(name) || i < KEEP_PROGRAMS {
@@ -229,10 +247,17 @@ fn fetch_round(_node: &Node) {
     st().fetching.insert(sha.clone());
     let t0 = Instant::now();
     let r = fetch(&peer, &sha, bytes);
-    st().fetching.remove(&sha);
+    let mut s = st();
+    s.fetching.remove(&sha);
     match r {
-        Ok(()) => eprintln!("arc code: fetched {} ({bytes} bytes) from {} in {:.1} s", &sha[..12], &peer[..12], t0.elapsed().as_secs_f64()),
-        Err(e) => eprintln!("arc code: fetching {} from {}: {e}", &sha[..12], &peer[..12]),
+        Ok(()) => {
+            s.fetch_err.remove(&sha);
+            eprintln!("arc code: fetched {} ({bytes} bytes) from {} in {:.1} s", &sha[..12], &peer[..12], t0.elapsed().as_secs_f64())
+        }
+        Err(e) => {
+            eprintln!("arc code: fetching {} from {}: {e}", &sha[..12], &peer[..12]);
+            s.fetch_err.insert(sha, (arcade_app::now(), format!("from {}: {e}", &peer[..12.min(peer.len())])));
+        }
     }
 }
 
@@ -381,7 +406,7 @@ pub fn held_files(name: &str, file: &str) -> Vec<(Release, PathBuf)> {
             s.have.contains(sha).then(|| (r.clone(), file_path(sha)))
         })
         .collect();
-    v.sort_by(|a, b| b.0.time.cmp(&a.0.time).then_with(|| b.0.version.cmp(&a.0.version)));
+    v.sort_by(|a, b| newest_first(&a.0, &b.0));
     v
 }
 
@@ -407,8 +432,25 @@ pub fn status() -> Value {
         })
         .collect();
     let missing: u64 = want.iter().filter(|(sha, _)| !s.have.contains(*sha)).map(|(_, b)| b).sum();
+    // Each file still missing: how many linked arcades say they hold it, and the last failed try (why a file isn't
+    // coming, which a bare "bytes_missing" didn't say).
+    let missing_files: Vec<Value> = want
+        .iter()
+        .filter(|(sha, _)| !s.have.contains(*sha))
+        .map(|(sha, b)| {
+            let holders = s.peer_has.iter().filter(|(p, has)| has.contains(sha) && crate::crvia::linked(p)).count();
+            json!({"sha256": sha, "bytes": b, "linked_holders": holders, "fetching": s.fetching.contains(sha),
+                   "last_error": s.fetch_err.get(sha).map(|(t, e)| json!({"at": t, "why": e}))})
+        })
+        .collect();
+    let newest = {
+        let mut rs: Vec<&Release> = s.releases.values().filter(|r| r.name == ARCADE_V1).collect();
+        rs.sort_by(|a, b| newest_first(a, b));
+        rs.first().map(|r| json!({"version": r.version, "id": r.id}))
+    };
     json!({"trusted_keys": KEYS.get().map(|k| k.iter().map(|k| hex::encode(k.to_bytes())).collect::<Vec<_>>()).unwrap_or_default(),
-           "releases": releases, "files_held": s.have.len(), "bytes_missing": missing, "fetching": s.fetching.iter().collect::<Vec<_>>()})
+           "releases": releases, "files_held": s.have.len(), "bytes_missing": missing, "fetching": s.fetching.iter().collect::<Vec<_>>(),
+           "missing_files": missing_files, "newest": newest})
 }
 
 /// `code.add {record, sig, files: {name: path}}`: a release made here (scripts/code-publish.py), with its files.
@@ -441,4 +483,25 @@ pub fn export(req: &Value) -> Result<Value, String> {
     }
     std::fs::write(to.join("release.json"), json!({"record": r.record, "sig": r.sig}).to_string()).map_err(|e| e.to_string())?;
     Ok(json!({"id": r.id, "dir": to, "written": written, "commit": r.commit}))
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+
+    fn rel(version: &str, time: u64, id: &str) -> Release {
+        Release { id: id.into(), record: String::new(), sig: String::new(), name: ARCADE_V1.into(), version: version.into(), commit: String::new(), time, files: Default::default() }
+    }
+
+    /// The newest release is the highest version as numbers; one version signed again sorts by its later time; an
+    /// older version signed later never comes first (@strawberry/arcade-v1 #8: v0.1.85 re-signed after v0.1.86).
+    #[test]
+    fn releases_order_by_version_then_signing_time() {
+        assert!(version_key("v0.1.10") > version_key("v0.1.9"));
+        assert_eq!(version_key("v0.1.85-windows"), version_key("v0.1.85"));
+        let mut v = vec![rel("v0.1.85", 100, "a"), rel("v0.1.86", 200, "b"), rel("v0.1.85", 300, "c"), rel("v0.1.9", 400, "d"), rel("v0.1.10", 50, "e")];
+        v.sort_by(newest_first);
+        let ids: Vec<&str> = v.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["b", "c", "a", "e", "d"]);
+    }
 }
