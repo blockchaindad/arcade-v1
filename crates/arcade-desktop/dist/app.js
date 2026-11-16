@@ -377,6 +377,16 @@ function drawCard(ch) {
   $("w-who").textContent = w.own ? (w.tag ? "@" + w.tag : "This arcade's wallet") : `${w.name || "Imported wallet"} · imported ${w.kind === "phrase" ? "from words" : "key"}`;
   $("w-bal").textContent = w.balance == null ? "—" : coinNum(w.balance);
   $("w-unit").textContent = tk;
+  // A borrowed chain: its trust colour beside the balance (red adds its note below).
+  $("w-trust").replaceChildren();
+  api("chains.status", { key: ch.key }).then((st) => {
+    if (cur() !== w || !st) return;
+    // Kept here: a plain green dot; borrowed: its trust colour and lender count.
+    if (!st.borrowed && (st.installed || st.home)) { $("w-trust").replaceChildren(trustDot("green", `${ch.name} is kept on this arcade: every block is checked here.`, null, true)); return; }
+    if (!st.borrowed || !st.trust) return;
+    $("w-trust").replaceChildren(trustDot(st.trust, st.trust_note, st.trust_hosts));
+    if (st.trust === "red" && st.trust_note && !$("w-sub").textContent.includes(st.trust_note)) $("w-sub").textContent = [st.trust_note, $("w-sub").textContent].filter(Boolean).join(" · ");
+  }).catch(() => {});
   const ddOn = w.own && w.index === 0 && isDD(ch.key) && W.dd && !W.dd.error;
   const sub = [];
   if (w.balance == null) sub.push(`${ch.name} isn't installed or borrowed with addresses here: add it in Chains & Coins to see balances.`);
