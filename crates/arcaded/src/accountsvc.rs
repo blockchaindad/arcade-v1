@@ -219,8 +219,12 @@ fn ask_vault(host: &str, tag: &str, here: bool) -> Option<(String, Value)> {
     if !v["blob"]["sealed"].is_string() {
         return None;
     }
-    let from = v["from"].as_str().map(bare_host).filter(|f| !f.is_empty()).unwrap_or_else(|| host.to_string());
-    Some((from, v))
+    Some((ask_from(host, &v), v))
+}
+
+/// The arcade an answer says holds the account ("from"), else the one asked.
+fn ask_from(asked: &str, v: &Value) -> String {
+    v["from"].as_str().map(bare_host).filter(|f| !f.is_empty()).unwrap_or_else(|| asked.to_string())
 }
 
 /// The sealed vault for @tag: from `from` if given, else from whichever known arcade holds it
@@ -335,7 +339,7 @@ fn bring_mailbox(node: &Node, host: &str, login: &ed25519_dalek::SigningKey, mk:
     let base = format!("https://{host}");
     let ch: Value = a.get(&format!("{base}/auth/challenge")).call().map_err(|e| format!("challenge: {e}"))?.into_json().map_err(|e| e.to_string())?;
     let (nonce, origin) = (ch["nonce"].as_str().unwrap_or(""), ch["origin"].as_str().unwrap_or(""));
-    let sig = login.sign(format!("DogecoinArcade login\n{origin}\n{nonce}").as_bytes());
+    let sig = login.sign(&login_message(host, origin, nonce)?);
     a.post(&format!("{base}/auth/login"))
         .send_json(json!({"pubkey": hex::encode(login.verifying_key().to_bytes()), "nonce": nonce, "signature": hex::encode(sig.to_bytes()), "origin": origin}))
         .map_err(|e| format!("login: {e}"))?;
@@ -367,6 +371,28 @@ fn bring_mailbox(node: &Node, host: &str, login: &ed25519_dalek::SigningKey, mk:
         }
     }
     Ok(json!({"groups": groups, "book": book, "blocked": blocked, "letters": m["letters"].as_array().map(|l| l.len()).unwrap_or(0)}))
+}
+
+/// What the login key signs for the arcade at `host` (the one this arcade dialled for the challenge): the challenge's
+/// origin must be that host's own (https, or http where a proxy in front doesn't say https), since the origin names
+/// where the signature lets one sign in. A challenge naming any other origin is refused, so an arcade that answers
+/// for an account (or one that `from` points to) gets a login good only for itself.
+fn login_message(host: &str, origin: &str, nonce: &str) -> Result<Vec<u8>, String> {
+    let host = host.trim().to_ascii_lowercase();
+    let plain = |h: &str| {
+        let (name, port) = h.split_once(':').unwrap_or((h, ""));
+        !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') && (h.len() == name.len() || !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let named = origin.trim().trim_end_matches('/').to_ascii_lowercase();
+    let named = named.strip_prefix("https://").or_else(|| named.strip_prefix("http://")).unwrap_or("");
+    let same = |n: &str| n == host || n.strip_suffix(":443").is_some_and(|n| n == host) || host.strip_suffix(":443").is_some_and(|h| h == n);
+    if !plain(&host) || !plain(named) || !same(named) {
+        return Err(format!("{host} asked to sign a login for {origin:?}, not for itself: not signed"));
+    }
+    if nonce.is_empty() {
+        return Err(format!("{host} gave no challenge to sign"));
+    }
+    Ok(format!("DogecoinArcade login\n{origin}\n{nonce}").into_bytes())
 }
 
 /// base64(nonce24 || secretbox) under blake2b-256(messaging secret || "arcade-mailbox/1").
@@ -402,6 +428,29 @@ mod tests {
         let blob = json!({"kdf": "PBKDF2-SHA512", "iterations": 1000, "salt": hex::encode(salt), "nonce": hex::encode(nonce), "sealed": hex::encode(ct)});
         assert_eq!(open_sealed(&blob, "pw").unwrap(), b"legal winner");
         assert_eq!(open_sealed(&blob, "nope").unwrap_err(), "wrong password");
+    }
+
+    #[test]
+    fn a_login_is_signed_only_for_the_arcade_dialled() {
+        let ok = |host: &str, origin: &str| login_message(host, origin, "n1").map(|m| String::from_utf8(m).unwrap());
+        // The arcade's own origin, as it names it (with or without https's port, a trailing slash, any case).
+        assert_eq!(ok("b.example", "https://b.example").unwrap(), "DogecoinArcade login\nhttps://b.example\nn1");
+        for o in ["https://B.example/", "http://b.example", "https://b.example:443"] {
+            assert!(ok("b.example", o).is_ok(), "{o}");
+        }
+        assert!(ok("b.example:8443", "https://b.example:8443").is_ok());
+        // Relayed: a.example was asked and answered that b.example holds the account ("from"), so the challenge
+        // comes from b.example. It may not name a.example, another arcade, or nothing.
+        let asked = "a.example";
+        let from = ask_from(asked, &json!({"from": "https://b.example/", "blob": {"sealed": "x"}}));
+        assert_eq!(from, "b.example");
+        for o in [format!("https://{asked}"), "https://pepecoinarcade.com".into(), "https://b.example.a.example".into(), "https://b.example:8443".into(),
+                  "https://x@b.example".into(), "b.example".into(), "".into()] {
+            assert!(ok(&from, &o).is_err(), "{o}");
+        }
+        // A `from` that isn't a plain host signs nothing.
+        assert!(ok("a.example@b.example", "https://a.example@b.example").is_err());
+        assert!(login_message("b.example", "https://b.example", "").is_err(), "no nonce");
     }
 }
 
