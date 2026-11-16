@@ -312,6 +312,19 @@ pub fn unqueue(node: &Node, key: &str) -> Result<Value, String> {
     Ok(json!({"unqueued": key}))
 }
 
+/// chains.queue: the chains waiting to be installed, next first, with the mode and indexes each asked for.
+pub fn queue_list(node: &Node) -> Value {
+    let rows: Vec<Value> = queue(node)
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let key = e["key"].as_str().unwrap_or("");
+            json!({"position": i + 1, "key": key, "name": by_key(key).map(|p| p.name), "mode": e["mode"], "with": e["with"], "at": e["at"]})
+        })
+        .collect();
+    json!({"installing": installing_now(node).map(|p| p.key), "queue": rows})
+}
+
 /// Every 20 s: when no chain is being installed, the next one in the queue starts.
 pub fn run_queue(node: Arc<Node>) {
     std::thread::Builder::new()
@@ -365,6 +378,8 @@ pub fn add(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>) -> Res
         if p.chain_no == node.params.chain_no {
             return Err(format!("{} is this arcade's home chain and is always installed", p.name));
         }
+        // The same checks as at its turn, so a typo fails now and not hours later; the queue keeps the checked list.
+        let indexes = check(p, mode, &indexes)?;
         let mut q = queue(node);
         if let Some(i) = q.iter().position(|e| e["key"] == p.key) {
             return Ok(json!({"queued": true, "key": p.key, "position": i + 1, "behind": busy.key}));
@@ -387,20 +402,7 @@ fn add_now(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>) -> Res
     if node.extra.lock().unwrap().contains_key(key) {
         return Err(format!("{} is already installed", p.name));
     }
-    if !MODES.contains(&mode) {
-        return Err(format!("mode must be one of {}", MODES.join(", ")));
-    }
-    if mode == "index" {
-        return Err("Index-only storage (borrowing blocks from the mesh) is coming; use full, chain or light for now".into());
-    }
-    // Light: the chain's headers only (§15 step 15), no blocks, no indexes.
-    if mode == "light" && !indexes.is_empty() {
-        return Err("Light storage keeps headers only: no indexes".into());
-    }
-    let indexes = normalize(p, &indexes, false)?;
-    if mode == "chain" && indexes.iter().any(|i| i != "addresses") {
-        return Err("Blockchain-only storage keeps no protocol indexes (Addresses is fine); choose full to add indexes".into());
-    }
+    let indexes = check(p, mode, &indexes)?;
     // Shared storage: pick the ord and token groups this arcade keeps (least-held first).
     let share = if mode == "shared" {
         json!({"ord": crate::shares::choose_groups(node, p.net, "ord"), "tok": crate::shares::choose_groups(node, p.net, "tok")})
@@ -416,6 +418,25 @@ fn add_now(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>) -> Res
     save(node);
     let _ = node.app.event("chains", &format!("installing {} ({mode})", p.name));
     status(node, key)
+}
+
+/// A mode and index set for a chain not installed yet, checked: the indexes it asks for, riders bringing ord.
+fn check(p: &ChainParams, mode: &str, indexes: &[String]) -> Result<Vec<String>, String> {
+    if !MODES.contains(&mode) {
+        return Err(format!("mode must be one of {}", MODES.join(", ")));
+    }
+    if mode == "index" {
+        return Err("Index-only storage (borrowing blocks from the mesh) is coming; use full, chain or light for now".into());
+    }
+    // Light: the chain's headers only (§15 step 15), no blocks, no indexes.
+    if mode == "light" && !indexes.is_empty() {
+        return Err("Light storage keeps headers only: no indexes".into());
+    }
+    let indexes = normalize(p, indexes, false)?;
+    if mode == "chain" && indexes.iter().any(|i| i != "addresses") {
+        return Err("Blockchain-only storage keeps no protocol indexes (Addresses is fine); choose full to add indexes".into());
+    }
+    Ok(indexes)
 }
 
 pub fn set_paused(node: &Node, key: &str, paused: bool) -> Result<Value, String> {
@@ -1027,12 +1048,13 @@ fn quick_list(node: &Node) -> Value {
         json!({"key": p.key, "name": p.name, "installed": home || installed.contains(p.key) || crate::arcsvc::runs(p), "home": home, "arcade": arcade,
                "borrowed": crate::borrow::is_borrowed(p.key), "state": "loading…", "loading": true, "sizes": null, "offers": node.offers_for(p.key).len(),
                "ord": !arcade && ord_start(p).is_some(), "tokens": if arcade { None } else { arcade_ledger::tokens::protocol(p).map(|x| x.0.to_uppercase()) },
-               "dunes": p.key == "doge", "dogefeed": p.key == "doge", "runes": p.key == "btc"})
+               "dunes": p.key == "doge", "dogefeed": p.key == "doge", "runes": p.key == "btc", "queued": queued_at(node, p.key)})
     };
     json!(ALL_CHAINS.iter().map(|p| row(p, false)).chain(crate::arcsvc::defined().map(|p| row(p, true))).collect::<Vec<_>>())
 }
 
 pub fn list(node: &Node) -> Value {
+    let q = queue(node);
     json!(ALL_CHAINS
         .iter()
         .map(|p| {
@@ -1043,7 +1065,9 @@ pub fn list(node: &Node) -> Value {
                    "dunes": p.key == "doge", "dogefeed": p.key == "doge", "runes": p.key == "btc", "sizes": crate::sizes::for_chain(node, p.key),
                    "offers": node.offers_for(p.key).len(),
                    "borrowed": st["borrowed"] == true, "lenders": st["lenders"], "tip": st["tip"], "floor": st["floor"], "mismatch": st["mismatch"],
-                   "queued": queued_at(node, p.key)})
+                   "queued": q.iter().position(|e| e["key"] == p.key).map(|i| i + 1),
+                   "queued_mode": q.iter().find(|e| e["key"] == p.key).map(|e| e["mode"].clone()),
+                   "queued_with": q.iter().find(|e| e["key"] == p.key).map(|e| e["with"].clone())})
         })
         .chain(crate::arcsvc::row(node))
         .collect::<Vec<_>>())
@@ -1582,6 +1606,29 @@ mod home_queue_tests {
         assert!(home_busy(1_000, 11, true), "just past the margin");
         assert!(home_busy(1_000, 0, false), "address rows still building");
         assert!(!home_busy(1_000, 10, true), "caught up: installs go ahead");
+    }
+
+    fn with(ix: &[&str]) -> Vec<String> {
+        ix.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// chains.add checks a queued install as add_now will at its turn (issue #4).
+    #[test]
+    fn a_queued_install_is_checked_before_it_waits() {
+        use super::check;
+        let pep = arcade_chain::params::by_key("pep").unwrap();
+        let doge = arcade_chain::params::by_key("doge").unwrap();
+        let all = with(&["addresses", "ledger", "profiles", "ord", "names", "maps", "tokens", "collections"]);
+        assert_eq!(check(pep, "full", &all).unwrap(), all);
+        assert_eq!(check(pep, "full", &with(&["names"])).unwrap(), with(&["ord", "names"]), "riders bring ord");
+        assert!(check(pep, "full", &with(&["ledgr"])).unwrap_err().contains("unknown index ledgr"));
+        assert!(check(pep, "full", &with(&["dogefeed"])).unwrap_err().contains("Dogecoin"));
+        assert!(check(doge, "full", &with(&["dogefeed"])).is_ok());
+        assert!(check(pep, "full", &with(&["messages"])).is_err(), "messages are the home chain's");
+        assert!(check(pep, "fast", &[]).unwrap_err().contains("mode must be"));
+        assert!(check(pep, "chain", &with(&["ledger"])).is_err());
+        assert!(check(pep, "chain", &with(&["addresses"])).is_ok());
+        assert!(check(pep, "light", &with(&["addresses"])).is_err());
     }
 }
 

@@ -86,6 +86,8 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
             let tag_count = tags.as_ref().map(|t| t.len()).unwrap_or(0);
             let digest = tags.as_ref().map(|t| arcade_ledger::tags::digest(t.iter().map(|(n, r)| (n.as_str(), r)))).unwrap_or_default();
             let indexed_to = node.chain.indexed_to(c, "ledger.v1").ok().flatten();
+            // The best height anyone tells us of (headers, arcades on the mesh, lenders); read before mesh_tips is held.
+            let best = tip.as_ref().map(|t| t.height).unwrap_or(0) + crate::borrow::home_lag(node).0;
             let tips = node.mesh_tips.lock().unwrap();
             let mesh: Vec<Value> = tips
                 .iter()
@@ -95,6 +97,7 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
                 "chain": p.name,
                 "sync": *node.sync_state.lock().unwrap(),
                 "tip": tip.map(|t| json!({"height": t.height, "hash": t.hash.to_hex()})),
+                "best_known": best,
                 "tags": {"indexed_to": indexed_to, "count": tag_count, "names_digest": digest},
                 "profiles": index::profile_count(&node.chain, c).unwrap_or(0),
                 "mesh": {"links": node.links.lock().unwrap().len(), "tips": mesh},
@@ -772,6 +775,7 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
             // The drive chosen for it, else this arcade's own (crate::chaindrive): its file starts there.
             crate::chaindrive::add(node, &key, &s("drive").unwrap_or_default(), || crate::chains::add(&node.self_arc(), &key, &s("mode").unwrap_or_else(|| "full".into()), with))
         }
+        "chains.queue" => Ok(crate::chains::queue_list(node)),
         "chains.unqueue" => crate::chains::unqueue(node, &s("key").ok_or("key required")?),
         "chains.pause" => crate::chains::set_paused(node, &s("key").ok_or("key required")?, true),
         "chains.resume" => crate::chains::set_paused(node, &s("key").ok_or("key required")?, false),

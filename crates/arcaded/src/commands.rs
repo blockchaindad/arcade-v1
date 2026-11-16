@@ -59,7 +59,7 @@ macro_rules! cmds {
 }
 
 cmds! {
-    "status" Public "" "Home chain, sync state, tags, profiles, mesh links, node id.";
+    "status" Public "" "Home chain, sync state, tip, best_known (the best height anyone tells us of), tags, profiles, mesh links, node id.";
     "peers" Read "" "Arcades linked over the mesh right now.";
     "mesh.udp" Read "" "UDP hole punching: STUN server and proved addresses, NAT kind, which links run over UDP paths (RTT, packets), introductions.";
     "mesh.udp_set" Admin "on?, lan_dial?, stun_port?, drop?" "Turn UDP paths and introductions on or off (ARCADE_MESH_UDP=0 overrides), offer LAN addresses to every peer, set the STUN port for the next start (0 = none); drop = a peer id prefix whose path to fail now (falls back to TCP).";
@@ -230,6 +230,7 @@ cmds! {
     "chains.offers" Public "" "Chains other arcades offer over the mesh.";
     "chains.sizes" Admin "" "Measure this arcade's disk use per chain now.";
     "chains.add" Admin "key, mode?, with?, drive?" "Install a chain (mode full, shared or chain; with = indexes; drive from chains.drives, else this arcade's own). One install at a time: while another chain is still being installed it waits in a queue (queued, position).";
+    "chains.queue" Public "" "Chains waiting to be installed, next first (position, key, name, mode, with), and the chain being installed now that they wait behind.";
     "chains.unqueue" Admin "key" "Take a chain out of the install queue.";
     "chains.pause" Admin "key" "Pause a chain.";
     "ui.link" Local "" "The link that opens the app's window in a browser (/ui/, with this start's key) and the SSH tunnel command for another computer (docs/WEBUI.md).";
