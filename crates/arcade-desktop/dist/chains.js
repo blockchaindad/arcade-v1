@@ -5,7 +5,7 @@
     ["shared", "Shared", "Coins, plus your share of the blocks, ord records and token ticks; the rest is held by other arcades and fetched when needed.", true],
     ["chain", "Blockchain only", "Blocks and coins (and Addresses, if you tick it). No protocol indexes.", true],
     ["index", "Index only", "Coming: chosen indexes, blocks borrowed from the mesh.", false],
-    ["light", "Light", "Coming: headers only; everything else borrowed.", false],
+    ["light", "Light", "Headers only, about 70 MB: no blocks, coins or indexes. Lets this arcade check ARCADE fraud proofs about Bitcoin.", true],
   ];
   // Every index is opt-in. Names, maps and tokens ride on the ord index (ticking one ticks ord);
   // collections needs ord too but is read from it afterwards.
@@ -114,6 +114,7 @@
   const size = (b) => b == null ? null : b >= 1e12 ? (b / 1e12).toFixed(2) + " TB" : b >= 1e9 ? (b / 1e9).toFixed(1) + " GB" : b >= 1e6 ? Math.max(1, Math.round(b / 1e6)) + " MB" : "under 1 MB";
   const who = (n) => n === 1 ? "1 arcade" : `${n} arcades`;
   function modeSize(c, k) {
+    if (k === "light") return c.key === "btc" ? "About 70 MB" : "";
     const z = c.sizes || {};
     const b = z.modes?.[k];
     if (b == null) return "Size: no arcade has reported this chain yet.";
@@ -152,7 +153,12 @@
       $("c-total").hidden = true;
       return;
     }
-    $("c-modes").replaceChildren(...MODES.map(([k, t, d, ok]) => {
+    // Light (headers only) is offered for Bitcoin alone, by choice: nothing adds it by itself.
+    const lightOk = c.key === "btc";
+    if (mode === "light" && !lightOk) mode = "full";
+    $("c-modes").replaceChildren(...MODES.map(([k, t, d, ok0]) => {
+      const ok = ok0 && (k !== "light" || lightOk);
+      if (k === "light" && !lightOk) d = "Bitcoin only: headers only.";
       const l = document.createElement("label");
       l.className = "mode" + (k === mode ? " sel" : "") + (ok ? "" : " off");
       l.innerHTML = `<input type="radio" name="mode" ${k === mode ? "checked" : ""} ${ok ? "" : "disabled"}><b></b><small></small><small class="sz"></small>`;
@@ -161,10 +167,10 @@
       if (ok) l.onclick = () => { mode = k; choose(c); };
       return l;
     }));
-    const noIdx = mode === "chain";
+    const noIdx = mode === "chain", light = mode === "light";
     // Runes only on Bitcoin, dunes only on Dogecoin: other chains don't list them.
     $("c-idx").replaceChildren(...INDEXES.filter(([, , , , needs]) => (needs !== "runes" || c.runes) && (needs !== "dunes" || c.dunes) && (needs !== "dogefeed" || c.dogefeed)).map(([k, t, d, ok, needs]) => {
-      const can = ok && (!noIdx || k === "addresses") && (needs !== "ord" || c.ord) && (k !== "tokens" || c.tokens);
+      const can = ok && !light && (!noIdx || k === "addresses") && (needs !== "ord" || c.ord) && (k !== "tokens" || c.tokens);
       const l = document.createElement("label");
       l.className = can ? "" : "off";
       l.innerHTML = `<input type="checkbox" data-k="${k}" ${can ? "" : "disabled"}> <b></b> <small></small> <small class="sz"></small>`;
@@ -181,7 +187,7 @@
       };
       return l;
     }));
-    $("c-est").textContent = noIdx ? "Blocks and coins; Addresses if you tick it, no protocol indexes." : "Nothing is ticked for you: choose the indexes you want. Each can be removed later. Addresses are built in one sorted pass after the chain catches up, which is much faster.";
+    $("c-est").textContent = light ? "Bitcoin's headers only (about 70 MB, a few minutes): no blocks, coins or indexes. Remove it any time." : noIdx ? "Blocks and coins; Addresses if you tick it, no protocol indexes." : "Nothing is ticked for you: choose the indexes you want. Each can be removed later. Addresses are built in one sorted pass after the chain catches up, which is much faster.";
     $("c-total").textContent = total(c);
     $("c-total").hidden = !$("c-total").textContent;
     const offers = c.offers || 0;

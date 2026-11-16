@@ -90,7 +90,7 @@ fn pct(s: &str) -> String {
 /// (one window per app; opening it again brings that window forward). `ring`: the ring it is
 /// opened from, which the app can then ask about; an open window starts the app again for it.
 #[tauri::command]
-fn open_app(app: tauri::AppHandle, id: String, title: String, frame: String, ring: Option<String>) -> Result<(), String> {
+fn open_app(app: tauri::AppHandle, id: String, title: String, frame: String, ring: Option<String>, at: Option<String>) -> Result<(), String> {
     use std::hash::{Hash, Hasher};
     use tauri::Manager;
     if !frame.starts_with("http://127.0.0.1:") {
@@ -101,12 +101,18 @@ fn open_app(app: tauri::AppHandle, id: String, title: String, frame: String, rin
     if let Some(r) = &ring {
         url.push_str(&format!("&ring={r}"));
     }
+    // A place inside the app (a #/ route, checked again by the window), as the Options' "read the newest code" opens
+    // Arcade Git at @arcade/arcade-v1.
+    let at = at.filter(|a| a.starts_with("#/") && a.len() <= 202);
+    if let Some(a) = &at {
+        url.push_str(&format!("&at={}", pct(a)));
+    }
     let mut h = std::collections::hash_map::DefaultHasher::new();
     id.hash(&mut h);
     let label = format!("app-{:016x}", h.finish());
     if let Some(w) = app.get_webview_window(&label) {
         let _ = w.unminimize();
-        if ring.is_some() {
+        if ring.is_some() || at.is_some() {
             let _ = w.eval(&format!("location.replace({})", Value::String(url)));
         }
         return w.set_focus().map_err(|e| e.to_string());

@@ -963,7 +963,7 @@ mainnet. Marked *(default)* where Martin has not said yes.
 
 **D. Mainnet**
 
-15. **Bitcoin headers** kept by every arcade (for beacons and Bitcoin segments). Pass: every arcade follows Bitcoin's headers.
+15. **Bitcoin headers** in light mode (for beacons and Bitcoin segments), by the operator's choice: Chains & Coins, Bitcoin, Light. Nothing adds them by itself. Pass: an arcade that chose them follows Bitcoin's headers.
 16. **The genesis list's 12-31 correction step** (a receipted commit left out is put back). Pass: a rehearsal where the assembler leaves a commit out and the correction restores it.
 17. **The mainnet settings**: the timetable, the assembler, block 0 naming the first code release. Pass: a dry run of the whole timetable shortened to hours.
 18. **Release checkpoints** for new or long-offline arcades. Pass: an arcade started fresh takes the checkpointed branch.

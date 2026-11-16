@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 fn c(node: &Node) -> u16 {
-    node.params.chain_no
+    node.ledger_home().chain_no
 }
 
 /// Acts waiting in the mempool, and posts too (shown at once, read live each time).
@@ -29,7 +29,7 @@ pub(crate) fn pending_acts(node: &Node) -> Vec<Value> {
 
 fn pending(node: &Node) -> (Vec<Value>, Vec<Value>) {
     let (mut posts, mut acts) = (Vec::new(), Vec::new());
-    let p = node.params;
+    let p = node.ledger_home();
     for (tx, atx) in crate::claims::pending_arcade(node) {
         let Some(a) = m::arcm_of(&atx.payload) else { continue };
         let txid = tx.txid.to_hex();
@@ -303,7 +303,7 @@ pub fn act(node: &Node, kind: &str, target: &str, text: &str, amount: u64) -> Re
             .or_else(|| m::rows(&node.chain, m::ACT, cc).ok()?.into_iter().find(|a| a["txid"] == target).and_then(|a| a["from"].as_str().map(String::from)))
             .ok_or("that post isn't in a block yet; tip it once it is")?;
         // A tip is a wallet spend: P2PKH of the home chain only.
-        let script = arcade_ledger::address::p2pkh_script_for_address(node.params, &author).ok_or("bad author address")?;
+        let script = arcade_ledger::address::p2pkh_script_for_address(node.ledger_home(), &author).ok_or("bad author address")?;
         extra.push(arcade_wallet::tx::TxOutSpec { value: amount, script });
     }
     let fa = FeedAct { act, target: target.to_string(), text: text.to_string() };

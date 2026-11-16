@@ -55,8 +55,10 @@ async function webInvoke(name, args = {}) {
     if (!String(frame || "").startsWith(location.origin + "/app/")) throw "apps run only from this arcade";
     let url = `appwindow.html?frame=${encodeURIComponent(frame)}&id=${encodeURIComponent(args.id)}&title=${encodeURIComponent(args.title)}`;
     if (args.ring && /^[0-9a-f]{16}$/.test(args.ring)) url += `&ring=${args.ring}`;
+    if (args.at) url += `&at=${encodeURIComponent(args.at)}`;
     const label = "app-" + String(args.id).replace(/[^A-Za-z0-9_-]/g, "_");
     const w = WEB_WINDOWS[label];
+    if (w && !w.closed && args.at) { w.location.replace(url); w.focus(); return; }
     if (w && !w.closed && !args.ring) { w.focus(); return; }
     WEB_WINDOWS[label] = window.open(url, label, "popup,width=1000,height=720");
     if (!WEB_WINDOWS[label]) throw "the browser blocked the app's window: allow pop-ups for this page";

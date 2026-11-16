@@ -270,7 +270,7 @@ fn vet(node: &Node, st: &mut St, origin: &str, member: &str, cred: Option<&Value
 
 fn who(node: &Node, origin: &str, member: &str, cred: Option<&Value>) -> Value {
     let address = cred.and_then(|c| c["a"].as_str()).map(String::from);
-    let tag = address.as_deref().and_then(|a| arcade_ledger::index::tag_of(&node.chain, node.params.chain_no, a).ok().flatten());
+    let tag = address.as_deref().and_then(|a| crate::hometag::of_address(node, a));
     json!({"id": member, "node": origin, "address": address, "tag": tag, "guest": address.is_none()})
 }
 

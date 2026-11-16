@@ -26,13 +26,13 @@ pub fn target_of(address: &str) -> Option<String> {
 /// The account a follow target names, on the home chain.
 pub fn address_of(node: &Node, target: &str) -> Option<String> {
     let b = hex::decode(target).ok()?;
-    (b.len() == 32 && b[20..].iter().all(|x| *x == 0)).then(|| arcade_ledger::address::base58check(node.params.p2pkh_version, &b[..20]))
+    (b.len() == 32 && b[20..].iter().all(|x| *x == 0)).then(|| arcade_ledger::address::base58check(node.ledger_home().p2pkh_version, &b[..20]))
 }
 
 /// An @tag or an address, as an address on the home chain.
 pub fn resolve(node: &Node, who: &str) -> Result<String, String> {
     let who = who.trim();
-    let c = node.params.chain_no;
+    let c = node.ledger_home().chain_no;
     match who.strip_prefix('@') {
         Some(t) => Ok(arcade_ledger::index::tag_row(&node.chain, c, &t.to_lowercase())
             .map_err(|e| e.to_string())?
@@ -66,21 +66,21 @@ fn settle(acts: impl Iterator<Item = Value>, key: impl Fn(&Value) -> Option<Stri
 
 pub fn followers_of(node: &Node, address: &str) -> Vec<String> {
     let Some(t) = target_of(address) else { return vec![] };
-    let c = node.params.chain_no;
+    let c = node.ledger_home().chain_no;
     let mut acts = m::acts_on(&node.chain, c, &t);
     acts.extend(waiting(node).into_iter().filter(|a| a["target"] == t.as_str()));
     settle(acts.into_iter(), |a| a["from"].as_str().filter(|f| *f != address).map(String::from))
 }
 
 pub fn following_of(node: &Node, address: &str) -> Vec<String> {
-    let c = node.params.chain_no;
+    let c = node.ledger_home().chain_no;
     let mut acts: Vec<Value> = m::rows(&node.chain, m::ACT, c).unwrap_or_default().into_iter().filter(|a| a["from"] == address).collect();
     acts.extend(waiting(node).into_iter().filter(|a| a["from"] == address));
     settle(acts.into_iter(), |a| a["target"].as_str().and_then(|t| address_of(node, t)).filter(|x| x != address))
 }
 
 fn row(node: &Node, address: &str) -> Value {
-    let tag = arcade_ledger::index::tag_of(&node.chain, node.params.chain_no, address).ok().flatten();
+    let tag = crate::hometag::of_address(node, address);
     json!({"address": address, "tag": tag})
 }
 
@@ -113,7 +113,7 @@ mod tests {
     #[test]
     fn a_target_names_an_address_and_back() {
         let t = crate::sitesvc::tests::setup();
-        let a = arcade_ledger::address::base58check(t.node.params.p2pkh_version, &[7u8; 20]);
+        let a = arcade_ledger::address::base58check(t.node.ledger_home().p2pkh_version, &[7u8; 20]);
         let target = target_of(&a).unwrap();
         assert_eq!(target.len(), 64);
         assert_eq!(address_of(&t.node, &target).as_deref(), Some(a.as_str()));
