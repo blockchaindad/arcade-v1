@@ -1204,7 +1204,8 @@ mod tests {
         let socks: Vec<std::net::TcpStream> = (0..MAX_HANDSHAKES_PER_IP + 3).map(|_| std::net::TcpStream::connect(to).unwrap()).collect();
         let mut open = 0;
         for mut s in socks {
-            s.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+            // Generous: a closed one reads 0 at once, and a waiting one gets our hello late on a loaded machine.
+            s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
             let mut b = [0u8; 4096];
             if s.read(&mut b).is_ok_and(|n| n > 0) {
                 open += 1;
