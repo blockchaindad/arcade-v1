@@ -65,7 +65,10 @@ pub fn send(node: &Node, payload: &[u8]) -> Result<(String, u64), String> {
     let (_, _, sk) = sender(node, p)?;
     let pk = arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
     let script = arcade_wallet::keys::p2pkh_script_for(&pk);
-    let coins = crate::claims::arc_coins(node, p, &script);
+    // Confirmed coins first; then this wallet's change still waiting in the pool (a record right after its text's
+    // blob spends the blob's change, so one coin is enough for both: @strawberry/arcade-v1 #7).
+    let mut coins = crate::claims::arc_coins(node, p, &script);
+    coins.extend(crate::arcsvc::waiting_outputs(&script).into_iter().map(|(op, value)| arcade_wallet::tx::Utxo { outpoint: op, value, script: script.clone() }));
     let fee_per_kb = 2 * arcade_arc::params::MIN_FEE_PER_KB;
     let tx = arcade_wallet::tx::build_arcade_with(p, payload, vec![], &sk, &coins, fee_per_kb, arcade_arc::params::DUST,
         arcade_app::now() as u32, arcade_wallet::tx::ARCADE_CLASS_C_MAX)
@@ -289,16 +292,34 @@ pub fn repo_manifest(node: &Node, full: &str) -> Option<String> {
 // ---------------- issues, pull requests, comments, reviews (§15 step 10) ----------------
 
 /// A text as a blob (Permanent, JSON): its id. The record that names it can go at once: the ledger keeps the id.
+/// About what a record's transaction and the blob's own transaction cost on top of the blob bytes (fees at twice the
+/// floor for a few hundred bytes each, and the dust left as change), kept back before a text is posted.
+const RECORD_FEE_ROOM: u64 = 1_000_000;
+
+/// The blob part of posting `bytes` of text: its bytes at the blob rate.
+fn blob_cost(bytes: usize) -> u64 {
+    arcade_arc::blob::fee_for(bytes as u64)
+}
+
 fn body_blob(node: &Node, v: &Value) -> Result<[u8; 32], String> {
     let bytes = serde_json::to_vec(v).map_err(|e| e.to_string())?;
-    // The text's blob and then the record are two transactions, and the record spends only confirmed coins: with one
-    // free coin the blob would take it and the record fail, and every retry would pay for the blob again. So wait (the
-    // error says "not enough", which callers retry) until there's a coin for each.
+    // The text's blob and then the record are two transactions. The record spends the blob's change while both wait
+    // in the pool (`send` takes waiting change), so one coin pays for both. Before, it needed two confirmed coins, and
+    // a wallet funded once has one: it could never post (@strawberry/arcade-v1 #7).
     let p = chain()?;
     let (_, _, sk) = sender(node, p)?;
     let pk = arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
-    if crate::claims::arc_coins(node, p, &arcade_wallet::keys::p2pkh_script_for(&pk)).len() < 2 {
-        return Err("not enough free coins yet: the text and its record need one each (wait for a block)".into());
+    let script = arcade_wallet::keys::p2pkh_script_for(&pk);
+    let have: u64 = crate::claims::arc_coins(node, p, &script).iter().map(|u| u.value).sum::<u64>()
+        + crate::arcsvc::waiting_outputs(&script).iter().map(|(_, v)| v).sum::<u64>();
+    // What the text costs (blob bytes at the blob rate, rounded up per kB) and about what its record's fee is: refused
+    // before anything is paid, so a retry never pays for the blob twice.
+    let need = blob_cost(bytes.len()) + RECORD_FEE_ROOM;
+    if have < need {
+        return Err(format!(
+            "not enough ARCADE here: posting this ({} bytes of text) costs about {} ARCADE, and this wallet has {}",
+            bytes.len(), arcade_ledger::amount::trimmed8(need), arcade_ledger::amount::trimmed8(have)
+        ));
     }
     let r = crate::coinsend::publish_blob(node, &bytes, "application/json", arcade_arc::blob::Class::Permanent, arcade_arc::blob::Encoding::Plain, true)?;
     r["blob"].as_str().and_then(|h| hex::decode(h).ok()).and_then(|b| b.try_into().ok()).ok_or_else(|| "the body's blob has no id".to_string())

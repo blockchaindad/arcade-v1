@@ -2512,6 +2512,23 @@ pub fn submit(req: &Value) -> Result<Value, String> {
 
 /// `arc.pool`: the transactions waiting here, in order of arrival.
 /// The waiting transactions as they are, in the order they came (at most `max`).
+/// Outputs paying `script` of transactions waiting in the pool that no other waiting transaction spends: a wallet's
+/// change from a transaction it just sent, spendable at once (the pool takes chains of waiting transactions).
+pub fn waiting_outputs(script: &[u8]) -> Vec<(OutPoint, u64)> {
+    let Some(svc) = svc() else { return Vec::new() };
+    let st = svc.st.lock().unwrap();
+    let mut out = Vec::new();
+    for w in st.pool.iter() {
+        for (i, o) in w.tx.outputs.iter().enumerate() {
+            let op = OutPoint { txid: w.tx.txid, vout: i as u32 };
+            if o.script_pubkey == script && st.pool.spender(&op).is_none() {
+                out.push((op, o.value));
+            }
+        }
+    }
+    out
+}
+
 pub fn waiting(max: usize) -> Vec<Vec<u8>> {
     svc().map(|s| s.st.lock().unwrap().pool.iter().take(max).map(|w| w.tx.raw.clone()).collect()).unwrap_or_default()
 }
