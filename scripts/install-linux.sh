@@ -191,7 +191,10 @@ After=network-online.target
 [Service]
 Type=simple
 Environment=ARCADE_HOME=$HOME_DIR
-ExecStart=$BIN/arcaded --home $HOME_DIR --http-port $HTTP_PORT --mesh-port $MESH_PORT --stun-port $STUN_PORT
+# Your own extra options (for example ARCADED_OPTS=--behind-proxy) go in this file: updates rewrite this unit, never it.
+EnvironmentFile=-%h/.config/arcade/arcaded.env
+ExecStart=$BIN/arcaded --home $HOME_DIR --http-port $HTTP_PORT --mesh-port $MESH_PORT --stun-port $STUN_PORT \$ARCADED_OPTS
+LimitNOFILE=8192
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=300

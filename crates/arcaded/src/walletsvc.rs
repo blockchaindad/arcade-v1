@@ -858,10 +858,27 @@ pub fn state_of(node: &Node, piece: &str, family: Option<&str>) -> Value {
 
 /// Token transfers waiting in the mempool to and from an address: (incoming, outgoing), each
 /// {kind: "token", property_id, units, txid, from, to} (simple sends and grants).
+/// The inscription an INSC transfer payload moves (its txid), if it is one.
+fn insc_transfer(payload: &[u8]) -> Option<[u8; 32]> {
+    (payload.len() >= 38 && &payload[..4] == b"INSC" && payload[4] == 1 && payload[5] == 2).then(|| payload[6..38].try_into().ok()).flatten()
+}
+
 pub fn pending_moves(node: &Node, address: &str) -> (Vec<Value>, Vec<Value>) {
     use arcade_ledger::payload::{decode, Msg};
     let (mut inc, mut out) = (Vec::new(), Vec::new());
     for (tx, atx) in crate::claims::pending_arcade(node) {
+        // An INSC transfer (kind 2: "INSC", version 1, kind 2, the inscription's txid): its inscription is on its
+        // way to the reference output.
+        if let Some(insc) = insc_transfer(&atx.payload) {
+            let m = json!({"kind": "inscription", "txid": hex::encode(insc), "move_txid": tx.txid.to_hex(), "from": atx.sender, "to": atx.reference});
+            if atx.reference.as_deref() == Some(address) {
+                inc.push(m.clone());
+            }
+            if atx.sender == address {
+                out.push(m);
+            }
+            continue;
+        }
         let Ok(d) = decode(&atx.payload) else { continue };
         let (pid, units, to) = match d.msg {
             Msg::SimpleSend { prop, amount } => (prop, amount, atx.reference.clone()),
@@ -918,6 +935,20 @@ fn ledger_tx(node: &Node, txid: &str) -> (u16, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An INSC transfer's payload names the inscription it moves; anything else isn't one.
+    #[test]
+    fn an_insc_transfer_is_a_pending_move() {
+        let mut d = b"INSC".to_vec();
+        d.extend_from_slice(&[1, 2]);
+        d.extend_from_slice(&[7u8; 32]);
+        assert_eq!(insc_transfer(&d), Some([7u8; 32]));
+        assert_eq!(insc_transfer(&d[..30]), None);
+        let mut other = d.clone();
+        other[5] = 1;
+        assert_eq!(insc_transfer(&other), None, "kind 1 is an inscription, not a transfer");
+        assert_eq!(insc_transfer(&[0, 0, 0, 0, 0, 0, 0, 1]), None);
+    }
 
     #[test]
     fn a_request_approved_twice_at_once_is_sent_once() {

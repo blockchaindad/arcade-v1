@@ -913,7 +913,7 @@ pub fn build_request(node: &Node, m: &Value, send: bool) -> Result<(String, u64,
                     let (tx, fee) = crate::ddmarket::take(node, chain, &maker, m["order"].as_str().unwrap_or(""), cents, pinned)?;
                     (tx.outputs.iter().map(|o| (o.value, o.script_pubkey.clone())).collect::<Vec<_>>(), tx.txid.to_hex(), fee)
                 } else {
-                    let (_, u, ..) = crate::ddmarket::ask_fill(node, chain, &maker, m["order"].as_str().unwrap_or(""), cents, pinned)?;
+                    let (_, u, ..) = crate::ddmarket::ask_fill(node, chain, &maker, m["order"].as_str().unwrap_or(""), cents, pinned, false)?;
                     (u.outs.iter().map(|o| (o.value, o.script.clone())).collect(), String::new(), u.fee)
                 };
                 let (_, _, _, dd_script, change) = crate::ddsvc::trade_coins(node, p)?;

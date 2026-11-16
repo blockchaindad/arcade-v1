@@ -55,8 +55,19 @@ pub fn list(node: &Node) -> Value {
     json!(out)
 }
 
+/// The ids of the accounts added here (not this arcade's own wallet, "").
+pub(crate) fn ids(node: &Node) -> Vec<String> {
+    list_raw(node).iter().filter_map(|a| a["id"].as_str().map(String::from)).collect()
+}
+
+/// This arcade's own wallet's @handle, read from its home-chain key record and the chain by its address, as for
+/// added accounts: never by switching to it for a moment (a send running meanwhile would use the wrong account).
 fn own_tag(node: &Node) -> Option<String> {
-    with_account(node, "", || crate::msgsvc::sender_key(node).ok().and_then(|(_, t, _)| t))
+    if node.app.active_account().is_empty() {
+        return crate::msgsvc::sender_key(node).ok().and_then(|(_, t, _)| t);
+    }
+    let k = node.app.own_tag_key(node.params.chain_no, 0).ok().flatten()?;
+    k.tag.or_else(|| crate::hometag::of_address(node, &k.address))
 }
 
 /// Run `f` with account `id` active, then put the previous one back.
@@ -98,6 +109,11 @@ pub fn sign_out(node: &Node, id: &str) -> Result<Value, String> {
     node.app.drop_account(id).map_err(|e| e.to_string())?;
     save(node, &l)?;
     let _ = node.app.event("wallet", &format!("signed out account {id}"));
+    // Its swaps and orders sign with its keys only: they wait (nothing is signed) until it is added back.
+    let running = crate::swaps::running_for(node, id) + crate::ddmarket::orders(node, None, false).iter().filter(|o| o["account"] == id).count();
+    if running > 0 {
+        let _ = node.app.event("wallet", &format!("account {id} has {running} swaps or orders still running: they wait until it is added back with its words (a swap's claim or refund needs its key)"));
+    }
     Ok(list(node))
 }
 
