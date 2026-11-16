@@ -187,7 +187,7 @@ cmds! {
     "ledger.item_comment" Wallet "repo, number, body, review?" "Comment on, or review (approve | changes), an issue or pull request.";
     "ledger.item_state" Wallet "repo, number, state, manifest?" "Close, reopen or merge an issue or pull request.";
     "ledger.items" Read "repo, number?" "A repository's issues and pull requests with their comments and reviews.";
-    "arc.earn" Admin "chain, on?" "The Earn ARCADE switch for a chain kept here in full (docs/ARCADECHAIN.md), and where it stands.";
+    "arc.earn" Admin "chain, on?" "The Earn ARCADE switch for a chain kept here in full (docs/EARN.md), and where it stands: sealing, the catalog, replicas waiting to register, this arcade's turn and next payout.";
     "ord.chunks" Public "from?, chain?" "Ord fingerprint chunks (as other arcades compare them).";
     "name" Public "name?, chain?" "A name claim, or counts.";
     "map" Public "map?, chain?" "A map claim, or counts.";
@@ -195,6 +195,7 @@ cmds! {
     "tokens" Public "owner, chain?" "Token balances of an address.";
     // Explorer
     "explorer.summary" Public "chain?" "Chain summary for the explorer's front page.";
+    "explorer.earn" Public "chain?" "This arcade's ARCADE pay, read only (docs/EARN.md): its turn, next payout, accrued pay, pay and draw weight, why pay waits, and its sealed replicas waiting to register; with a chain, that coin's Earn ARCADE progress too.";
     "explorer.blocks" Public "chain?, offset?, limit?" "Recent blocks.";
     "explorer.block" Public "chain?, id" "One block (height or hash).";
     "explorer.tx" Public "chain?, txid" "One transaction.";

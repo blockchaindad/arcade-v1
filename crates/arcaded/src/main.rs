@@ -19,6 +19,7 @@ mod announce;
 mod api;
 mod apikeys;
 mod arcaudit;
+mod arcearn;
 mod arcfraud;
 mod arcborrow;
 mod arcseal;

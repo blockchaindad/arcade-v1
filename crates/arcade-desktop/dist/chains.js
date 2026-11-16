@@ -337,21 +337,24 @@
     let e;
     try { e = await api("arc.earn", { chain: st.key }); } catch (err) { box.hidden = true; return; }
     const full = st.mode === "full";
+    // A coin the ARCADE chain doesn't list can't earn: no switch that reads on (docs/EARN.md).
+    const paid = e.paid !== false;
     const sw = document.createElement("label"); sw.className = "switch";
-    const cb = document.createElement("input"); cb.type = "checkbox"; cb.checked = !!e.on; cb.disabled = !full;
+    const cb = document.createElement("input"); cb.type = "checkbox"; cb.checked = !!e.on && paid; cb.disabled = !full || !paid;
     sw.append(cb, Object.assign(document.createElement("span"), { className: "knob" }));
     cb.onchange = async () => {
       cb.disabled = true;
       try { await api("arc.earn", { chain: st.key, on: cb.checked }); msg(cb.checked ? `Earn ARCADE is on for ${st.name}: sealing starts at block 0.` : `Earn ARCADE is off for ${st.name}.`); }
       catch (err) { cb.checked = !cb.checked; msg(err.message, true); }
-      cb.disabled = !full; earnBox(st);
+      cb.disabled = !full || !paid; earnBox(st);
     };
     const title = document.createElement("div"); title.className = "earn-h";
     title.append(Object.assign(document.createElement("img"), { src: "coins/arctest.png", alt: "" }), Object.assign(document.createElement("b"), { textContent: "Earn ARCADE" }), sw);
     const line = document.createElement("div"); line.className = "earn-line";
     const bar = document.createElement("div"); bar.className = "bar"; const fill = document.createElement("i"); bar.append(fill);
     let pct = 0;
-    if (!full) line.textContent = `Needs ${st.name} kept in full: its whole database is sealed.`;
+    if (!paid) line.textContent = `Not paid on this network: the ARCADE chain doesn't list ${st.name}, so its data earns nothing.`;
+    else if (!full) line.textContent = `Needs ${st.name} kept in full: its whole database is sealed.`;
     else if (!e.on) line.textContent = `Seal ${st.name}'s whole database (one sealed copy, read by unsealing) and earn ARCADE for holding it.`;
     else {
       // The blocks and every index together: one percent, one bar.
@@ -365,7 +368,25 @@
         : `Sealed to block ${fmtN(e.sealed_to)} of ${fmtN(e.of)}${ixText} · ${pct.toFixed(1)}%${sealing} · earning with ${mib(e.weight)} (${share}% of all weight)`;
     }
     fill.style.width = pct + "%";
-    box.replaceChildren(title, line, ...(e.on && full ? [bar] : []));
+    // Where pay stands, and what doesn't earn: one small line each.
+    const notes = [];
+    const unpaid = paid && full ? e.unpaid_indexes || [] : [];
+    for (const u of unpaid) notes.push(`${u.index} index: ${u.why}.`);
+    if (e.on && full && paid) {
+      for (const f of [{ name: "blocks", catalog: e.catalog }, ...(e.indexes || [])]) if (f.catalog?.note) notes.push(`${f.name}: ${f.catalog.note}.`);
+      const reps = e.registration?.replicas || [];
+      const next = reps.filter((r) => r.state === "next batch" || r.state === "challenge window");
+      if (next.length) notes.push(`${next.length} sealed segment(s) wait to register: the next batch can go in block ${fmtN(Math.max(...next.map((r) => r.batch_at)))} (one batch every ${fmtN(e.pay?.period)} blocks).`);
+      const reg = reps.filter((r) => r.state === "registering");
+      if (reg.length) notes.push(`${reg.length} segment(s) registering: proof due by block ${fmtN(reg[0].proof_by)}.`);
+      const unl = reps.filter((r) => r.state === "not listed" || r.state === "offered" || r.state === "other root");
+      if (unl.length) notes.push(`${unl.length} sealed segment(s) can't register yet: not listed on the ARCADE chain.`);
+      const p = e.pay;
+      if (p) notes.push(p.waits === "nothing" ? "No ARCADE accrued yet." : `Accrued ${(p.accrued / 1e8).toLocaleString(undefined, { maximumFractionDigits: 8 })} ARCADE · paid at this arcade's turn, block ${fmtN(p.turn)} of every ${fmtN(p.period)}` +
+        (p.next_payout ? ` · next payout block ${fmtN(p.next_payout)}` : "") + (p.why ? ` · ${p.why}` : ""));
+    }
+    const small = notes.map((t) => Object.assign(document.createElement("div"), { className: "earn-line small", textContent: t }));
+    box.replaceChildren(title, line, ...(e.on && full && paid ? [bar] : []), ...small);
   }
 
   function showProgress(st) {

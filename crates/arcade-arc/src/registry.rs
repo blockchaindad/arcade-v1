@@ -200,6 +200,12 @@ fn last_turn(net: &Net, e: &Earner, height: u64) -> Option<u64> {
     height.checked_sub(back).filter(|&h| h > 0)
 }
 
+/// The first block after `height` that is an earner's turn: where its next payout can be.
+pub fn next_turn(net: &Net, e: &Earner, height: u64) -> u64 {
+    let p = net.audit_period;
+    height + 1 + (turn(net, e) + p - (height + 1) % p) % p
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Commit {
     payout: Payout,
@@ -607,7 +613,7 @@ impl Registry {
 
     /// An owner's draw weight for the next block (§4, §6.1): its replicas that passed an audit DRAW_WEIGHT_WAIT or
     /// more blocks ago and haven't missed one since.
-    fn owner_draw_weight(&self, k: &Key) -> u64 {
+    pub fn owner_draw_weight(&self, k: &Key) -> u64 {
         let next = self.blocks.len() as u64 + 1;
         self.owners.get(k).map_or(0, |o| {
             o.replicas.iter().filter_map(|id| self.replicas.get(id)).filter(|r| r.missed == 0 && r.draw_from.is_some_and(|f| f <= next)).map(|r| self.share(&r.segment)).sum()
@@ -1119,6 +1125,16 @@ impl Registry {
     /// A registered replica's sealed-leaf root and the audits it missed in a row.
     pub fn replica_audit(&self, id: &Hash) -> Option<(Hash, u32)> {
         self.replicas.get(id).map(|r| (r.root, r.missed))
+    }
+
+    /// The height from which a registered replica counts for the writer draw (none before its first passed audit).
+    pub fn draw_from(&self, id: &Hash) -> Option<u64> {
+        self.replicas.get(id).and_then(|r| r.draw_from)
+    }
+
+    /// The height until which a key has no draw weight (its challenge or reveal demand was answered), if it has none now.
+    pub fn silenced_until(&self, key: &Key) -> Option<u64> {
+        self.silenced.get(key).copied().filter(|&until| self.blocks.len() as u64 + 1 < until)
     }
 
     /// The owner's pick of `replica` and where it is in the owner's audits.
@@ -1909,6 +1925,9 @@ mod tests {
         for i in 0..2 {
             let hs: Vec<u64> = paid[&pay(i as u8 + 1)].iter().map(|x| x.0).collect();
             assert!(hs.len() >= 2 && hs.iter().all(|h| h % P == turns[i]), "{hs:?} {}", turns[i]);
+            // next_turn (what arc.earn shows) names each of those blocks from the block before it.
+            let e = Earner::Genesis(pay(i as u8 + 1));
+            assert!(hs.iter().all(|&h| next_turn(&NET, &e, h - 1) == h && next_turn(&NET, &e, h) == h + P));
         }
         // Holder 3 earns 0.05 a period: carried until it reaches the minimum.
         assert!(paid.get(&pay(3)).is_none_or(|v| v.iter().all(|x| x.1 >= params::MIN_PAYOUT)));
