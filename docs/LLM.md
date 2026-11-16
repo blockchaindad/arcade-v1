@@ -78,8 +78,12 @@ seller records in `<home>/llm-sellers.json`, keys in META `llm_key:<id>`, grants
 auto top-up in META `llm_auto`); `lm` frames go through crvia (meshsvc dispatch); offers are flooded through
 `mesh_outbox` every 10 min and on each settings change; the OpenAI door is in http.rs (`openai_door`), this computer
 only (as `/api/v1`), with an `sk-arcade-` key; app pages get `arcade.llm` through the appwindow `llm` door (one yes per
-window). A buyer with no link to a seller dials the seller's public name from its offer; a seller with no public name
-is reached once it links to the buyer's arcade (or through a relay).
+window). A buyer with no link to a seller tries every way there at once and waits up to 25 s: the seller's public
+name from its offer (dialed), a relay that lists the seller (asked for a relayed link whichever id is lower,
+`relaysvc::want`), and a UDP introduction through its links (`udpsvc::want`). Not reaching a seller is the mesh's
+fault, not the seller's: it isn't counted in the seller's record (ARCADE #19). A mesh link that hears nothing for
+120 s ends (pings go both ways every 15 s), so a relayed link whose far end is gone no longer stays "linked" with
+nothing going through.
 
 ## 5. Tests before it goes live
 

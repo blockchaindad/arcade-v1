@@ -44,6 +44,8 @@ const PIECE: usize = 48 * 1024;
 const MAX_REQUEST: usize = 8 << 20;
 /// The longest a whole request may take.
 const REQUEST_TIME: Duration = Duration::from_secs(600);
+/// How long a buyer waits for a link to a seller it isn't linked to (a relay open waits 20 s).
+const REACH_WAIT: Duration = Duration::from_secs(25);
 /// The longest between two answers of one request.
 const GAP_TIME: Duration = Duration::from_secs(180);
 /// How long a request waits for a free slot at the seller.
@@ -1274,17 +1276,28 @@ fn reach(node: &Node, seller: &str) -> Result<(), String> {
     if crate::crvia::linked(seller) {
         return Ok(());
     }
-    let o = offer_of(node, seller).ok_or("that seller has no offer now")?;
-    let name = o["name"].as_str().filter(|n| !n.is_empty()).ok_or("no mesh link to that seller, and it has no public name to dial (it is reached once it links to this arcade or a relay)")?;
-    crate::meshsvc::dial(&node.self_arc(), name.to_string());
-    let end = Instant::now() + Duration::from_secs(15);
+    let o = offer_of(node, seller).ok_or("can't reach that seller: it has no offer now")?;
+    // Every way there at once: its public name, a relay that lists it, a UDP introduction through our links.
+    let name = o["name"].as_str().filter(|n| !n.is_empty()).map(String::from);
+    if let Some(n) = &name {
+        crate::meshsvc::dial(&node.self_arc(), n.clone());
+    }
+    let relayed = crate::relaysvc::want(node, seller);
+    crate::udpsvc::want(seller);
+    let end = Instant::now() + REACH_WAIT;
     while Instant::now() < end {
         if crate::crvia::linked(seller) {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    Err(format!("couldn't link to that seller at {name}"))
+    Err(match (&name, relayed) {
+        (Some(n), _) => format!("can't reach that seller: no link to it at {n} or through a relay yet; try again in a minute"),
+        (None, true) => "can't reach that seller: a relay is linking us; try again in a minute".to_string(),
+        (None, false) => "can't reach that seller yet: it has no public name, no relay we use lists it, and no link of ours introduced it; \
+                          try again in a minute (a seller is easiest to reach with a public name, mesh.name_set)"
+            .to_string(),
+    })
 }
 
 /// Ask `seller` `what` (the grant is added); each answer event but the last to `each`; the last returned.
@@ -1377,7 +1390,8 @@ pub fn chat(node: &Node, seller: &str, body: &Value, each: &mut dyn FnMut(Value)
                 }
             }
             // The buyer's own lack of credit is no failure of the seller's.
-            Err(e) if e.starts_with("not enough credit") => s.requests -= 1,
+            // Nor is not reaching it (no link yet): that is the mesh, not the seller.
+            Err(e) if e.starts_with("not enough credit") || e.starts_with("can't reach") => s.requests -= 1,
             Err(_) => s.failed += 1,
         }
     });
@@ -1432,7 +1446,8 @@ pub fn speak(node: &Node, seller: &str, body: &Value, each: &mut AudioSink) -> R
                     rec.credit.insert(seller.to_string(), l);
                 }
             }
-            Err(e) if e.starts_with("not enough credit") => s.requests -= 1,
+            // Nor is not reaching it (no link yet): that is the mesh, not the seller.
+            Err(e) if e.starts_with("not enough credit") || e.starts_with("can't reach") => s.requests -= 1,
             Err(_) => s.failed += 1,
         }
     });
