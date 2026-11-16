@@ -35,7 +35,7 @@ fn save(node: &Node, l: &[Value]) -> Result<(), String> {
 }
 
 /// The accounts' ids and stored @handles: this arcade's own wallet ("") first. Read as stored, switching to none.
-pub fn ids(node: &Node) -> Vec<(String, Option<String>)> {
+pub fn ids_and_tags(node: &Node) -> Vec<(String, Option<String>)> {
     let mut out = vec![(String::new(), None)];
     out.extend(list_raw(node).iter().map(|a| (a["id"].as_str().unwrap_or_default().to_string(), a["tag"].as_str().map(String::from))));
     out

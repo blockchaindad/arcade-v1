@@ -2090,7 +2090,7 @@ pub fn earning(node: &Node) -> Result<Value, String> {
     let at_address: u64 = script.as_ref().map_or(0, |s| st.chain.coins().values().filter(|c| &c.script == s).map(|c| c.value).sum());
     // Which account here the payout address belongs to (each account's stored ARCADE key, read without switching).
     let account = address.as_ref().and_then(|a| {
-        crate::accountsvc::ids(node).into_iter().find_map(|(id, tag)| {
+        crate::accountsvc::ids_and_tags(node).into_iter().find_map(|(id, tag)| {
             let k = node.app.stored_tag_key_of(&id, svc.params.chain_no, 0).ok().flatten()?;
             (k.address == *a).then(|| json!({"id": id, "own": id.is_empty(), "tag": k.tag.or(tag)}))
         })

@@ -1625,12 +1625,6 @@ impl Registry {
         self.owners.get(owner).map(|o| o.turn)
     }
 
-    /// The height until which a key has no draw weight, after a challenge or reveal demand of its was answered (one
-    /// audit period). It still earns; it doesn't write blocks.
-    pub fn silenced_until(&self, key: &Key) -> Option<u64> {
-        self.silenced.get(key).copied()
-    }
-
     /// An owner's replicas: their bytes, the audits each missed in a row, and the height each counts for the draw from.
     pub fn replicas_of(&self, owner: &Key) -> Vec<(u64, u32, Option<u64>)> {
         self.owners.get(owner).map_or_else(Vec::new, |o| {

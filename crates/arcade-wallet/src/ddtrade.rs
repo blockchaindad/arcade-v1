@@ -253,7 +253,7 @@ pub fn sign_mine(p: &ChainParams, u: &Unsigned, key: &SecretKey) -> Result<Part,
             push(&mut ss, &pk.serialize());
             part.push((i, ss, vec![]));
         } else if x.script == p2wpkh {
-            let sig = SECP256K1.sign_ecdsa(&Message::from_digest(crate::tx::bip143_digest(SEND_VERSION, &u.utxos, &u.outs, i)), key);
+            let sig = SECP256K1.sign_ecdsa(&Message::from_digest(crate::tx::bip143_digest(SEND_VERSION, &u.utxos, &u.outs, i, &h)), key);
             let mut der = sig.serialize_der().to_vec();
             der.push(SIGHASH_ALL as u8);
             part.push((i, vec![], vec![der, pk.serialize().to_vec()]));
