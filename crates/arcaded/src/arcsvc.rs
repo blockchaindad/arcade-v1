@@ -966,6 +966,31 @@ pub fn define(node: &Arc<Node>, settings: &std::path::Path) -> Result<(), String
 /// The chain came from `--arc-local` settings (a closed test network).
 static LOCAL: AtomicBool = AtomicBool::new(false);
 
+/// Done once per arcade: [`undo_auto_btc`] ran.
+const AUTO_BTC_UNDONE: &[u8] = b"btc_light_auto_undone";
+
+/// Take off the light Bitcoin earlier versions added by themselves, once. Light Bitcoin couldn't be chosen in the app
+/// before (its mode said "coming"), so one found here at the first start of this version is the automatic one. Marked
+/// done even when there was none, so a light Bitcoin the operator adds later stays.
+fn undo_auto_btc(node: &Arc<Node>) {
+    if node.app.store.read(|r| r.get(arcade_app::META, AUTO_BTC_UNDONE)).ok().flatten().is_some() {
+        return;
+    }
+    if node.mode_of("btc").as_deref() == Some("light") {
+        match crate::chains::remove(node, "btc") {
+            Ok(_) => {
+                eprintln!("arc: Bitcoin's headers (added by an earlier version by itself) taken off; add them in Chains & Coins if you want them");
+                let _ = node.app.event("chains", "Bitcoin's headers, added by an earlier version by itself, were taken off: add Bitcoin in Light mode in Chains & Coins to follow them again");
+            }
+            Err(e) => {
+                eprintln!("arc: Bitcoin's headers: couldn't take them off ({e}); asked again at the next start");
+                return;
+            }
+        }
+    }
+    let _ = node.app.store.write(|w| w.put(arcade_app::META, AUTO_BTC_UNDONE, b"1"));
+}
+
 /// [`define`] from the settings' text (the built-in testnet's, or a file's).
 pub fn define_text(node: &Arc<Node>, text: &str) -> Result<(), String> {
     let s = Settings::parse(&params::TESTNET, text)?;
@@ -1152,19 +1177,14 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
             })
             .map_err(|e| e.to_string())?;
     }
-    // Every arcade follows Bitcoin's headers (§15 step 15: beacons, fraud proofs about Bitcoin segments): added in
-    // light mode (headers only, about 70 MB) unless Bitcoin is kept here already. Not on local test chains.
+    // Bitcoin's headers are the operator's choice (Chains & Coins: Bitcoin, Light), never added by themselves. v0.1.72
+    // to v0.1.83 added them to every arcade (§15 step 15): such a light Bitcoin is taken off once; the operator can add
+    // it back. Not on local test chains.
     if !LOCAL.load(Ordering::Relaxed) {
         let n = node.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(20));
-            if n.extra.lock().unwrap().contains_key("btc") {
-                return;
-            }
-            match crate::chains::add(&n, "btc", "light", Vec::new()) {
-                Ok(_) => eprintln!("arc: following Bitcoin's headers (light)"),
-                Err(e) => eprintln!("arc: Bitcoin's headers: {e}"),
-            }
+            undo_auto_btc(&n);
         });
     }
     if old_log.exists() {
