@@ -65,12 +65,38 @@ pub fn known(node: &Node, key: &str) -> bool {
 }
 
 /// May this request run? `key` is the bearer token, if any. Records use (and tip spending).
+const ONE_DOGE: u64 = 100_000_000;
+
+/// An amount in DOGE (a string or a number, as `dogefeed.act` takes it) in koinu.
+fn doge_koinu(v: &Value) -> Option<u64> {
+    let x = v.as_str().map(String::from).or_else(|| v.as_f64().map(|f| f.to_string()))?;
+    let (whole, frac) = x.trim().split_once('.').unwrap_or((x.trim(), ""));
+    let frac: String = frac.chars().chain(std::iter::repeat('0')).take(8).collect();
+    whole.parse::<u64>().ok()?.checked_mul(ONE_DOGE)?.checked_add(frac.parse::<u64>().ok()?)
+}
+
 pub fn allow(node: &Node, key: Option<&str>, req: &Value) -> Result<(), (u16, String)> {
     let cmd = req["cmd"].as_str().unwrap_or("");
     let c = commands::find(cmd).ok_or((404, format!("unknown command {cmd}")))?;
     let mut need = c.perm;
+    // What a write spends from the tip allowance, in the smallest unit (None: it spends nothing).
+    let mut spends: Option<u64> = None;
     if cmd == "feed.act" && req["kind"] == "tip" {
         need = Perm::Tip;
+        spends = Some(req["amount"].as_u64().unwrap_or(0));
+    }
+    // D:// writes spend this arcade's mainnet DOGE (a tip or reveal its amount, any other write about 1 DOGE in
+    // all): sent ones need "tip" and count against the key's daily limit, like feed tips. Without send they only
+    // say what they would cost.
+    if (cmd == "dogefeed.act" || cmd == "dogefeed.post") && req["send"] == true {
+        need = Perm::Tip;
+        let tip = matches!(req["op"].as_str(), Some("tip" | "reveal")).then(|| doge_koinu(&req["amount"])).flatten();
+        spends = Some(tip.unwrap_or(ONE_DOGE));
+    }
+    // A file named by path is read from this computer's disk: only its own programs may name one (the socket or
+    // the cookie RPC). Over a key, send the bytes as hex.
+    if cmd.starts_with("arc.blob_publish") && (req["path"].is_string() || req["files"].as_array().is_some_and(|f| f.iter().any(|x| x["path"].is_string()))) {
+        return Err((403, format!("{cmd} with a file path is only available on this computer's own socket or the cookie RPC; send the bytes as hex")));
     }
     if cmd == "feed.settings" && req["set"].is_object() {
         need = Perm::Post;
@@ -96,8 +122,7 @@ pub fn allow(node: &Node, key: Option<&str>, req: &Value) -> Result<(), (u16, St
     if !rec["perms"].as_array().is_some_and(|p| p.iter().any(|x| x == need.name())) {
         return Err((403, format!("this key can't {cmd}: it needs \"{}\"", need.name())));
     }
-    if need == Perm::Tip {
-        let amount = req["amount"].as_u64().unwrap_or(0);
+    if let Some(amount) = spends {
         if rec["spent"]["day"].as_u64() != Some(today()) {
             rec["spent"] = json!({"day": today(), "sats": 0});
         }
@@ -132,5 +157,38 @@ mod tests {
         assert!(known(&t.node, key));
         assert!(!known(&t.node, &format!("{key}x")));
         assert!(!known(&t.node, "ak_nope_nope"));
+    }
+
+    /// D:// writes that send spend mainnet DOGE: a "wallet" key alone can't send them, and a "tip" key's sends
+    /// count against its daily limit (a tip by its amount, any other write as 1 DOGE).
+    #[test]
+    fn dogefeed_sends_need_tip_and_count_against_the_limit() {
+        let (_one, t) = crate::http::tests::node();
+        let w = create(&t.node, "w", &["wallet".into()], 0).unwrap();
+        let w = w["key"].as_str().unwrap();
+        let act = |key: &str, v: Value| allow(&t.node, Some(key), &v);
+        assert!(act(w, json!({"cmd": "dogefeed.act", "op": "like", "target": "x"})).is_ok(), "without send it only says the cost");
+        assert_eq!(act(w, json!({"cmd": "dogefeed.act", "op": "like", "target": "x", "send": true})).unwrap_err().0, 403);
+        assert_eq!(act(w, json!({"cmd": "dogefeed.act", "op": "tip", "target": "x", "amount": "5", "send": true})).unwrap_err().0, 403);
+        let k = create(&t.node, "t", &["tip".into(), "wallet".into()], 3 * ONE_DOGE).unwrap();
+        let k = k["key"].as_str().unwrap();
+        assert!(act(k, json!({"cmd": "dogefeed.act", "op": "tip", "target": "x", "amount": "1.5", "send": true})).is_ok());
+        assert!(act(k, json!({"cmd": "dogefeed.act", "op": "like", "target": "x", "send": true})).is_ok(), "1.5 + 1 of 3");
+        assert_eq!(act(k, json!({"cmd": "dogefeed.post", "text": "hi", "send": true})).unwrap_err().0, 403, "another 1 DOGE is over 3");
+        assert!(act(k, json!({"cmd": "dogefeed.act", "op": "tip", "target": "x", "amount": 0.5, "send": true})).is_ok(), "exactly 3");
+        assert_eq!(doge_koinu(&json!("0.00000001")), Some(1));
+        assert_eq!(doge_koinu(&json!("x")), None);
+    }
+
+    /// A file path is read from this computer's disk: never over an API key, whatever its permissions.
+    #[test]
+    fn a_key_cannot_name_a_file_to_publish() {
+        let (_one, t) = crate::http::tests::node();
+        let k = create(&t.node, "w", &["wallet".into()], 0).unwrap();
+        let k = k["key"].as_str().unwrap();
+        let r = |v: Value| allow(&t.node, Some(k), &v);
+        assert_eq!(r(json!({"cmd": "arc.blob_publish", "path": "/home/x/.local/share/arcade/secret.key", "type": "text/plain"})).unwrap_err().0, 403);
+        assert!(r(json!({"cmd": "arc.blob_publish_many", "files": [{"path": "/etc/passwd"}]})).is_err());
+        assert!(r(json!({"cmd": "arc.blob_publish", "hex": "6869", "type": "text/plain"})).is_ok());
     }
 }
