@@ -262,7 +262,7 @@ pub fn pay(node: &Node) {
         if amount > have_spare {
             return; // nothing to spare: someone else pays
         }
-        let r = match crate::coinsend::send(node, Some(p.key), &addr, amount, None, true) {
+        let r = match crate::coinsend::send(node, Some(p.key), &addr, amount, None, None, false, true) {
             Ok(r) => r,
             Err(e) => {
                 let _ = node.app.event("faucet", &format!("could not top {addr} up with ARCADE: {e}"));

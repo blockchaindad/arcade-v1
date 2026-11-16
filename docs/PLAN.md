@@ -244,6 +244,42 @@ no user password, matching the "no password" decision.
 - Claim flow (steps 6–9): pick tag → validate format → check `ledger.v1.tag` + mempool → request peptest if the
   key's address can't pay the fee → build + sign claim tx → broadcast via P2P and mesh → watch until confirmed.
 
+### Address types (SegWit chains)
+
+The same 12 words give SegWit chains more than one kind of address, as the existing arcade's Wallet card offers
+them (`wallet_js.js` ADDRESS_KINDS). Each kind has its own key, at its BIP purpose with the chain's own coin type
+(the one Legacy has always used, so Legacy addresses never change), for tag slot `i`:
+
+| Kind (menu order) | id | Path | Address |
+|---|---|---|---|
+| Legacy | `legacy` | m/44'/coin'/0'/0/i | P2PKH (on DigiByte the key's dgb1q… P2WPKH is shown, its D… still counted, as before) |
+| P2SH (Nested SegWit) | `p2sh-p2wpkh` | m/49'/coin'/0'/0/i | BIP49: P2WPKH wrapped in P2SH |
+| Native SegWit | `p2wpkh` | m/84'/coin'/0'/0/i | BIP84: bech32 P2WPKH |
+| Taproot | `p2tr` | m/86'/coin'/0'/0/i | BIP86: bech32m key-path-only output, spent with a Schnorr signature by the tweaked key |
+
+| Chain | Coin type | Kinds |
+|---|---|---|
+| Litecoin (`ltc`) | 3 | all four (ltc1q…, ltc1p…, M…) |
+| Litecoin testnet4 (`ltctest`), regtest (`ltcregtest`) | 1 | all four (tltc1…/rltc1…, Q…) |
+| DigiByte (`dgb`) | 3 | all four (dgb1q…, dgb1p…, S…) |
+| DigiByte testnet (`dgbtest`) | 1 | all four (dgbt1…) |
+| Bitcoin (`btc`) | 0 | all four (bc1q…, bc1p…, 3…) |
+| Bellscoin (`bel`) | 3 | Legacy, Native SegWit (its scripthash byte is Dogecoin's "D": no nested kind) |
+| everything else (Dogecoin, Pepecoin, Pepecoin testnet, …) | | Legacy only: no menu |
+
+- The Wallet shows an **Address type** menu on these chains (Legacy is the default); the kind picked is remembered
+  per chain by the arcade (`wallet.addr_kind`), so the desktop app and the browser window agree. Receive shows that
+  kind's address and path.
+- Every kind's coins are watched and counted: `wallet.keys` gives each kind's address and balance under `kinds`, and
+  `balance` is all of them; Activity and NFTs list every kind's.
+- Send says which kind it spends from: that kind's coins only, change back to its address (`wallet.send` `kind`, or
+  the kind of `from`). "Also spend coins on my other address types" (`all_kinds`) mixes them in one transaction,
+  each input signed by its own key (P2PKH legacy sighash, P2WPKH / P2SH-P2WPKH BIP143, Taproot BIP341 key path).
+  Coins carrying an inscription stay out, whatever their kind (crate::ordsafe). Every input of a built transaction
+  is checked by the same checker used for others' transactions (`arcade_wallet::verify`) before it is shown.
+- Sending an inscription (`ord.send`) is still from the Legacy address only.
+- Imported wallets keep their own kind; P2SH-P2WPKH imports can now be spent too.
+
 ## 7. Directory layout
 
 ```

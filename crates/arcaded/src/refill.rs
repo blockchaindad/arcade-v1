@@ -71,6 +71,23 @@ pub fn host_of(addr: &str) -> String {
     }
 }
 
+/// The host behind an address, for counting sources that are independent of each other: its
+/// IP, with one IPv6 /64 (what one home or one server is given) as one host, and an IPv4 in
+/// IPv6 as itself. Free node ids on one host count once.
+pub fn host_group(addr: &str) -> String {
+    let h = host_of(addr);
+    match h.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let s = v6.segments();
+                format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+            }
+        },
+        _ => h,
+    }
+}
+
 fn short(id: &str) -> String {
     if id.starts_with("p2p ") { id.to_string() } else { id.chars().take(8).collect() }
 }
@@ -511,7 +528,13 @@ mod tests {
         assert_eq!(host_of("wss://Some-Tunnel.trycloudflare.com/mesh"), "some-tunnel.trycloudflare.com");
         assert_eq!(host_of("seed.example.org:33874"), "seed.example.org");
         assert_eq!(host_of("2001:db8::1"), "2001:db8::1");
-        let s = |n: &str, ip: &str| Source { node: n.into(), ip: ip.into(), addr: format!("{ip}:1"), kind: Kind::Bk };
+        // One IPv6 /64 is one host; an IPv4 in IPv6 is that IPv4.
+        assert_eq!(host_group("[2001:db8:1:2::5]:8421"), "2001:db8:1:2::/64");
+        assert_eq!(host_group("[2001:db8:1:2:ffff::9]:9"), "2001:db8:1:2::/64");
+        assert_eq!(host_group("[::ffff:1.2.3.4]:8421"), "1.2.3.4");
+        assert_eq!(host_group("1.2.3.4:8421"), "1.2.3.4");
+        assert_eq!(host_group("wss://relay.example.org/mesh"), "relay.example.org");
+        let s =|n: &str, ip: &str| Source { node: n.into(), ip: ip.into(), addr: format!("{ip}:1"), kind: Kind::Bk };
         let order: Vec<String> = spread(vec![s("a", "1"), s("b", "1"), s("c", "2"), s("d", "3"), s("e", "2")]).into_iter().map(|x| x.node).collect();
         assert_eq!(order, vec!["a", "c", "d", "b", "e"]);
     }

@@ -194,3 +194,21 @@ function contentEmbeds(text) {
   });
 }
 
+
+// How far an answer from the mesh is vouched for (arcaded vouch.rs): green = this arcade's own data or 2+ arcades
+// agree, yellow = one arcade's word, grey = nobody, red = they disagree. A dot with the note as its tooltip, and the
+// note as a caution line where one arcade's word is all there is.
+const VOUCH_WORD = { green: "vouched for", yellow: "one arcade's word", grey: "nobody vouches for it", red: "arcades disagree" };
+function vouchDot(level, note) {
+  const d = document.createElement("span");
+  d.className = "vouch " + (VOUCH_WORD[level] ? level : "grey");
+  d.title = note || VOUCH_WORD[level] || "";
+  d.setAttribute("aria-label", "Trust: " + (VOUCH_WORD[level] || "unknown") + (note ? ". " + note : ""));
+  return d;
+}
+function vouchLine(level, note) {
+  const p = document.createElement("div");
+  p.className = "vouch-line " + (VOUCH_WORD[level] ? level : "grey");
+  p.append(vouchDot(level, note), document.createTextNode(note || VOUCH_WORD[level] || ""));
+  return p;
+}

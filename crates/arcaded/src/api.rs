@@ -146,15 +146,37 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
             }
             // A borrowed copy answers while the installed one catches up.
             let installed = !crate::borrow::is_borrowed(cp.key) && crate::chains::kept(node, cp) && node.chain.addresses_on(cp.chain_no).unwrap_or(false);
+            let multi = arcade_wallet::keys::kinds_for(cp).len() > 1;
+            let pref = crate::coinsend::pref_kind(node, cp);
             Ok(json!(keys.iter().map(|k| {
                 let pk = arcade_wallet::secp256k1::PublicKey::from_slice(&hex::decode(&k.pubkey).unwrap()).unwrap();
                 // Every address of the key (DigiByte: dgb1... to receive, its D... still counted).
                 let scripts = crate::coinsend::key_scripts(cp, &pk);
                 // As tx.coins counts them, on any chain with a pool here: confirmed coins less those a waiting
-                // transaction spends, plus waiting outputs to this wallet (ARCADE #15).
-                let sc: Vec<Vec<u8>> = scripts.iter().map(|(_, s)| s.clone()).collect();
-                let f = if installed || crate::borrow::is_borrowed(cp.key) { crate::sitesvc::wallet_figures(node, cp, &sc) } else { None };
+                // transaction spends, plus waiting outputs to this wallet (ARCADE #15). On SegWit chains every
+                // address type's scripts count (each type's own figure under kinds).
+                let own = if multi { crate::coinsend::own_addresses(node, cp, k) } else { Vec::new() };
+                let mut sc: Vec<Vec<u8>> = scripts.iter().map(|(_, s)| s.clone()).collect();
+                for (_, v) in &own {
+                    for (_, s) in v {
+                        if !sc.contains(s) {
+                            sc.push(s.clone());
+                        }
+                    }
+                }
+                let counted = installed || crate::borrow::is_borrowed(cp.key);
+                let f = if counted { crate::sitesvc::wallet_figures(node, cp, &sc) } else { None };
                 let balance = f.as_ref().map(|f| f.balance);
+                // Address types (SegWit chains): each kind's address and coins; `balance` counts them all.
+                let kinds: Vec<Value> = own
+                    .into_iter()
+                    .map(|(kd, v)| {
+                        let ks: Vec<Vec<u8>> = v.iter().map(|(_, s)| s.clone()).collect();
+                        let kb = if counted { crate::sitesvc::wallet_figures(node, cp, &ks).map(|f| f.balance) } else { None };
+                        json!({"id": kd.id(), "label": kd.label(), "path": kd.path(cp.bip44_coin_type, k.index),
+                               "address": v[0].0, "legacy": v.get(1).map(|x| x.0.clone()), "balance": kb})
+                    })
+                    .collect();
                 let waiting: Vec<_> = f.as_ref().map(|f| &f.waiting[..]).unwrap_or_default().iter()
                     .map(|(id, received, spent)| json!({"txid": id.to_hex(), "received": received, "spent": spent})).collect();
                 // Own transactions that left the pool without a block (crate::ownwait): their coins are free again.
@@ -173,7 +195,8 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
                        "tag": if cp.chain_no == p.chain_no { k.tag.clone() } else if crate::arcsvc::runs(cp) {
                            k.tag.clone().or_else(|| arcade_ledger::index::tag_of(&node.chain, cp.chain_no, &scripts[0].0).ok().flatten())
                        } else { None },
-                       "balance": balance, "borrowed": !installed && crate::borrow::is_borrowed(cp.key)})
+                       "balance": balance, "borrowed": !installed && crate::borrow::is_borrowed(cp.key),
+                       "kinds": kinds, "kind": if multi { Some(pref.id()) } else { None }})
             }).collect::<Vec<_>>()))
         }
         "dd.wallet" => crate::ddsvc::wallet(node, s("chain").as_deref()),
@@ -185,9 +208,13 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         "wallet.send" => {
             let amount = req["amount"].as_u64().ok_or("amount required (satoshis)")?;
             crate::coinsend::OWNER_CHANGE_OK.with(|c| c.set(req["owner_changed_ok"] == true));
-            let r = crate::coinsend::send(node, s("chain").as_deref(), &s("to").ok_or("to required")?, amount, s("from").as_deref(), req["send"] == true);
+            let r = crate::coinsend::send(node, s("chain").as_deref(), &s("to").ok_or("to required")?, amount, s("from").as_deref(), s("kind").as_deref(), req["all_kinds"] == true, req["send"] == true);
             crate::coinsend::OWNER_CHANGE_OK.with(|c| c.set(false));
             r
+        }
+        "wallet.addr_kind" => {
+            let cp = crate::chains::find(&s("chain").ok_or("chain required")?).ok_or("unknown chain")?;
+            crate::coinsend::addr_kind(node, cp, s("kind").as_deref())
         }
         "wallet.link" => crate::links::link(node, &s("chain").ok_or("chain required")?, &s("wif").ok_or("wif required")?, &s("tag").ok_or("tag required")?),
         "wallet.unlink" => crate::links::unlink(node, &s("chain").ok_or("chain required")?, &s("address").ok_or("address required")?, &s("tag").ok_or("tag required")?),
@@ -708,6 +735,7 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         "chains.drives" => Ok(crate::chaindrive::drives(node)),
         "chains.move" => crate::chaindrive::start(&node.self_arc(), &s("key").ok_or("key required")?, &s("drive").unwrap_or_else(|| "home".into())),
         "arc.status" => crate::arcsvc::status(node),
+        "arc.earning" => crate::arcsvc::earning(node),
         "arc.block" => crate::arcsvc::block(req),
         "arc.submit" => crate::arcsvc::submit(req),
         "arc.pool" => crate::arcsvc::pool(req),
@@ -864,7 +892,7 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         "borrow.coins" => crate::borrow::coins(node, &s("chain").ok_or("chain required")?),
         "borrow.send" => {
             let amount = req["amount"].as_u64().ok_or("amount required (satoshis)")?;
-            crate::borrow::send(node, &s("chain").ok_or("chain required")?, &s("to").ok_or("to required")?, amount, s("from").as_deref(), req["send"] == true)
+            crate::borrow::send(node, &s("chain").ok_or("chain required")?, &s("to").ok_or("to required")?, amount, s("from").as_deref(), s("kind").as_deref(), req["all_kinds"] == true, req["send"] == true)
         }
         "events" => {
             let n = req["n"].as_u64().unwrap_or(30).min(2000) as usize;

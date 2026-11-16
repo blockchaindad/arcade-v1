@@ -655,8 +655,15 @@
       const outs = document.createElement("ul"); outs.className = "outs";
       for (const o of pv.outputs) { const li = document.createElement("li"); li.textContent = o.data ? "data (the arcade record)" : `${pep(o.value)} → ${o.address}${o.mine ? " (back to you)" : ""}`; outs.append(li); }
       const lines = [`${from} asks to send ${pv.what} to ${pv.to_tag ? "@" + pv.to_tag + " " : ""}${pv.to}.`];
+      // The app's card is one arcade's word (a chain whose ledger isn't here): said above Approve, not hidden.
+      if (who.caution) { const c = document.createElement("span"); c.className = "caution"; c.textContent = "⚠ " + who.caution; lines.push(c); }
       if (pv.note) lines.push(`“${pv.note}”`);
       lines.push(outs, `Network fee: ${pep(pv.fee)}`);
+      // One arcade alone (or none) vouched that its coins carry no inscription: said above Approve.
+      if (pv.caution && pv.caution.note && pv.caution.level !== "green") {
+        const c = document.createElement("div"); c.className = "caution " + pv.caution.level; c.setAttribute("role", "alert"); c.textContent = pv.caution.note;
+        lines.push(c);
+      }
       const yes = await card("Approve this send?", lines, "Approve and send", "Refuse");
       await api(yes ? "wallet.approve" : "wallet.deny", { id: r.id });
     } catch (_) { /* answered elsewhere */ }

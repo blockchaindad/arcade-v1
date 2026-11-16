@@ -215,6 +215,10 @@ main:has(#explorer.on) { max-width: 1240px; }
 .stages li.now .sn { color: var(--accent); }
 .stages li.info .bar { display: none; }
 .note { background: var(--warn-bg); border: 1px solid var(--warn-line); border-radius: 10px; padding: 12px 14px; }
+/* A send's caution (one source only, or none): a line of its own above Send, not a tooltip. */
+.caution { background: var(--panel); border: 1px solid var(--warn-line); border-left-width: 4px; border-radius: 8px; padding: 8px 10px; margin: 8px 0; font-weight: 600; }
+.caution.grey { border-color: var(--muted); font-weight: normal; }
+.caution.red { border-color: var(--bad); color: var(--bad); }
 .addix { display: block; margin: 4px 0 16px; }
 .addix h3 { font-size: 14px; margin: 6px 0 8px; }
 .addrow { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; margin-bottom: 8px; background: var(--panel); }
@@ -386,6 +390,7 @@ button.linkish { border: 0; background: none; padding: 0; font-size: 11px; color
 .wl-addrrow { display: flex; align-items: center; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
 .wl-addrrow code { font: 12.5px var(--mono); background: var(--panel-2); padding: 4px 10px; border-radius: 999px; word-break: break-all; }
 .wl-addrrow button.small { margin-left: 0; }
+.wl-kind { font-size: 12.5px; color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
 .wl-actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
 .wl-actions button { min-width: 8em; }
 .wl-panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 4px 18px 14px; margin-bottom: 14px; }
@@ -483,6 +488,12 @@ button.linkish { border: 0; background: none; padding: 0; font-size: 11px; color
 .earn-h .switch { margin-left: auto; }
 .earn-line { margin-top: 6px; font-size: 13px; opacity: .85; }
 .earn .bar { margin-top: 8px; }
+.earning { margin: 12px 0 4px; padding: 12px 14px; border: 1px solid #6a3fb0; border-radius: 12px; background: rgba(120,70,200,.08); }
+.earning .eword { margin-left: auto; font-size: 13px; color: var(--muted); }
+.edot { display: inline-block; width: 14px; height: 14px; border-radius: 50%; flex: none; border: 1px solid rgb(0 0 0 / .15); }
+.edot.green { background: #2e8b44; } .edot.yellow { background: #d9a400; } .edot.grey { background: #9aa59e; } .edot.red { background: #c62828; }
+.earn-rows { display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; margin: 10px 0 6px; font-size: 13px; overflow-wrap: anywhere; }
+.earn-rows .k { padding-top: 2px; }
 .switch { position: relative; display: inline-block; width: 42px; height: 24px; }
 .switch input { opacity: 0; width: 0; height: 0; }
 .switch .knob { position: absolute; inset: 0; border-radius: 12px; background: #3a3d3b; transition: .15s; cursor: pointer; }
@@ -594,3 +605,10 @@ button.linkish { border: 0; background: none; padding: 0; font-size: 11px; color
 /* Models tab (models.js) */
 .md-reply { white-space: pre-wrap; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px; max-height: 360px; overflow: auto; }
 #md-offers td .small + .small { margin-left: 4px; }
+/* How far a mesh answer is vouched for (common.js vouchDot): the trust colours, with fallbacks. */
+.vouch { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: 0; flex: none; background: var(--trust-grey, #6f7973); }
+.vouch.green { background: var(--trust-green, #2e8b44); }
+.vouch.yellow { background: var(--trust-yellow, #c58a00); }
+.vouch.red { background: var(--trust-red, #b3261e); }
+.vouch-line { font-size: 12.5px; color: var(--muted); margin: 4px 0; }
+.vouch-line.yellow, .vouch-line.red { color: var(--ink); background: var(--warn-bg); border: 1px solid var(--warn-line); border-radius: 8px; padding: 4px 8px; }

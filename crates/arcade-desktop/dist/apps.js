@@ -15,6 +15,8 @@
     try {
       const l = await api("apps.launch", { chain: a.chain, txid: a.txid });
       await invoke("open_app", { id: l.id, title: l.title, frame: l.frame });
+      // The version that opened is one arcade's word (apps on a chain whose ledger isn't kept here): it opens, said.
+      if (l.caution) note(`⚠ ${a.card.name}: ${l.caution}`);
     } catch (e) { note(e.message, true); }
   }
 
@@ -87,6 +89,13 @@
     return b;
   }
 
+  // How far a card from the mesh is vouched for (appsvc trust): a line when it is one arcade's word.
+  function trustLine(a, always) {
+    const t = a.trust;
+    if (!t || (!always && t.level === "green")) return "";
+    return vouchLine(t.level, t.note);
+  }
+
   function pills(a) {
     return h("div", { class: "ap-pills" },
       a.card.multiplayer ? h("span", { class: "pill" }, "multiplayer") : "",
@@ -122,6 +131,7 @@
       h("div", { class: "ap-body" },
         h("div", { class: "ap-title" }, h("b", {}, a.card.name), star),
         h("div", { class: "ap-pills" }, chainBadge(a), pills(a)), h("div", { class: "s" }, byline(a), " · ", ratingLine(a)),
+        trustLine(a),
         a.card.description ? h("div", { class: "ap-desc" }, a.card.description) : "",
         h("div", { class: "row ap-row" }, openB, wear || inst, wear ? inst : "", details),
         h("div", { class: "fd-acts" },
@@ -146,7 +156,8 @@
     const det = h("button", { class: "small" }, "Details"); det.onclick = () => { detail = a; draw(); };
     const wear = a.card.category === "themes" ? h("button", { class: "small primary" }, THEME.current()?.id === a.id ? "Worn" : "Use theme") : "";
     if (wear) wear.onclick = () => useTheme(a);
-    tile.append(h("div", { class: "row ap-row" }, wear, det, un));
+    // An installed app now at a version only one arcade lists: said on its tile, before it is opened.
+    tile.append(trustLine(a) || "", h("div", { class: "row ap-row" }, wear, det, un));
     return tile;
   }
 
@@ -162,12 +173,13 @@
     const openB = h("button", { class: "primary" }, "Open"); openB.onclick = () => open(a);
     $("ap2-body").replaceChildren(h("div", { class: "ap-detail" }, back,
       h("div", { class: "ap-card" }, cover(a), h("div", { class: "ap-body" }, h("h2", {}, a.card.name), h("div", { class: "ap-pills" }, chainBadge(a), pills(a)), h("div", { class: "s" }, byline(a)),
+        trustLine(a, true),
         h("div", { class: "ap-desc" }, a.card.description || ""), h("div", { class: "row ap-row" }, openB))),
       claimed.length ? h("div", { class: "card" }, h("div", { class: "k" }, "This app asks for"), ...sw, h("div", { class: "s" }, "Off: it asks you the first time it wants it.")) : "",
       h("h2", {}, "Ratings"),
       rateBox(a),
       h("h2", {}, "Versions"),
-      h("ul", { class: "ap-list" }, ...a.versions.map((v, i) => h("li", {}, `${v.version ? "v" + v.version : "version"} · block ${v.height}${i === 0 ? " · shown" : ""}`))),
+      h("ul", { class: "ap-list" }, ...a.versions.map((v, i) => h("li", {}, v.trust ? vouchDot(v.trust) : "", `${v.version ? "v" + v.version : "version"} · block ${v.height}${i === 0 ? " · shown" : ""}`))),
       h("h2", {}, `Reviews and comments (${a.comments.length})`),
       h("ul", { class: "ap-list" }, ...(a.comments.length ? a.comments.map((c) => h("li", {}, h("b", {}, (c.from || "").slice(0, 10) + "… "), c.stars ? h("span", { class: "ap-stars" }, STARS(c.stars) + " ") : "", c.stars ? c.text.replace(/^[★☆]{5}\s*/, "") : c.text)) : [h("li", { class: "s" }, "None yet.")])),
       h("div", { class: "s" }, `Card ${a.txid} · page ${a.opens} on ${a.chain_name} · by ${a.creator}`)));

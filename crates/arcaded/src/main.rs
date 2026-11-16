@@ -92,6 +92,7 @@ mod psync;
 mod realtime;
 mod refill;
 mod pagechain;
+mod vouch;
 mod prizesvc;
 mod refereesvc;
 mod tradesvc;

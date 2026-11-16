@@ -12,6 +12,12 @@
 //! every [id, number, [trait value]] in number order, compact JSON), so a list and a root of the
 //! same items can be compared.
 //!
+//! The arcade that sends a list's items also says its fingerprint, so that fingerprint alone proves
+//! only that the items arrived whole. A copy is vouched for by sources that don't depend on it (as
+//! crate::vouch): other independent arcades keeping the list, and an on-chain root of the same items
+//! this arcade reads itself. Green = two or more of those agree, yellow = only the sending arcade
+//! (still copied, marked); arcades saying different fingerprints = red, not copied.
+//!
 //! Tables, in the chain's own database (C = chain number):
 //!   coll.v1.oc    C|slug             -> JSON {slug, name, description, traits, supply, count, fp, cover, added, from}
 //!   coll.v1.oci   C|slug|number u64  -> JSON [id, [trait value]]
@@ -30,6 +36,8 @@ pub const OCOF: &str = "coll.v1.ocof";
 pub const TABLES: &[&str] = &[OC, OCI, OCOF];
 /// What an operator list's id starts with in explorer.collection(s): `list:<slug>`.
 pub const PREFIX: &str = "list:";
+/// Arcades asked for a list's fingerprint when it is copied.
+const FP_HOLDERS: usize = 3;
 const MAX_ITEMS: usize = 100_000;
 const MAX_TRAITS: usize = 64;
 
@@ -316,6 +324,15 @@ pub fn copy(node: &Node, p: &ChainParams, slug: &str) -> Result<Value, String> {
     if first["kind"] != "list" || first["fp"].as_str().unwrap_or("").is_empty() {
         return Err(format!("no arcade answered for the list {slug} on {}", p.name));
     }
+    let fp = first["fp"].as_str().unwrap_or("").to_string();
+    let sender = first["_mesh"]["node"].as_str().unwrap_or("").to_string();
+    let others = crate::vouch::ask_each(node, p, "collections", "explorer.collection", &json!({"chain": p.key, "id": id, "offset": 0, "n": 1}), FP_HOLDERS, 8_000);
+    let said: Vec<(Option<String>, String)> = others.iter().map(|(v, who)| ((v["kind"] == "list").then(|| v["fp"].as_str().map(String::from)).flatten(), who.clone())).collect();
+    let roots: Vec<(u64, Value)> = arcade_ledger::collreg::roots(&node.chain, p.chain_no);
+    let (level, by) = vouch_fp(&fp, &sender, &said, &roots).map_err(|e| {
+        crate::vouch::alert_once(node, &format!("oplist:{}:{slug}", p.key), "collections", &format!("Not copied: the list {slug} on {}: {e}", p.name));
+        e
+    })?;
     let traits: Vec<String> = first["traits"].as_array().into_iter().flatten().filter_map(|t| t.as_str().map(String::from)).collect();
     let total = first["total"].as_u64().unwrap_or(0) as usize;
     if total == 0 || total > MAX_ITEMS {
@@ -339,11 +356,37 @@ pub fn copy(node: &Node, p: &ChainParams, slug: &str) -> Result<Value, String> {
     }
     rows.sort_by_key(|r| r.1);
     rows.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+    // The fingerprint the sources vouched for (the first page's), whatever later pages say.
     let head = json!({"slug": slug, "name": got["name"], "description": got["description"], "supply": got["supply"], "cover": got["cover"],
-                      "fp": got["fp"], "from": "mesh"});
+                      "fp": fp, "from": "mesh", "trust": level.as_str(), "vouched": by});
     let v = keep(node, p, head, &traits, &rows)?;
-    let _ = node.app.event("collections", &format!("kept a copy of the list {} on {} ({} items, fingerprint checked)", got["name"].as_str().unwrap_or(slug), p.name, rows.len()));
+    let _ = node.app.event("collections", &format!("kept a copy of the list {} on {} ({} items, fingerprint checked; vouched for by {})", got["name"].as_str().unwrap_or(slug), p.name, rows.len(),
+        if by.len() > 1 { by.join(", ") } else { "the sending arcade only".to_string() }));
     Ok(v)
+}
+
+/// Who vouches for a copied list's fingerprint `fp`, sent with its items by `sender` (a node id, or its start;
+/// empty when unknown): the other arcades asked (`said`: fingerprint or None, node id) and this arcade's own
+/// reading of the chain's roots (an active root carrying the same sha256). (level, names); Err when arcades
+/// say different fingerprints (red: not copied).
+fn vouch_fp(fp: &str, sender: &str, said: &[(Option<String>, String)], roots: &[(u64, Value)]) -> Result<(crate::vouch::Level, Vec<String>), String> {
+    let mut all: Vec<(Option<String>, String)> = said.to_vec();
+    // The sending arcade counts once, under its full id when it was asked again (then it must say the same again).
+    let sent_by = said.iter().map(|x| &x.1).find(|w| !sender.is_empty() && w.starts_with(sender)).cloned().unwrap_or_else(|| sender.to_string());
+    all.push((Some(fp.to_string()), sent_by));
+    let name = |w: &String| if w.is_empty() { "the sending arcade".to_string() } else { crate::vouch::who(w) };
+    let groups = crate::vouch::tally(&all);
+    if groups.len() > 1 {
+        let each: Vec<String> = groups.iter().map(|(f, w)| format!("{} from {}", f.chars().take(12).collect::<String>(), w.iter().map(name).collect::<Vec<_>>().join(", "))).collect();
+        return Err(format!("arcades on the mesh give this list different fingerprints ({})", each.join("; ")));
+    }
+    let mut by: Vec<String> = groups.first().map(|g| g.1.iter().map(name).collect()).unwrap_or_default();
+    for (n, r) in roots {
+        if r["status"] == "active" && r["sha256"] == fp {
+            by.push(format!("on-chain root #{n}{}", r["publisher"].as_str().filter(|x| !x.is_empty()).map(|x| format!(" by {x}")).unwrap_or_default()));
+        }
+    }
+    Ok((crate::vouch::Level::of_sources(by.len()), by))
 }
 
 // ---------------- explorer rows ----------------
@@ -354,7 +397,23 @@ pub fn row(v: &Value, chain: &str) -> Value {
     json!({"kind": "list", "id": format!("{PREFIX}{}", v["slug"].as_str().unwrap_or("")), "slug": v["slug"], "name": v["name"], "chain": chain,
            "supply": supply, "count": count, "missing": supply.saturating_sub(count), "cover": v["cover"], "description": v["description"],
            "traits": v["traits"], "fp": v["fp"], "from": v["from"], "added": v["added"], "publisher": null, "height": null, "number": null,
-           "status": "active", "reason": ""})
+           "status": "active", "reason": "", "trust": trust_of(v)})
+}
+
+/// How far a kept list is vouched for: {level, by, note}. A list from this operator's own file is green; a copy
+/// carries what was found when it was copied (one made before sources were compared: yellow).
+fn trust_of(v: &Value) -> Value {
+    if v["from"] != "mesh" {
+        return json!({"level": "green", "by": ["this arcade's own list file"], "note": "Added here from a list file."});
+    }
+    let by: Vec<String> = v["vouched"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect();
+    let level = v["trust"].as_str().unwrap_or("yellow");
+    let note = if by.len() > 1 {
+        format!("Copied from the mesh; its fingerprint is vouched for by {}.", by.join(", "))
+    } else {
+        "Copied from the mesh on one arcade's word: no other arcade or on-chain root vouched for its fingerprint. Double-check it before selling on it.".to_string()
+    };
+    json!({"level": level, "by": by, "note": note})
 }
 
 /// explorer.collection for `list:<slug>`: the row and a page of items {number, id, inscription, traits, values}.
@@ -457,6 +516,45 @@ mod tests {
         remove(node, p, "add").unwrap();
         assert!(lines(node, c).is_empty() && items(node, c, "add", 0, 96).is_empty());
         assert!(of(node, c, &ord::parse_iid(A).unwrap()).is_none());
+    }
+
+    #[test]
+    fn a_copied_lists_fingerprint_needs_another_source() {
+        use crate::vouch::Level;
+        let fp = "ab".repeat(32);
+        let other = "cd".repeat(32);
+        let s = |f: Option<&str>, w: &str| (f.map(String::from), w.to_string());
+        // Only the arcade that sent the items (asked again or not): yellow, still copied.
+        assert_eq!(vouch_fp(&fp, "n1aaaaaaaaaaaaaa", &[], &[]).unwrap().0, Level::Yellow);
+        assert_eq!(vouch_fp(&fp, "n1aaaaaaaaaaaaaa", &[s(Some(&fp), "n1aaaaaaaaaaaaaaffff")], &[]).unwrap().0, Level::Yellow);
+        // The sending arcade, asked again, says another fingerprint: red.
+        assert!(vouch_fp(&fp, "n1aaaaaaaaaaaaaa", &[s(Some(&other), "n1aaaaaaaaaaaaaaffff")], &[]).is_err());
+        assert_eq!(vouch_fp(&fp, "", &[], &[]).unwrap().1, vec!["the sending arcade".to_string()]);
+        // An arcade that doesn't keep the list says nothing either way.
+        assert_eq!(vouch_fp(&fp, "n1", &[s(None, "n2")], &[]).unwrap().0, Level::Yellow);
+        // A second arcade with the same fingerprint: green.
+        let (l, by) = vouch_fp(&fp, "n1", &[s(Some(&fp), "n2")], &[]).unwrap();
+        assert_eq!((l, by.len()), (Level::Green, 2));
+        // An on-chain root of the same items, read here: green, naming its publisher. A root no longer in use doesn't count.
+        let roots = vec![(5, json!({"status": "active", "sha256": fp, "publisher": "Dpub"})), (6, json!({"status": "claimed", "sha256": fp}))];
+        let (l, by) = vouch_fp(&fp, "n1", &[], &roots).unwrap();
+        assert_eq!(l, Level::Green);
+        assert_eq!(by[1], "on-chain root #5 by Dpub");
+        // Arcades that disagree: red, not copied.
+        let e = vouch_fp(&fp, "n1", &[s(Some(&other), "n2"), s(Some(&fp), "n3")], &roots).unwrap_err();
+        assert!(e.contains("different fingerprints"), "{e}");
+    }
+
+    #[test]
+    fn a_lists_row_says_how_far_it_is_vouched_for() {
+        let file = row(&json!({"slug": "add", "from": "file"}), "doge");
+        assert_eq!(file["trust"]["level"], "green");
+        // A copy from before sources were compared: one arcade's word.
+        let old = row(&json!({"slug": "add", "from": "mesh"}), "doge");
+        assert_eq!(old["trust"]["level"], "yellow");
+        assert!(old["trust"]["note"].as_str().unwrap().contains("one arcade's word"));
+        let two = row(&json!({"slug": "add", "from": "mesh", "trust": "green", "vouched": ["@amy", "@bob"]}), "doge");
+        assert_eq!((two["trust"]["level"].as_str(), two["trust"]["by"].as_array().map(|a| a.len())), (Some("green"), Some(2)));
     }
 
     #[test]

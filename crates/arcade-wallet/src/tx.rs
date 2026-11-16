@@ -1,4 +1,5 @@
-//! Building and signing legacy P2PKH transactions, and the @tag claim transaction.
+//! Building and signing transactions: legacy P2PKH, the wallet's SegWit and Taproot address
+//! kinds (P2WPKH native or in P2SH, BIP86 key path), and the @tag claim transaction.
 
 use arcade_chain::encode::write_varint;
 use arcade_chain::hash::sha256d;
@@ -140,11 +141,6 @@ pub fn verify_p2pkh_input(p: &ChainParams, tx: &Tx, utxos: &[Utxo], i: usize) ->
 
 // ---------------- SegWit v0 key-hash inputs (BIP143) ----------------
 
-/// The key hash of a P2WPKH script (0014<20>).
-fn p2wpkh_hash(script: &[u8]) -> Option<[u8; 20]> {
-    (script.len() == 22 && script[0] == 0 && script[1] == 20).then(|| script[2..22].try_into().unwrap())
-}
-
 fn outputs_bytes(outs: &[TxOutSpec]) -> Vec<u8> {
     let mut o = Vec::new();
     for out in outs {
@@ -155,13 +151,13 @@ fn outputs_bytes(outs: &[TxOutSpec]) -> Vec<u8> {
     o
 }
 
-/// BIP143 signature hash of input `i` (a P2WPKH coin) with SIGHASH_ALL, as this module builds
-/// txs: every nSequence 0xffffffff, locktime 0.
-pub(crate) fn bip143_digest(version: i32, utxos: &[Utxo], outs: &[TxOutSpec], i: usize) -> [u8; 32] {
-    bip143_digest_with(version, utxos, &vec![u32::MAX; utxos.len()], 0, outs, i)
+/// BIP143 signature hash of input `i` (a P2WPKH coin, native or wrapped in P2SH, of key hash
+/// `h`) with SIGHASH_ALL, as this module builds txs: every nSequence 0xffffffff, locktime 0.
+pub(crate) fn bip143_digest(version: i32, utxos: &[Utxo], outs: &[TxOutSpec], i: usize, h: &[u8; 20]) -> [u8; 32] {
+    bip143_digest_with(version, utxos, &vec![u32::MAX; utxos.len()], 0, outs, i, h)
 }
 
-fn bip143_digest_with(version: i32, utxos: &[Utxo], sequences: &[u32], lock_time: u32, outs: &[TxOutSpec], i: usize) -> [u8; 32] {
+fn bip143_digest_with(version: i32, utxos: &[Utxo], sequences: &[u32], lock_time: u32, outs: &[TxOutSpec], i: usize, h: &[u8; 20]) -> [u8; 32] {
     let mut prevouts = Vec::new();
     let mut seqs = Vec::new();
     for (u, q) in utxos.iter().zip(sequences) {
@@ -169,7 +165,6 @@ fn bip143_digest_with(version: i32, utxos: &[Utxo], sequences: &[u32], lock_time
         prevouts.extend_from_slice(&u.outpoint.vout.to_le_bytes());
         seqs.extend_from_slice(&q.to_le_bytes());
     }
-    let h = p2wpkh_hash(&utxos[i].script).expect("a P2WPKH coin");
     let mut pre = Vec::new();
     pre.extend_from_slice(&version.to_le_bytes());
     pre.extend_from_slice(&sha256d(&prevouts).0);
@@ -178,7 +173,7 @@ fn bip143_digest_with(version: i32, utxos: &[Utxo], sequences: &[u32], lock_time
     pre.extend_from_slice(&utxos[i].outpoint.vout.to_le_bytes());
     // scriptCode: the P2PKH script of the key hash, with its length.
     pre.push(25);
-    pre.extend_from_slice(&arcade_ledger::address::p2pkh_script(&h));
+    pre.extend_from_slice(&arcade_ledger::address::p2pkh_script(h));
     pre.extend_from_slice(&utxos[i].value.to_le_bytes());
     pre.extend_from_slice(&sequences[i].to_le_bytes());
     pre.extend_from_slice(&sha256d(&outputs_bytes(outs)).0);
@@ -186,9 +181,6 @@ fn bip143_digest_with(version: i32, utxos: &[Utxo], sequences: &[u32], lock_time
     pre.extend_from_slice(&SIGHASH_ALL.to_le_bytes());
     sha256d(&pre).0
 }
-
-/// Sign every input with `key`: P2PKH coins with the legacy signature hash, P2WPKH coins with
-/// BIP143 (a witness of signature and key). The tx is written with a witness when any input
 
 /// The Dogecoin family (Dogecoin Core 1.14 and the chains built on it) charges its relay fee per STARTED
 /// kilobyte: a 14,783-byte transaction pays 15 x the rate, and a peer drops one that pays a byte-exact
@@ -207,55 +199,97 @@ pub fn fee_for_size(p: &ChainParams, size: u64, fee_per_kb: u64) -> u64 {
     }
 }
 
-/// has one (chains that allow SegWit only). Inputs that are neither are refused.
+/// How a key spends a coin: the scripts of one key, one per kind of output it signs for.
+struct Signer<'a> {
+    key: &'a SecretKey,
+    pk: PublicKey,
+    h: [u8; 20],
+    p2pkh: Vec<u8>,
+    p2wpkh: Vec<u8>,
+    p2sh_p2wpkh: Vec<u8>,
+    p2tr: Option<Vec<u8>>,
+}
+
+impl<'a> Signer<'a> {
+    fn of(key: &'a SecretKey) -> Signer<'a> {
+        let pk = PublicKey::from_secret_key(SECP256K1, key);
+        let h = arcade_ledger::address::hash160(&pk.serialize());
+        let p2wpkh = arcade_ledger::address::p2wpkh_script(&h);
+        Signer {
+            key,
+            pk,
+            h,
+            p2pkh: arcade_ledger::address::p2pkh_script(&h),
+            p2sh_p2wpkh: arcade_ledger::address::p2sh_script(&arcade_ledger::address::hash160(&p2wpkh)),
+            p2wpkh,
+            // The key's own Taproot output, no script tree (BIP86; DigiDollar coins too).
+            p2tr: crate::taproot::output_key(&pk).map(|q| crate::taproot::p2tr_script(&q)),
+        }
+    }
+
+    fn signs(&self, script: &[u8]) -> bool {
+        script == self.p2pkh || script == self.p2wpkh || script == self.p2sh_p2wpkh || self.p2tr.as_deref() == Some(script)
+    }
+}
+
+/// Sign every input with `key`: P2PKH coins with the legacy signature hash, P2WPKH coins (native
+/// or wrapped in P2SH) with BIP143, the key's own Taproot output with BIP341 (key path). The tx
+/// is written with a witness when any input has one (chains that allow SegWit only). Inputs that
+/// are none of these are refused.
 pub fn sign_keyhash(p: &ChainParams, version: i32, utxos: &[Utxo], outs: &[TxOutSpec], key: &SecretKey, time: u32) -> Result<Tx, String> {
-    let pk: PublicKey = PublicKey::from_secret_key(SECP256K1, key);
-    let h = arcade_ledger::address::hash160(&pk.serialize());
-    let p2pkh = arcade_ledger::address::p2pkh_script(&h);
-    let p2wpkh = arcade_ledger::address::p2wpkh_script(&h);
-    // The key's own Taproot output (no script tree): DigiDollar coins.
-    let p2tr = crate::taproot::output_key(&pk).map(|q| crate::taproot::p2tr_script(&q));
+    sign_keys(p, version, utxos, outs, std::slice::from_ref(key), time)
+}
+
+/// As [`sign_keyhash`], each input signed by whichever of `keys` it belongs to: a wallet's
+/// address kinds (Legacy, nested and native SegWit, Taproot) each have their own key, and one
+/// send may spend coins of several.
+pub fn sign_keys(p: &ChainParams, version: i32, utxos: &[Utxo], outs: &[TxOutSpec], keys: &[SecretKey], time: u32) -> Result<Tx, String> {
+    let signers: Vec<Signer> = keys.iter().map(Signer::of).collect();
     let outs_tr: Vec<(u64, Vec<u8>)> = outs.iter().map(|o| (o.value, o.script.clone())).collect();
     let spent: Vec<crate::taproot::SpentInput> =
         utxos.iter().map(|u| crate::taproot::SpentInput { outpoint: u.outpoint, sequence: u32::MAX, amount: u.value, script: &u.script }).collect();
     let mut script_sigs: Vec<Vec<u8>> = Vec::with_capacity(utxos.len());
     let mut witnesses: Vec<Vec<Vec<u8>>> = Vec::with_capacity(utxos.len());
+    let ecdsa = |digest: [u8; 32], key: &SecretKey| {
+        let mut der = SECP256K1.sign_ecdsa(&Message::from_digest(digest), key).serialize_der().to_vec();
+        der.push(SIGHASH_ALL as u8);
+        der
+    };
     for (i, u) in utxos.iter().enumerate() {
-        if u.script == p2pkh {
+        let s = signers.iter().find(|s| s.signs(&u.script)).ok_or("a coin this key can't sign for")?;
+        if u.script == s.p2pkh {
             let ins: Vec<(OutPoint, Vec<u8>)> =
                 utxos.iter().enumerate().map(|(j, x)| (x.outpoint, if i == j { x.script.clone() } else { vec![] })).collect();
             let mut pre = serialize(p, version, time, &ins, outs);
             pre.extend_from_slice(&SIGHASH_ALL.to_le_bytes());
-            let sig = SECP256K1.sign_ecdsa(&Message::from_digest(sha256d(&pre).0), key);
-            let mut der = sig.serialize_der().to_vec();
-            der.push(SIGHASH_ALL as u8);
             let mut ss = Vec::new();
-            push(&mut ss, &der);
-            push(&mut ss, &pk.serialize());
+            push(&mut ss, &ecdsa(sha256d(&pre).0, s.key));
+            push(&mut ss, &s.pk.serialize());
             script_sigs.push(ss);
             witnesses.push(Vec::new());
-        } else if u.script == p2wpkh {
+        } else if u.script == s.p2wpkh || u.script == s.p2sh_p2wpkh {
             if !p.format.segwit {
                 return Err(format!("{} has no SegWit", p.name));
             }
-            let sig = SECP256K1.sign_ecdsa(&Message::from_digest(bip143_digest(version, utxos, outs, i)), key);
-            let mut der = sig.serialize_der().to_vec();
-            der.push(SIGHASH_ALL as u8);
-            script_sigs.push(Vec::new());
-            witnesses.push(vec![der, pk.serialize().to_vec()]);
-        } else if Some(&u.script) == p2tr.as_ref() {
+            let der = ecdsa(bip143_digest(version, utxos, outs, i, &s.h), s.key);
+            // Wrapped: the scriptSig is the redeem script (the P2WPKH program) alone.
+            let mut ss = Vec::new();
+            if u.script == s.p2sh_p2wpkh {
+                push(&mut ss, &s.p2wpkh);
+            }
+            script_sigs.push(ss);
+            witnesses.push(vec![der, s.pk.serialize().to_vec()]);
+        } else {
             if !p.format.segwit {
                 return Err(format!("{} has no Taproot", p.name));
             }
-            let kp = crate::taproot::tweaked_keypair(key, None).ok_or("the key can't be tweaked")?;
+            let kp = crate::taproot::tweaked_keypair(s.key, None).ok_or("the key can't be tweaked")?;
             let sh = crate::taproot::sighash_default(version, 0, &spent, &outs_tr, i);
             // Auxiliary randomness for the nonce (BIP340): fresh bytes, mixed with the sighash.
             let mut aux = [0u8; 32];
             getrandom::getrandom(&mut aux).map_err(|e| format!("no randomness: {e}"))?;
             script_sigs.push(Vec::new());
             witnesses.push(vec![crate::taproot::sign(&kp, &sh, &aux).to_vec()]);
-        } else {
-            return Err("a coin this key can't sign for".into());
         }
     }
     let ins: Vec<(OutPoint, Vec<u8>)> = utxos.iter().zip(script_sigs).map(|(u, s)| (u.outpoint, s)).collect();
@@ -281,41 +315,11 @@ pub fn sign_keyhash(p: &ChainParams, version: i32, utxos: &[Utxo], outs: &[TxOut
     Tx::parse_with(&raw, &p.format).map_err(|e| format!("built a tx that doesn't parse: {e}"))
 }
 
-/// Check every input of a tx we built with sign_keyhash (P2PKH, P2WPKH, own Taproot key path),
-/// before sending.
+/// Check every input of a tx we built with sign_keyhash / sign_keys before sending, with the
+/// checker used for transactions signed elsewhere (crate::verify: P2PKH, P2WPKH native or in
+/// P2SH, Taproot key path).
 pub fn verify_keyhash(p: &ChainParams, tx: &Tx, utxos: &[Utxo]) -> bool {
-    let outs: Vec<TxOutSpec> = tx.outputs.iter().map(|o| TxOutSpec { value: o.value, script: o.script_pubkey.clone() }).collect();
-    let outs_tr: Vec<(u64, Vec<u8>)> = outs.iter().map(|o| (o.value, o.script.clone())).collect();
-    let spent: Vec<crate::taproot::SpentInput> = utxos
-        .iter()
-        .zip(&tx.inputs)
-        .map(|(u, i)| crate::taproot::SpentInput { outpoint: u.outpoint, sequence: i.sequence, amount: u.value, script: &u.script })
-        .collect();
-    for (i, u) in utxos.iter().enumerate() {
-        if u.script.len() == 34 && u.script[0] == 0x51 && u.script[1] == 0x20 {
-            let w = &tx.inputs[i].witness;
-            let Ok(q) = secp256k1::XOnlyPublicKey::from_slice(&u.script[2..]) else { return false };
-            if w.len() != 1 || !crate::taproot::verify(&q, &crate::taproot::sighash_default(tx.version, tx.lock_time, &spent, &outs_tr, i), &w[0]) {
-                return false;
-            }
-        } else if p2wpkh_hash(&u.script).is_some() {
-            let w = &tx.inputs[i].witness;
-            if w.len() != 2 {
-                return false;
-            }
-            let (Some((&ht, der)), Ok(pk)) = (w[0].split_last(), PublicKey::from_slice(&w[1])) else { return false };
-            if ht as u32 != SIGHASH_ALL || Some(arcade_ledger::address::hash160(&pk.serialize())) != p2wpkh_hash(&u.script) {
-                return false;
-            }
-            let Ok(sig) = secp256k1::ecdsa::Signature::from_der(der) else { return false };
-            if SECP256K1.verify_ecdsa(&Message::from_digest(bip143_digest(tx.version, utxos, &outs, i)), &sig, &pk).is_err() {
-                return false;
-            }
-        } else if !verify_p2pkh_input(p, tx, utxos, i) {
-            return false;
-        }
-    }
-    true
+    crate::verify::all(p, tx, utxos).is_ok()
 }
 
 /// Virtual size of a key-hash tx: inputs of each kind, and the output scripts' lengths.
@@ -325,8 +329,27 @@ pub fn estimate_vsize(n_p2pkh: usize, n_p2wpkh: usize, out_scripts: &[usize]) ->
     10 + n_p2pkh * 148 + n_p2wpkh * 68 + if n_p2wpkh > 0 { 1 } else { 0 } + outs
 }
 
-/// Pay `amount` to `to_script` from `coins` (P2PKH and/or P2WPKH coins of `key`), the largest
-/// first, with change to `change_script` when it is at least `dust`.
+/// The vbytes one input spending `script` adds (compressed keys, ECDSA signatures at their
+/// longest): P2PKH 148, P2SH-P2WPKH 91, P2WPKH 68, Taproot key path 58; anything else counted
+/// as P2PKH.
+pub fn input_vsize(script: &[u8]) -> usize {
+    match script {
+        [0x00, 0x14, ..] if script.len() == 22 => 68,
+        [0xa9, 0x14, .., 0x87] if script.len() == 23 => 91,
+        [0x51, 0x20, ..] if script.len() == 34 => 58,
+        _ => 148,
+    }
+}
+
+/// Virtual size of a tx spending `coins` to outputs with scripts of these lengths.
+pub fn estimate_vsize_coins(coins: &[Utxo], out_scripts: &[usize]) -> usize {
+    let outs: usize = out_scripts.iter().map(|l| 9 + l).sum();
+    let segwit = coins.iter().any(|u| input_vsize(&u.script) != 148);
+    10 + coins.iter().map(|u| input_vsize(&u.script)).sum::<usize>() + usize::from(segwit) + outs
+}
+
+/// Pay `amount` to `to_script` from `coins` (any kind `key` signs for), the largest first, with
+/// change to `change_script` when it is at least `dust`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_send_keyhash(
     p: &ChainParams,
@@ -339,12 +362,26 @@ pub fn build_send_keyhash(
     dust: u64,
     time: u32,
 ) -> Result<Tx, String> {
+    build_send_keys(p, to_script, amount, std::slice::from_ref(key), coins, change_script, fee_per_kb, dust, time)
+}
+
+/// As [`build_send_keyhash`], the coins of several keys (a wallet's address kinds): each input
+/// signed by its own key (sign_keys).
+#[allow(clippy::too_many_arguments)]
+pub fn build_send_keys(
+    p: &ChainParams,
+    to_script: &[u8],
+    amount: u64,
+    keys: &[SecretKey],
+    coins: &[Utxo],
+    change_script: &[u8],
+    fee_per_kb: u64,
+    dust: u64,
+    time: u32,
+) -> Result<Tx, String> {
     let mut sorted: Vec<&Utxo> = coins.iter().collect();
     sorted.sort_by(|a, b| b.value.cmp(&a.value));
-    let fee_for = |c: &[Utxo]| {
-        let w = c.iter().filter(|u| p2wpkh_hash(&u.script).is_some()).count();
-        fee_for_size(p, estimate_vsize(c.len() - w, w, &[to_script.len(), change_script.len()]) as u64, fee_per_kb)
-    };
+    let fee_for = |c: &[Utxo]| fee_for_size(p, estimate_vsize_coins(c, &[to_script.len(), change_script.len()]) as u64, fee_per_kb);
     let mut chosen: Vec<Utxo> = Vec::new();
     let mut have = 0u64;
     for u in sorted {
@@ -367,7 +404,7 @@ pub fn build_send_keyhash(
     if change >= dust {
         outs.push(TxOutSpec { value: change, script: change_script.to_vec() });
     }
-    let tx = sign_keyhash(p, if p.format.segwit { 2 } else { 1 }, &chosen, &outs, key, time)?;
+    let tx = sign_keys(p, if p.format.segwit { 2 } else { 1 }, &chosen, &outs, keys, time)?;
     if !verify_keyhash(p, &tx, &chosen) {
         return Err("the signed tx didn't verify".into());
     }
@@ -662,7 +699,7 @@ mod tests {
         let utxos: Vec<Utxo> = tx.inputs.iter().enumerate().map(|(i, x)| Utxo { outpoint: x.prevout, value: if i == 1 { 600_000_000 } else { 625_000_000 }, script: wpkh.clone() }).collect();
         let outs: Vec<TxOutSpec> = tx.outputs.iter().map(|o| TxOutSpec { value: o.value, script: o.script_pubkey.clone() }).collect();
         let seqs: Vec<u32> = tx.inputs.iter().map(|x| x.sequence).collect();
-        let d = bip143_digest_with(tx.version, &utxos, &seqs, tx.lock_time, &outs, 1);
+        let d = bip143_digest_with(tx.version, &utxos, &seqs, tx.lock_time, &outs, 1, &hex::decode("1d0f172a0ecb48aee1be1f2687d2963ae33f71a1").unwrap().try_into().unwrap());
         assert_eq!(hex::encode(d), "c37af31116d1b27caf68aae9e3ac82f1477929014d5b917657d0eb49478cb670");
     }
 
@@ -696,6 +733,108 @@ mod tests {
         // Below dust, or without SegWit on the chain: refused.
         assert!(build_send_keyhash(p, &to, 1_000, &k, &coins, &wpkh, 1_000_000, 5_460, 0).is_err());
         assert!(build_send_keyhash(&arcade_chain::params::KOTIA_MAIN, &to, 100_000, &k, &coins, &wpkh, 1_000_000, 5_460, 0).is_err());
+    }
+
+    /// BIP143's P2SH-P2WPKH example: the wrapped coin signs the same message a native one does.
+    #[test]
+    fn bip143_p2sh_p2wpkh_vector() {
+        let raw = hex::decode("0100000001db6b1b20aa0fd7b23880be2ecbd4a98130974cf4748fb66092ac4d3ceb1a54770100000000feffffff02b8b4eb0b000000001976a914a457b684d7f0d539a46a45bbc043f35b59d0d96388ac0008af2f000000001976a914fd270b1ee6abcaea97fea7ad0402e8bd8ad6d77c88ac92040000").unwrap();
+        let tx = Tx::parse(&raw).unwrap();
+        let h = arcade_ledger::address::hash160(&hex::decode("03ad1d8e89212f0b92c74d23bb710c00662ad1470198ac48c43f7d6f93a2a26873").unwrap());
+        let redeem = arcade_ledger::address::p2wpkh_script(&h);
+        let sh = arcade_ledger::address::p2sh_script(&arcade_ledger::address::hash160(&redeem));
+        let utxos = vec![Utxo { outpoint: tx.inputs[0].prevout, value: 1_000_000_000, script: sh }];
+        let outs: Vec<TxOutSpec> = tx.outputs.iter().map(|o| TxOutSpec { value: o.value, script: o.script_pubkey.clone() }).collect();
+        let d = bip143_digest_with(tx.version, &utxos, &[tx.inputs[0].sequence], tx.lock_time, &outs, 0, &h);
+        assert_eq!(hex::encode(d), "64f3b0f4dd2bb3aa1ce8566d220cc74dda9df97d8490cc81d89d735c92e59fb6");
+    }
+
+    /// The four address kinds of one phrase (each its own key, m/44' 49' 84' 86'), on every chain
+    /// that offers them: a coin of each kind spent alone verifies with the checker for others'
+    /// transactions (crate::verify), and a tampered signature doesn't.
+    #[test]
+    fn each_address_kind_signs_and_verifies() {
+        use crate::keys::{kind_key, kind_script, kinds_for, AddrKind};
+        let seed = seed_from_phrase("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about").unwrap();
+        for p in [&arcade_chain::params::LITECOIN_MAIN, &arcade_chain::params::LITECOIN_TEST, &arcade_chain::params::DIGIBYTE_MAIN,
+                  &arcade_chain::params::DIGIBYTE_TEST, &arcade_chain::params::BITCOIN_MAIN, &arcade_chain::params::BELLSCOIN_MAIN] {
+            for &kind in kinds_for(p) {
+                let k = kind_key(&seed[..], kind, p.bip44_coin_type, 0).unwrap();
+                let script = kind_script(kind, &k.public());
+                let coins = vec![Utxo { outpoint: OutPoint { txid: Hash256([4; 32]), vout: 3 }, value: 50_000_000, script: script.clone() }];
+                let to = arcade_ledger::address::p2pkh_script(&[8; 20]);
+                let tx = build_send_keyhash(p, &to, 20_000_000, &k.key, &coins, &script, 100_000, 5_460, 0).unwrap();
+                assert_eq!(crate::verify::all(p, &tx, &coins), Ok(()), "{} {kind:?}", p.key);
+                assert_eq!(tx.has_witness(), kind != AddrKind::Legacy, "{} {kind:?}", p.key);
+                // The change goes back to the same kind.
+                assert_eq!(tx.outputs[1].script_pubkey, script);
+                let mut bad = tx.clone();
+                match kind {
+                    AddrKind::Legacy => bad.inputs[0].script_sig[12] ^= 1,
+                    _ => bad.inputs[0].witness[0][12] ^= 1,
+                }
+                assert!(crate::verify::all(p, &bad, &coins).is_err(), "{} {kind:?}", p.key);
+                // Another kind's key can't sign this coin.
+                let other = kind_key(&seed[..], if kind == AddrKind::Legacy { AddrKind::NativeSegwit } else { AddrKind::Legacy }, p.bip44_coin_type, 0).unwrap();
+                assert!(sign_keyhash(p, 2, &coins, &[TxOutSpec { value: 1, script: to.clone() }], &other.key, 0).is_err());
+            }
+        }
+    }
+
+    /// One send spending coins of all four kinds (four keys): every input verifies, the tx is
+    /// written as SegWit (marker, flag, a witness per input, empty for the Legacy one), the txid
+    /// leaves the witness out, and the nested input's scriptSig is its redeem script alone.
+    #[test]
+    fn mixed_kind_inputs_make_a_valid_segwit_tx() {
+        use crate::keys::{kind_key, kind_script, AddrKind};
+        let p = &arcade_chain::params::LITECOIN_MAIN;
+        let seed = seed_from_phrase("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about").unwrap();
+        let keys: Vec<_> = AddrKind::ALL.iter().map(|&k| (k, kind_key(&seed[..], k, p.bip44_coin_type, 0).unwrap())).collect();
+        let coins: Vec<Utxo> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, (kind, k))| Utxo { outpoint: OutPoint { txid: Hash256([i as u8 + 1; 32]), vout: i as u32 }, value: 10_000_000 * (i as u64 + 1), script: kind_script(*kind, &k.public()) })
+            .collect();
+        let sks: Vec<SecretKey> = keys.iter().map(|(_, k)| k.key).collect();
+        let to = kind_script(AddrKind::Taproot, &PublicKey::from_secret_key(SECP256K1, &SecretKey::from_slice(&[3; 32]).unwrap()));
+        let change = coins[2].script.clone();
+        // 99,000,000 of the 100,000,000 the four hold: every coin is needed.
+        let tx = build_send_keys(p, &to, 99_000_000, &sks, &coins, &change, 10_000, 5_460, 0).unwrap();
+        assert_eq!(tx.inputs.len(), 4);
+        assert_eq!(crate::verify::all(p, &tx, &{
+            let mut c = coins.clone();
+            c.sort_by(|a, b| b.value.cmp(&a.value));
+            c
+        }), Ok(()));
+        assert!(tx.has_witness());
+        assert_eq!(&tx.raw[4..6], &[0, 1], "marker and flag");
+        // Parses back the same, and the txid is of the bytes without witnesses.
+        let again = Tx::parse_with(&tx.raw, &p.format).unwrap();
+        assert_eq!(again.raw, tx.raw);
+        assert_eq!(arcade_chain::hash::sha256d(&tx.encode_legacy()), tx.txid);
+        assert_ne!(arcade_chain::hash::sha256d(&tx.raw), tx.txid);
+        for x in &tx.inputs {
+            let c = coins.iter().find(|c| c.outpoint == x.prevout).unwrap();
+            match c.script.len() {
+                25 => assert!(x.witness.is_empty() && !x.script_sig.is_empty()),
+                23 => {
+                    assert_eq!(x.script_sig[0], 22);
+                    assert_eq!(&x.script_sig[1..3], &[0, 20]);
+                    assert_eq!(x.witness.len(), 2);
+                }
+                22 => assert!(x.script_sig.is_empty() && x.witness.len() == 2),
+                34 => assert!(x.script_sig.is_empty() && x.witness.len() == 1 && x.witness[0].len() == 64),
+                _ => unreachable!(),
+            }
+        }
+        // The fee covers the estimate and isn't far over it.
+        let vsize = (tx.encode_legacy().len() * 3 + tx.raw.len()).div_ceil(4);
+        let fee = 100_000_000 - tx.outputs.iter().map(|o| o.value).sum::<u64>();
+        assert!(fee >= vsize as u64 * 10 && fee <= vsize as u64 * 12, "fee {fee} for vsize {vsize}");
+        // Without one of the keys, the send is refused rather than half signed.
+        assert!(build_send_keys(p, &to, 99_000_000, &sks[..3], &coins, &change, 10_000, 5_460, 0).is_err());
+        // On a chain without SegWit only Legacy coins can go.
+        assert!(sign_keys(&arcade_chain::params::DOGECOIN_MAIN, 1, &coins[1..2], &[TxOutSpec { value: 1, script: to.clone() }], &sks, 0).is_err());
     }
 
     #[test]
