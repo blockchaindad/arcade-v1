@@ -615,7 +615,7 @@ fn offer_of(node: &Node, seller: &str) -> Option<Value> {
 /// `llm.offers`: every model on offer, with our own record of each seller.
 pub fn list_offers(node: &Node) -> Value {
     let me = node.id_hex();
-    let rec = records().lock().unwrap();
+    let rec = records_loaded(node);
     let out: Vec<Value> = offers(node).into_iter().map(|o| {
         let id = o["o"].as_str().unwrap_or("").to_string();
         let models: Vec<Value> = o["models"].as_array().cloned().unwrap_or_default().into_iter().map(|m| {
@@ -661,15 +661,21 @@ fn records() -> &'static Mutex<Records> {
     &R
 }
 
-fn with_records<T>(node: &Node, f: impl FnOnce(&mut Records) -> T) -> T {
-    let path = node.home.join("llm-sellers.json");
+/// The records, loaded from disk the first time (after a restart, before any request).
+fn records_loaded(node: &Node) -> std::sync::MutexGuard<'static, Records> {
     let mut r = records().lock().unwrap();
     if !r.loaded {
-        if let Some(saved) = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Records>(&t).ok()) {
+        if let Some(saved) = std::fs::read_to_string(node.home.join("llm-sellers.json")).ok().and_then(|t| serde_json::from_str::<Records>(&t).ok()) {
             *r = saved;
         }
         r.loaded = true;
     }
+    r
+}
+
+fn with_records<T>(node: &Node, f: impl FnOnce(&mut Records) -> T) -> T {
+    let path = node.home.join("llm-sellers.json");
+    let mut r = records_loaded(node);
     let out = f(&mut r);
     if let Ok(t) = serde_json::to_string(&*r) {
         let tmp = node.home.join("llm-sellers.json.new");
@@ -1643,7 +1649,7 @@ pub fn pick(node: &Node, asked: &str) -> Result<(String, String), String> {
     if c.is_empty() {
         return Err(format!("no seller offers {asked} now (GET /openai/v1/models lists what is on offer)"));
     }
-    let credit = records().lock().unwrap().credit.clone();
+    let credit = records_loaded(node).credit.clone();
     let os = offers(node);
     let price = |seller: &str| -> u64 {
         os.iter().find(|o| o["o"] == seller).and_then(|o| o["models"].as_array().and_then(|m| m.iter().find(|m| m["id"] == asked)).map(|m| m["in"].as_u64().unwrap_or(0) + m["out"].as_u64().unwrap_or(0))).unwrap_or(u64::MAX)
