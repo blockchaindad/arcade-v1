@@ -1117,18 +1117,22 @@ mod tests {
     #[test]
     fn knocks_over_the_budget_are_left_out() {
         let hub = Hub::start(UdpSocket::bind("127.0.0.1:0").unwrap()).unwrap();
-        // 300 paths knocking at 4 addresses each want 1200 hellos at once: 800 go.
+        // 300 paths knocking at 4 addresses each want 1200 hellos at once: 800 go. One clock
+        // for all, so no refill comes between them however slow the machine is.
+        let t = Instant::now();
         let to: Vec<SocketAddr> = (1..=4).map(|p| SocketAddr::from(([127, 0, 0, 1], p))).collect();
-        let cells: Vec<Arc<Cell>> = (0..300u32).map(|i| {
-            let mut k = [0u8; 32];
-            k[..4].copy_from_slice(&i.to_be_bytes());
-            hub.add(Path::new(&k, &k, to.clone(), Instant::now()))
-        }).collect();
-        let held = hub.knocks_held.load(std::sync::atomic::Ordering::Relaxed);
-        assert!((300..=1200).contains(&held), "held {held}");
-        for c in &cells {
-            hub.remove(c);
+        let mut sent = 0;
+        for _ in 0..300 {
+            let mut out: Vec<(SocketAddr, Vec<u8>)> = to.iter().map(|a| (*a, vec![0u8; 8])).collect();
+            hub.knock_budget(&mut out, t);
+            sent += out.len();
         }
+        assert_eq!(sent, KNOCK_BURST as usize);
+        assert_eq!(hub.knocks_held.load(std::sync::atomic::Ordering::Relaxed), 1200 - KNOCK_BURST as u64);
+        // A second later the budget has refilled by KNOCKS_PER_SEC.
+        let mut out: Vec<(SocketAddr, Vec<u8>)> = (0..1000).map(|_| (to[0], vec![0u8; 8])).collect();
+        hub.knock_budget(&mut out, t + Duration::from_secs(1));
+        assert_eq!(out.len(), KNOCKS_PER_SEC as usize);
     }
 
     #[test]
