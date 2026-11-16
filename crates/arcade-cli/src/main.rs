@@ -10,6 +10,7 @@ const HELP: &str = "arcade — Arcade V1.0
   arcade status                  sync, tag index, mesh links
   arcade web                     the link that opens the app's window in a browser (here, or through an SSH tunnel)
   arcade peers                   mesh links
+  arcade peers dials             the last mesh dials, and whether this network refuses bare IPs
   arcade wallet create           new wallet; shows the 12-word recovery phrase ONCE
   arcade wallet restore          restore from a recovery phrase (typed at a prompt, not shown)
   arcade wallet phrase           show the recovery phrase
@@ -277,6 +278,7 @@ fn main() {
         ["status"] => json!({"cmd": "status"}),
         ["web"] => json!({"cmd": "ui.link"}),
         ["peers"] => json!({"cmd": "peers"}),
+        ["peers", "dials"] => json!({"cmd": "mesh.dials"}),
         ["wallet", "create"] => json!({"cmd": "wallet.create"}),
         ["wallet", "restore", words @ ..] => match restore_phrase(words, || read_hidden("Your recovery phrase (not shown as you type): ")) {
             Ok(phrase) => json!({"cmd": "wallet.create", "phrase": phrase}),

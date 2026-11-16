@@ -788,6 +788,11 @@ const WROTE_KEEP: usize = 1_000;
 /// The tip this arcade's own proof of time is running for (the writer's draw), if one is.
 static OWN_PROOF: Mutex<Option<Hash256>> = Mutex::new(None);
 
+/// The ARCADE chain's tip here, if it runs.
+pub fn tip_id() -> Option<Hash256> {
+    svc().map(|s| s.st.lock().unwrap().chain.tip().id)
+}
+
 /// Whether this arcade is in the middle of its own proof for the block after the tip: an update waits for the next
 /// block before it restarts (crate::updater), so the work isn't thrown away.
 pub fn proving_for_tip() -> bool {
