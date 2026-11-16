@@ -125,7 +125,12 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
                 // Home chain: coins still waiting in the mempool, spendable already.
                 let pending: u64 = if cp.chain_no == p.chain_no && !crate::borrow::is_borrowed(cp.key) { scripts.iter().flat_map(|(_, sc)| crate::claims::unconfirmed_coins(node, sc)).map(|u| u.value).sum() } else { 0 };
                 json!({"index": k.index, "address": scripts[0].0, "legacy": scripts.get(1).map(|x| x.0.clone()), "pending": pending,
-                       "tag": if cp.chain_no == p.chain_no { k.tag.clone() } else { None },
+                       // @tags live on the home chain and on ARCADE (running here): there, the tag this address holds on
+                       // ARCADE's own ledger, as tag.check reads it (a tag carried over at block 0 was never claimed
+                       // from this wallet, so the key has none recorded).
+                       "tag": if cp.chain_no == p.chain_no { k.tag.clone() } else if crate::arcsvc::runs(cp) {
+                           k.tag.clone().or_else(|| arcade_ledger::index::tag_of(&node.chain, cp.chain_no, &scripts[0].0).ok().flatten())
+                       } else { None },
                        "balance": balance, "borrowed": !installed && crate::borrow::is_borrowed(cp.key)})
             }).collect::<Vec<_>>()))
         }
