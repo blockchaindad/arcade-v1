@@ -9,13 +9,15 @@ use std::time::Duration;
 
 pub const NET: &str = "arcade-main"; // one mesh for every chain (verified live)
 
+/// Public arcades every arcade dials at start. Only addresses anyone can reach: no home-network
+/// ones (those go in --peer), and each checked to link (wss://pepecoinarcade.com/mesh and
+/// 156.67.28.112 are one arcade under two names; both stay, as either may be the one a
+/// network lets through).
 pub const SEEDS: &[&str] = &[
-    "wss://app.dogecoinarcade.com/mesh",
     "wss://pepecoinarcade.com/mesh",
     "156.67.28.112:8421",
     "207.244.232.43:8421",
     "147.124.204.26:8421",
-    "192.168.1.25:8421",
 ];
 
 use arcade_app::now;
@@ -26,9 +28,15 @@ pub const MAX_OUTBOUND: usize = 48; // the original's EVERYONE_MAX
 /// Of those, most dialing addresses we only heard of (other arcades' "addrs", announcements
 /// on chain, peers remembered from them): seeds and --peer always have room.
 const MAX_HEARD_DIALS: usize = 32;
-/// A heard address is let go after this many failed dials in a row (heard again, it is
-/// tried again).
+/// A heard address is dialed this many times in a row quickly; after that it is parked (its
+/// thread and slots freed) and tried again once every HEARD_RETRY, for up to HEARD_KEEP of
+/// failing, before it is let go (heard again, it starts over). Some networks refuse an IP
+/// for a while and then let it through, so one bad minute must not lose an arcade.
 const HEARD_TRIES: u32 = 3;
+const HEARD_RETRY: u64 = 15 * 60;
+const HEARD_KEEP: u64 = 2 * 86400;
+/// Most parked addresses kept (the oldest-failing is let go first).
+const MAX_PARKED: usize = 512;
 /// New addresses taken from one link's "addrs" per HEARD_WINDOW seconds.
 const HEARD_PER_LINK: usize = 64;
 const HEARD_WINDOW: u64 = 600;
@@ -104,6 +112,57 @@ fn heard_dials() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<St
     H.get_or_init(Default::default).lock().unwrap()
 }
 
+/// A heard address waiting to be dialed again.
+#[derive(Clone, Copy)]
+struct Parked {
+    src: &'static str,
+    /// When its dials started failing.
+    since: u64,
+    /// When to dial it next.
+    next: u64,
+}
+
+fn parked() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<String, Parked>> {
+    static P: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeMap<String, Parked>>> = std::sync::OnceLock::new();
+    P.get_or_init(Default::default).lock().unwrap()
+}
+
+/// Park `addr` after a round of failed dials (`started`: when this round began failing):
+/// false if it has failed for HEARD_KEEP and is let go.
+fn park(addr: &str, src: &'static str, started: u64, at: u64) -> bool {
+    let mut p = parked();
+    let since = p.get(addr).map(|x| x.since).unwrap_or(started).min(started);
+    if at.saturating_sub(since) >= HEARD_KEEP {
+        p.remove(addr);
+        return false;
+    }
+    p.insert(addr.to_string(), Parked { src, since, next: at + HEARD_RETRY });
+    while p.len() > MAX_PARKED {
+        let oldest = p.iter().min_by_key(|(_, x)| x.since).map(|(a, _)| a.clone()).unwrap();
+        p.remove(&oldest);
+    }
+    true
+}
+
+/// Parked addresses due again at `at` (they stay parked until a dial links or gives up).
+fn due(at: u64) -> Vec<(String, &'static str)> {
+    parked().iter().filter(|(_, x)| x.next <= at).map(|(a, x)| (a.clone(), x.src)).collect()
+}
+
+/// Dial parked addresses as they come due, every minute, for as long as the arcade runs.
+pub fn retry_parked(node: &Arc<Node>) {
+    let n = node.clone();
+    std::thread::Builder::new()
+        .name("mesh retry".into())
+        .spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(60));
+            for (a, src) in due(now()) {
+                dial_heard(&n, a, src);
+            }
+        })
+        .unwrap();
+}
+
 /// Start a dialing thread for a mesh address unless one exists (seeds, --peer).
 pub fn dial(node: &Arc<Node>, addr: String) {
     {
@@ -118,8 +177,8 @@ pub fn dial(node: &Arc<Node>, addr: String) {
 }
 
 /// Dial an address we heard of (`src`: "gossip" from another arcade, "chain" from an
-/// announcement): public addresses only, at most MAX_HEARD_DIALS at once, and let go after
-/// HEARD_TRIES failures in a row.
+/// announcement): public addresses only, at most MAX_HEARD_DIALS at once; parked after
+/// HEARD_TRIES failures in a row (see HEARD_RETRY).
 pub fn dial_heard(node: &Arc<Node>, addr: String, src: &'static str) {
     if !heard_dial_ok(&addr) {
         return;
@@ -294,24 +353,44 @@ fn retry_after(fails: u32, heard: bool) -> Option<Duration> {
 }
 
 /// Keep dialing `addr`. `heard`: where we heard of it ("gossip", "chain"); such an address
-/// is dialed only while it resolves to public addresses, and let go after HEARD_TRIES
-/// failures in a row (or when the arcade is linked under another address).
+/// is dialed only while it resolves to public addresses, and parked after HEARD_TRIES
+/// failures in a row (or let go when the arcade is linked under another address). Every
+/// failed dial is logged.
 pub fn run(node: Arc<Node>, addr: String, heard: Option<&'static str>) {
     let mut fails = 0u32;
+    let mut failing_since = 0u64;
+    // A parked address gets one dial a round, not another quick series.
+    let retrying = heard.is_some() && parked().contains_key(&addr);
     loop {
         let dialed = match heard {
             Some(_) => Link::dial_checked(&addr, NET, &node.identity, None, &public_ip),
             None => Link::dial(&addr, NET, &node.identity, None),
         };
         match dialed {
-            Err(_) => {
+            Err(e) => {
                 fails += 1;
-                let Some(wait) = retry_after(fails, heard.is_some()) else { break };
-                std::thread::sleep(wait);
+                if fails == 1 {
+                    failing_since = now();
+                }
+                let wait = if retrying { None } else { retry_after(fails, heard.is_some()) };
+                match (wait, heard) {
+                    (Some(w), _) => eprintln!("mesh: dial {addr} failed ({fails} in a row): {e}; next try in {} s", w.as_secs()),
+                    (None, Some(src)) => {
+                        if park(&addr, src, failing_since, now()) {
+                            eprintln!("mesh: dial {addr} failed ({fails} in a row): {e}; trying again every {} min", HEARD_RETRY / 60);
+                        } else {
+                            eprintln!("mesh: dial {addr} failed: {e}; failing for {} h, let go", HEARD_KEEP / 3600);
+                        }
+                        break;
+                    }
+                    (None, None) => unreachable!("seeds are tried for ever"),
+                }
+                std::thread::sleep(wait.unwrap());
                 continue;
             }
             Ok(mut link) => {
                 fails = 0;
+                parked().remove(&addr);
                 let id = link.peer_id.clone();
                 // Already linked to this arcade under another address (one arcade, several
                 // names): it keeps one link per node and closes this one, so don't keep
@@ -319,6 +398,7 @@ pub fn run(node: Arc<Node>, addr: String, heard: Option<&'static str>) {
                 if node.links.lock().unwrap().values().any(|l| l.node_id == id && l.addr != addr) {
                     drop(link);
                     if heard.is_some() {
+                        parked().remove(&addr);
                         break;
                     }
                     std::thread::sleep(Duration::from_secs(1800));
@@ -830,6 +910,15 @@ mod tests {
         assert!(retry_after(HEARD_TRIES - 1, true).is_some());
         assert!(retry_after(HEARD_TRIES, true).is_none());
         assert!(retry_after(100, false).is_some(), "seeds are tried for ever");
+        // Past the quick tries a heard address is parked, dialed again every HEARD_RETRY,
+        // and let go only after HEARD_KEEP of failing.
+        let a = "203.0.113.77:8421";
+        assert!(park(a, "gossip", 1000, 1040));
+        assert!(due(1040 + HEARD_RETRY - 1).iter().all(|(x, _)| x != a), "not due yet");
+        assert!(due(1040 + HEARD_RETRY).iter().any(|(x, s)| x == a && *s == "gossip"), "due again");
+        assert!(park(a, "gossip", 5000, 5000), "a later round keeps the first failure time");
+        assert!(!park(a, "gossip", 9000, 1000 + HEARD_KEEP), "let go after HEARD_KEEP");
+        assert!(due(u64::MAX).iter().all(|(x, _)| x != a));
         let node = &crate::sitesvc::tests::shared().node;
         let t = now();
         let peer = |id: String, source: &str, last_seen: u64| arcade_app::Peer { id, host: "8.8.8.8".into(), port: 8421, source: source.into(), last_seen, failures: 0 };
