@@ -329,9 +329,11 @@ function Try-Download {
         Say "No prebuilt download for this PC yet."
         return $false
     }
+    # A download that fails its checksum installs nothing: it stops here, never falling back to a build from source
+    # (a damaged or changed download is a reason to stop, not to try something else).
     try { Assert-Sha256 $zip "$zip.sha256" } catch {
-        Write-Host $_.Exception.Message
-        return $false
+        Remove-Item -LiteralPath $zip, "$zip.sha256" -Force -ErrorAction SilentlyContinue
+        throw ("Nothing was installed: " + $_.Exception.Message + " Try again later, or download the release by hand and check it.")
     }
     Expand-Archive -LiteralPath $zip -DestinationPath $cache -Force
     $dir = Join-Path $cache $name

@@ -95,12 +95,14 @@ jobs:
       # drops the unused call on Linux; MSVC must resolve it): compile it in too.
       CL: /DSECP256K1_STATIC /DENABLE_MODULE_ELLSWIFT=1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
       - name: "LLVM (libclang for libmdbx and chiavdf: the MSVC headers want Clang 20 or newer)"
-        uses: KyleMayes/install-llvm-action@v2
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2
         with:
           version: "20.1.8"
 
@@ -108,7 +110,7 @@ jobs:
         shell: pwsh
         run: . .\scripts\msvc-env.ps1
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Test
         shell: pwsh
@@ -160,7 +162,7 @@ jobs:
           [IO.File]::WriteAllText("$pwd\$name-setup.exe.sha256", "$hash  $name-setup.exe`n")
           Get-ChildItem "$name-setup.exe*" | Format-Table Name,Length
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: arcade-v1-windows-x86_64
           path: |
