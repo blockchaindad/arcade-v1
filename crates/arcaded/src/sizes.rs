@@ -162,8 +162,10 @@ pub fn for_chain(node: &Node, key: &str) -> Value {
     let key = arcade_chain::params::by_key(key).map(|p| p.net).unwrap_or(key);
     let cutoff = arcade_app::now().saturating_sub(30 * 86400);
     let mut reports: Vec<(String, Value)> = Vec::new();
-    if let Some(v) = node.my_sizes.lock().unwrap().get(key) {
-        reports.push(("this arcade".into(), v.clone()));
+    let mine = node.my_sizes.lock().unwrap().get(key).cloned();
+    let counting = mine.is_none() && crate::chains::find_net(key).is_some_and(|p| crate::chains::kept(node, p));
+    if let Some(v) = mine {
+        reports.push(("this arcade".into(), v));
     }
     for (id, (t, v)) in node.mesh_sizes.lock().unwrap().iter() {
         if *t >= cutoff {
@@ -206,6 +208,8 @@ pub fn for_chain(node: &Node, key: &str) -> Value {
         "sharing": sharing,
         "copies": crate::shares::copies(),
         "indexes": ix,
+        // Kept here but not measured yet (measuring runs in the background, never in a call).
+        "counting": counting,
     })
 }
 

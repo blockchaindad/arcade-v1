@@ -938,6 +938,100 @@ pub fn kept(node: &Node, p: &ChainParams) -> bool {
     p.chain_no == node.params.chain_no || node.extra.lock().unwrap().contains_key(p.key) || crate::arcsvc::runs(p)
 }
 
+/// `chains.list` as the window asks for it: a copy made in the background (one pass at a time),
+/// so a slow chain status never holds up the call. Rows may be a few seconds old; before the
+/// first pass is done, the rows that need no chain reads, marked "loading".
+pub fn list_cached(node: &Node) -> Value {
+    match node.me.get().and_then(|w| w.upgrade()) {
+        Some(n) => node.list_cache.get(move || list(&n), || quick_list(node)),
+        None => list(node),
+    }
+}
+
+/// A chain was added, removed or changed: the next `chains.list` waits a moment for a fresh pass.
+pub fn list_changed(node: &Node) {
+    node.list_cache.changed();
+}
+
+/// How old the copy may be before a call starts a new pass.
+const LIST_FRESH: Duration = Duration::from_secs(2);
+/// How long a call waits for a pass when the copy is missing or out of date.
+const LIST_WAIT: Duration = Duration::from_millis(500);
+
+#[derive(Default)]
+struct ListState {
+    rows: Option<Value>,
+    at: Option<std::time::Instant>,
+    /// Bumped by each change: a pass started before it doesn't count as fresh.
+    gen: u64,
+    busy: bool,
+}
+
+/// The copy behind [`list_cached`].
+#[derive(Default)]
+pub struct ListCache {
+    st: Arc<(Mutex<ListState>, std::sync::Condvar)>,
+}
+
+impl ListCache {
+    /// The copy, starting a pass of `make` when it is old; `quick()` while there is none yet.
+    fn get(&self, make: impl Fn() -> Value + Send + 'static, quick: impl FnOnce() -> Value) -> Value {
+        let (lock, cv) = &*self.st;
+        let mut s = lock.lock().unwrap();
+        if s.at.is_none_or(|t| t.elapsed() > LIST_FRESH) && !s.busy {
+            s.busy = true;
+            let st = self.st.clone();
+            std::thread::spawn(move || loop {
+                let gen = st.0.lock().unwrap().gen;
+                let rows = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&make)).ok();
+                let mut s = st.0.lock().unwrap();
+                // Changed meanwhile: once more, so the next answer shows the change.
+                if rows.is_some() && s.gen != gen {
+                    s.rows = rows;
+                    continue;
+                }
+                if rows.is_some() {
+                    s.rows = rows;
+                    s.at = Some(std::time::Instant::now());
+                }
+                s.busy = false;
+                st.1.notify_all();
+                return;
+            });
+        }
+        if s.at.is_none() {
+            s = cv.wait_timeout_while(s, LIST_WAIT, |s| s.at.is_none() && s.busy).unwrap().0;
+        }
+        match &s.rows {
+            Some(rows) => rows.clone(),
+            None => {
+                drop(s);
+                quick()
+            }
+        }
+    }
+
+    fn changed(&self) {
+        let mut s = self.st.0.lock().unwrap();
+        s.gen += 1;
+        s.at = None;
+    }
+}
+
+/// `chains.list` rows from what is known without reading any chain: installed, borrowed or
+/// neither, with "loading" set until the first full pass is in.
+fn quick_list(node: &Node) -> Value {
+    let installed: std::collections::BTreeSet<String> = node.extra.lock().unwrap().keys().cloned().collect();
+    let row = |p: &ChainParams, arcade: bool| {
+        let home = p.chain_no == node.params.chain_no;
+        json!({"key": p.key, "name": p.name, "installed": home || installed.contains(p.key) || crate::arcsvc::runs(p), "home": home, "arcade": arcade,
+               "borrowed": crate::borrow::is_borrowed(p.key), "state": "loading…", "loading": true, "sizes": null, "offers": node.offers_for(p.key).len(),
+               "ord": !arcade && ord_start(p).is_some(), "tokens": if arcade { None } else { arcade_ledger::tokens::protocol(p).map(|x| x.0.to_uppercase()) },
+               "dunes": p.key == "doge", "dogefeed": p.key == "doge", "runes": p.key == "btc"})
+    };
+    json!(ALL_CHAINS.iter().map(|p| row(p, false)).chain(crate::arcsvc::defined().map(|p| row(p, true))).collect::<Vec<_>>())
+}
+
 pub fn list(node: &Node) -> Value {
     json!(ALL_CHAINS
         .iter()
@@ -1586,5 +1680,57 @@ mod turn_wait_tests {
         assert_eq!(turn_wait(Some("ord.v1"), "ledger.v1", 1_290_960, 1_290_967).as_deref(), Some("its turn (the chain thread is walking ord.v1)"));
         assert_eq!(turn_wait(Some("ord.v1"), "ord.v1", 1_004_428, 1_290_967), None, "the walking index itself");
         assert_eq!(turn_wait(None, "ledger.v1", 10, 20), None, "nothing walking");
+    }
+}
+
+#[cfg(test)]
+mod list_cache_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Instant;
+
+    // ARCADE #16: a slow chains.list pass (30 s on a busy disk) held up the window. The call
+    // answers from the copy at once; the pass runs behind it, one at a time.
+    #[test]
+    fn a_slow_pass_never_holds_up_the_call() {
+        let cache = ListCache::default();
+        let passes = Arc::new(AtomicUsize::new(0));
+        let make = |passes: &Arc<AtomicUsize>| {
+            let passes = passes.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(1500));
+                json!({"pass": passes.fetch_add(1, Ordering::SeqCst) + 1})
+            }
+        };
+        let quick = || json!("loading");
+        // No copy yet: the quick rows, after a short wait at most.
+        let t = Instant::now();
+        assert_eq!(cache.get(make(&passes), quick), json!("loading"));
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+        // Asked again while the pass runs: no second pass, still at once.
+        let t = Instant::now();
+        assert_eq!(cache.get(make(&passes), quick), json!("loading"));
+        assert!(t.elapsed() < Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(passes.load(Ordering::SeqCst), 1, "one pass at a time");
+        // The pass is in: answered from it.
+        let t = Instant::now();
+        assert_eq!(cache.get(make(&passes), quick), json!({"pass": 1}));
+        assert!(t.elapsed() < Duration::from_millis(100));
+        // After a change: the old copy still answers soon while the new pass runs.
+        cache.changed();
+        let t = Instant::now();
+        assert_eq!(cache.get(make(&passes), quick), json!({"pass": 1}));
+        assert!(t.elapsed() < Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(1700));
+        assert_eq!(cache.get(make(&passes), quick), json!({"pass": 2}));
+    }
+
+    #[test]
+    fn a_pass_that_panics_lets_the_next_call_try_again() {
+        let cache = ListCache::default();
+        assert_eq!(cache.get(|| -> Value { panic!("boom") }, || json!("loading")), json!("loading"));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(cache.get(|| json!("rows"), || json!("loading")), json!("rows"));
     }
 }

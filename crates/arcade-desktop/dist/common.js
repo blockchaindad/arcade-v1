@@ -85,11 +85,19 @@ async function webInvoke(name, args = {}) {
   throw `unknown call ${name}`;
 }
 
-// Everything goes through arcaded's local API (one JSON request each).
-async function api(cmd, args = {}) {
-  const r = await invoke("api", { req: { cmd, ...args } });
-  if (!r.ok) throw new Error(r.error || "failed");
-  return r.result;
+// Everything goes through arcaded's local API (one JSON request each). A call still out is
+// never sent again: the same call (same command and arguments) shares its answer, so polls
+// don't pile up behind a slow one (ARCADE #16).
+const API_OUT = new Map();
+function api(cmd, args = {}) {
+  const key = cmd + " " + JSON.stringify(args);
+  if (API_OUT.has(key)) return API_OUT.get(key);
+  const p = invoke("api", { req: { cmd, ...args } }).then((r) => {
+    if (!r.ok) throw new Error(r.error || "failed");
+    return r.result;
+  }).finally(() => API_OUT.delete(key));
+  API_OUT.set(key, p);
+  return p;
 }
 
 // Element builder: h("div", { class: "x", onclick: f }, kids...). Attributes that are
@@ -132,8 +140,7 @@ const homeCoins = (sats) => coinNum(sats) + " " + homeTicker();
 async function loadHome() {
   if (HOME.known) return HOME;
   try {
-    const r = await invoke("api", { req: { cmd: "chains.list" } });
-    const c = r.ok && (r.result || []).find((x) => x.home);
+    const c = ((await api("chains.list")) || []).find((x) => x.home);
     if (c) {
       Object.assign(HOME, { key: c.key, name: c.name, known: true });
       document.querySelectorAll(".home-ticker").forEach((e) => { e.textContent = homeTicker(); });

@@ -62,7 +62,13 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
     if let Some(tag) = req["as"].as_str().filter(|_| cmd.starts_with("ledger.") || cmd.starts_with("a.") || cmd.starts_with("arc.blob_publish")) {
         return crate::arcledger::with_sign_as(Some(tag.to_string()), || dispatch_inner(node, req));
     }
-    dispatch_inner(node, req)
+    let out = dispatch_inner(node, req);
+    // A command that can change a chain or the wallet: chains.list's copy is made again.
+    use crate::commands::Perm;
+    if crate::commands::find(cmd).is_some_and(|c| matches!(c.perm, Perm::Admin | Perm::Wallet | Perm::Local)) && cmd != "ui.link" {
+        crate::chains::list_changed(node);
+    }
+    out
 }
 
 fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
@@ -75,8 +81,10 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         "status" => {
             let tip = node.chain.tip(c).map_err(|e| e.to_string())?;
             use arcade_ledger::index;
-            let tag_count = index::read_tags(&node.chain, c).map(|t| t.len()).unwrap_or(0);
-            let digest = index::names_digest(&node.chain, c).unwrap_or_default();
+            // The tags read once for both the count and the digest.
+            let tags = index::read_tags(&node.chain, c).ok();
+            let tag_count = tags.as_ref().map(|t| t.len()).unwrap_or(0);
+            let digest = tags.as_ref().map(|t| arcade_ledger::tags::digest(t.iter().map(|(n, r)| (n.as_str(), r)))).unwrap_or_default();
             let indexed_to = node.chain.indexed_to(c, "ledger.v1").ok().flatten();
             let tips = node.mesh_tips.lock().unwrap();
             let mesh: Vec<Value> = tips
@@ -641,7 +649,8 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
             let (known, good, resting) = crate::peerbook::summary(node, p.net);
             Ok(json!({"chain": p.key, "known": known, "working": good, "resting": resting, "good": crate::peerbook::good(node, p.net, 50), "next": node.coin_candidates(p).into_iter().take(10).collect::<Vec<_>>()}))
         }
-        "chains.list" => Ok(crate::chains::list(node)),
+        // From a copy made in the background: never held up by a slow chain.
+        "chains.list" => Ok(crate::chains::list_cached(node)),
         "mesh.overview" => Ok(crate::meshview::overview(node)),
         "chains.sizes" => {
             // Measure now (instead of waiting for the six-hourly pass) and show the result.
