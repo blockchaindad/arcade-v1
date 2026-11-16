@@ -290,7 +290,7 @@ pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, metho
         "importaddress" => {
             let a = param(0).as_str().unwrap_or("").to_string();
             arcade_ledger::address::script_for_address(p, &a).ok_or_else(|| err(-5, "Invalid address"))?;
-            if !watch_add(&caller(), p.chain_no, &a, now()) {
+            if !watch_add(&caller(), &caller_host(), p.chain_no, &a, now()) {
                 return Err(err(-4, "too many watched addresses"));
             }
             Ok(Value::Null)
@@ -308,7 +308,7 @@ pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, metho
             let mut out = Vec::new();
             for a in addrs {
                 let Some(sc) = arcade_ledger::address::script_for_address(p, &a) else { return Err(err(-5, format!("Invalid address: {a}"))) };
-                watch_add(&caller(), c, &a, now());
+                watch_add(&caller(), &caller_host(), c, &a, now());
                 for (op, value, height) in db.coins_for_script(p, &sc).map_err(e)? {
                     let conf = money_conf(height) as u64;
                     if conf < minconf || conf > maxconf || spender(&op)?.is_some() {
@@ -407,31 +407,40 @@ pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, metho
 
 use arcade_app::now;
 
-/// Addresses one caller watches at most, and all callers together.
+/// Addresses one caller watches at most, all callers on one host together (node ids cost
+/// nothing to make), and all callers together. Past the last two, the least recently used
+/// caller (of that host, or of any other host) makes way; this arcade's own RPC never does.
 const MAX_WATCH_PER: usize = 1000;
+const MAX_WATCH_HOST: usize = 2 * MAX_WATCH_PER;
 const MAX_WATCH: usize = 50_000;
 /// A caller's addresses are forgotten after this long without a call that uses them.
 const WATCH_IDLE: u64 = 7 * 86400;
 
 thread_local! {
-    /// Who the calls on this thread are for: a mesh peer's node id while its link is served
-    /// (crate::meshsvc::serve), else "" (this arcade's own RPC).
-    static CALLER: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// Who the calls on this thread are for: a mesh peer's node id and the host its link comes
+    /// from (crate::refill::host_group) while its link is served (crate::meshsvc::serve), else
+    /// "" (this arcade's own RPC).
+    static CALLER: std::cell::RefCell<(String, String)> = const { std::cell::RefCell::new((String::new(), String::new())) };
 }
 
 fn caller() -> String {
-    CALLER.with(|c| c.borrow().clone())
+    CALLER.with(|c| c.borrow().0.clone())
 }
 
-/// Run `f` with the calls on this thread answered for mesh peer `peer`.
-pub fn as_caller<T>(peer: &str, f: impl FnOnce() -> T) -> T {
-    let old = CALLER.with(|c| std::mem::replace(&mut *c.borrow_mut(), peer.to_string()));
+fn caller_host() -> String {
+    CALLER.with(|c| c.borrow().1.clone())
+}
+
+/// Run `f` with the calls on this thread answered for mesh peer `peer`, linked from `host`.
+pub fn as_caller<T>(peer: &str, host: &str, f: impl FnOnce() -> T) -> T {
+    let old = CALLER.with(|c| std::mem::replace(&mut *c.borrow_mut(), (peer.to_string(), host.to_string())));
     let r = f();
     CALLER.with(|c| *c.borrow_mut() = old);
     r
 }
 
-type Watched = std::collections::HashMap<String, (u64, std::collections::BTreeSet<(u16, String)>)>;
+/// Per caller: (last used, host, addresses).
+type Watched = std::collections::HashMap<String, (u64, String, std::collections::BTreeSet<(u16, String)>)>;
 
 /// Addresses each caller asked about (importaddress / listunspent): what listunspent without
 /// addresses and listtransactions list, for that caller only.
@@ -440,24 +449,44 @@ fn watch() -> std::sync::MutexGuard<'static, Watched> {
     W.get_or_init(Default::default).lock().unwrap()
 }
 
-/// Watch an address for `who`; false when that would pass a cap (nothing changes then).
-fn watch_add(who: &str, c: u16, a: &str, t: u64) -> bool {
-    add_to(&mut watch(), who, c, a, t)
+/// Watch an address for `who` (linked from `host`); false when that would pass its own cap
+/// (nothing changes then).
+fn watch_add(who: &str, host: &str, c: u16, a: &str, t: u64) -> bool {
+    add_to(&mut watch(), who, host, c, a, t)
 }
 
-fn add_to(w: &mut Watched, who: &str, c: u16, a: &str, t: u64) -> bool {
-    w.retain(|_, (at, _)| at.saturating_add(WATCH_IDLE) > t);
-    let total: usize = w.values().map(|(_, s)| s.len()).sum();
-    let e = w.entry(who.to_string()).or_default();
-    e.0 = t;
+fn add_to(w: &mut Watched, who: &str, host: &str, c: u16, a: &str, t: u64) -> bool {
+    w.retain(|_, (at, _, _)| at.saturating_add(WATCH_IDLE) > t);
     let k = (c, a.to_string());
-    if e.1.contains(&k) {
-        return true;
+    if let Some(e) = w.get_mut(who) {
+        e.0 = t;
+        e.1 = host.to_string();
+        if e.2.contains(&k) {
+            return true;
+        }
+        if e.2.len() >= MAX_WATCH_PER {
+            return false;
+        }
     }
-    if e.1.len() >= MAX_WATCH_PER || total >= MAX_WATCH {
-        return false;
+    // The least recently used caller other than `who` that `pick` allows makes way.
+    fn evict(w: &mut Watched, who: &str, pick: impl Fn(&str, &str) -> bool) -> bool {
+        let lru = w.iter().filter(|(id, e)| id.as_str() != who && !id.is_empty() && pick(id, &e.1)).min_by_key(|(_, e)| e.0).map(|(id, _)| id.clone());
+        lru.is_some_and(|id| w.remove(&id).is_some())
     }
-    e.1.insert(k);
+    let count = |w: &Watched, host: Option<&str>| -> usize { w.values().filter(|e| host.is_none_or(|h| e.1 == h)).map(|e| e.2.len()).sum() };
+    if !who.is_empty() {
+        while count(w, Some(host)) >= MAX_WATCH_HOST {
+            if !evict(w, who, |_, h| h == host) {
+                return false;
+            }
+        }
+    }
+    while count(w, None) >= MAX_WATCH {
+        if !evict(w, who, |_, _| true) {
+            return false;
+        }
+    }
+    w.entry(who.to_string()).or_insert_with(|| (t, host.to_string(), Default::default())).2.insert(k);
     true
 }
 
@@ -466,7 +495,7 @@ fn watched(who: &str, c: u16) -> Vec<String> {
     let mut w = watch();
     let Some(e) = w.get_mut(who) else { return Vec::new() };
     e.0 = now();
-    e.1.iter().filter(|(cc, _)| *cc == c).map(|(_, a)| a.clone()).collect()
+    e.2.iter().filter(|(cc, _)| *cc == c).map(|(_, a)| a.clone()).collect()
 }
 
 /// A transaction as Core's verbose getrawtransaction / decoderawtransaction shows it.
@@ -523,10 +552,10 @@ mod tests {
         let (a, b) = (t.a[0].clone(), t.a[1].clone());
         let peer_a = "aa".repeat(32);
         let peer_b = "bb".repeat(32);
-        as_caller(&peer_a, || call_on(&t.node, t.p, "importaddress", &[json!(a)])).unwrap();
-        as_caller(&peer_b, || call_on(&t.node, t.p, "importaddress", &[json!(b)])).unwrap();
+        as_caller(&peer_a, "198.51.100.7", || call_on(&t.node, t.p, "importaddress", &[json!(a)])).unwrap();
+        as_caller(&peer_b, "192.0.2.44", || call_on(&t.node, t.p, "importaddress", &[json!(b)])).unwrap();
         let listed = |peer: &str| -> Vec<String> {
-            let v = as_caller(peer, || call_on(&t.node, t.p, "listtransactions", &[json!("*"), json!(100)])).unwrap();
+            let v = as_caller(peer, "", || call_on(&t.node, t.p, "listtransactions", &[json!("*"), json!(100)])).unwrap();
             v.as_array().unwrap().iter().map(|r| r["address"].as_str().unwrap().to_string()).collect()
         };
         let la = listed(&peer_a);
@@ -541,21 +570,43 @@ mod tests {
     fn watched_addresses_are_capped_and_expire() {
         let mut w = Watched::default();
         for i in 0..MAX_WATCH_PER {
-            assert!(add_to(&mut w, "a", 77, &format!("x{i}"), 1000));
+            assert!(add_to(&mut w, "a", "h-a", 77, &format!("x{i}"), 1000));
         }
-        assert!(!add_to(&mut w, "a", 77, "one-more", 1000), "per caller");
-        assert!(add_to(&mut w, "a", 77, "x0", 1000), "a known one is fine");
-        // In all: many callers stop at MAX_WATCH.
-        let mut n = MAX_WATCH_PER;
-        for i in 0.. {
-            if !add_to(&mut w, &format!("c{}", i / 900), 77, &format!("y{i}"), 1000) {
-                break;
-            }
-            n += 1;
-        }
-        assert_eq!(n, MAX_WATCH);
+        assert!(!add_to(&mut w, "a", "h-a", 77, "one-more", 1000), "per caller");
+        assert!(add_to(&mut w, "a", "h-a", 77, "x0", 1000), "a known one is fine");
         // Unused for WATCH_IDLE: forgotten at the next add.
-        assert!(add_to(&mut w, "b", 77, "z", 1000 + WATCH_IDLE));
+        assert!(add_to(&mut w, "b", "h-b", 77, "z", 1000 + WATCH_IDLE));
         assert_eq!(w.len(), 1);
+    }
+
+    #[test]
+    fn one_host_cant_fill_the_watch_list() {
+        let mut w = Watched::default();
+        let total = |w: &Watched| w.values().map(|e| e.2.len()).sum::<usize>();
+        // This arcade's own RPC and an honest borrower, first.
+        assert!(add_to(&mut w, "", "", 77, "own", 1));
+        assert!(add_to(&mut w, "honest", "192.0.2.44", 77, "mine", 2));
+        // Many node ids from one host: together MAX_WATCH_HOST, their oldest making way.
+        for i in 0..200u64 {
+            for j in 0..MAX_WATCH_PER {
+                add_to(&mut w, &format!("s{i}"), "198.51.100.7", 77, &format!("{i}-{j}"), 10 + i);
+            }
+        }
+        assert_eq!(w.values().filter(|e| e.1 == "198.51.100.7").map(|e| e.2.len()).sum::<usize>(), MAX_WATCH_HOST);
+        assert!(w.contains_key("s199") && !w.contains_key("s0"));
+        assert!(w.contains_key("honest") && w.contains_key(""));
+        // Many hosts: MAX_WATCH in all, the least recently used caller makes way, never our own.
+        let mut t = 1000;
+        for h in 0..60u64 {
+            for j in 0..MAX_WATCH_PER {
+                t += 1;
+                assert!(add_to(&mut w, &format!("p{h}"), &format!("10.0.{h}.1"), 77, &format!("{j}"), t));
+            }
+        }
+        assert!(total(&w) <= MAX_WATCH);
+        assert!(w.contains_key("") && !w.contains_key("honest"), "the honest borrower was least recently used");
+        // Used again (its next call re-adds): it is back.
+        assert!(add_to(&mut w, "honest", "192.0.2.44", 77, "mine", t + 1));
+        assert!(w.contains_key("p59"));
     }
 }
