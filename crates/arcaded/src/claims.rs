@@ -294,7 +294,7 @@ fn advance_one(node: &Node, mut c: Claim) -> Result<Claim, String> {
             match build_claim(p, &payload, &sk, &have, fee, dust, arcade_app::now() as u32) {
                 Ok(tx) if !home => {
                     // The ARCADE chain: into its pool, from where it goes to the other arcades.
-                    match crate::arcsvc::send_raw(&tx.raw) {
+                    match crate::ownwait::send_arc(node, &tx) {
                         Ok(_) => {
                             c.txid = Some(tx.txid.to_hex());
                             set(&mut c, ClaimStatus::Sent, "claim sent; waiting for a block");

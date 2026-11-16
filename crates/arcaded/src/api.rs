@@ -100,6 +100,8 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
             let tag_count = tags.as_ref().map(|t| t.len()).unwrap_or(0);
             let digest = tags.as_ref().map(|t| arcade_ledger::tags::digest(t.iter().map(|(n, r)| (n.as_str(), r)))).unwrap_or_default();
             let indexed_to = node.chain.indexed_to(c, "ledger.v1").ok().flatten();
+            // The best height anyone tells us of (headers, arcades on the mesh, lenders); read before mesh_tips is held.
+            let best = tip.as_ref().map(|t| t.height).unwrap_or(0) + crate::borrow::home_lag(node).0;
             let tips = node.mesh_tips.lock().unwrap();
             let mesh: Vec<Value> = tips
                 .iter()
@@ -109,6 +111,7 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
                 "chain": p.name,
                 "sync": *node.sync_state.lock().unwrap(),
                 "tip": tip.map(|t| json!({"height": t.height, "hash": t.hash.to_hex()})),
+                "best_known": best,
                 "tags": {"indexed_to": indexed_to, "count": tag_count, "names_digest": digest},
                 "profiles": index::profile_count(&node.chain, c).unwrap_or(0),
                 "mesh": {"links": node.links.lock().unwrap().len(), "tips": mesh},
@@ -118,6 +121,9 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         }
         "mesh.udp" => Ok(crate::udpsvc::status(node)),
         "mesh.relay" => Ok(crate::relaysvc::status(node)),
+        "mesh.dials" => Ok(crate::meshsvc::dials_status()),
+        "mesh.name" => Ok(json!({"name": crate::meshsvc::public_name(node)})),
+        "mesh.name_set" => crate::meshsvc::set_public_name(node, req["name"].as_str().ok_or("name required (\"\" clears it)")?),
         "mesh.relay_set" => crate::relaysvc::set(node, &req),
         "mesh.udp_set" => {
             if let Some(p) = req["drop"].as_str().filter(|p| !p.is_empty()) {
@@ -151,9 +157,13 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
                 let balance = f.as_ref().map(|f| f.balance);
                 let waiting: Vec<_> = f.as_ref().map(|f| &f.waiting[..]).unwrap_or_default().iter()
                     .map(|(id, received, spent)| json!({"txid": id.to_hex(), "received": received, "spent": spent})).collect();
+                // Own transactions that left the pool without a block (crate::ownwait): their coins are free again.
+                let dropped: Vec<_> = crate::ownwait::dropped(node, cp, |s| sc.iter().any(|x| x.as_slice() == s)).into_iter()
+                    .map(|(id, received, spent)| json!({"txid": id.to_hex(), "received": received, "spent": spent})).collect();
                 json!({"index": k.index, "address": scripts[0].0, "legacy": scripts.get(1).map(|x| x.0.clone()),
-                       // confirmed: the blocks' figure; free: confirmed coins no waiting transaction spends (spendable
-                       // now); pending: waiting outputs arriving (pending_coins of them), spendable already.
+                       // confirmed: the blocks' figure; free: confirmed coins spendable now (no waiting transaction spends
+                       // them, mature, no inscription); pending: waiting outputs arriving (pending_coins of them).
+                       "dropped": dropped,
                        "confirmed": f.as_ref().map(|f| f.confirmed), "free": f.as_ref().map(|f| f.free),
                        "pending": f.as_ref().map_or(0, |f| f.arriving), "pending_coins": f.as_ref().map_or(0, |f| f.arriving_coins),
                        "waiting": waiting,
@@ -652,6 +662,8 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
                 }
             }
         }
+        // This arcade's ARCADE pay and Earn progress, read only (arc.earn without the switch).
+        "explorer.earn" => crate::arcsvc::earn_read(node, &req),
         c if c.starts_with("explorer.") => crate::explorer::handle_with(node, c, &req, req["img"] == "links"),
         c @ ("ledger.book" | "ledger.trades" | "ledger.pairs") => crate::marketsvc::handle(node, c, &req),
         // Token sends from this wallet (tokensend.rs): arcade tokens in one transaction; PRC-20 / DRC-20 as a job.
@@ -786,6 +798,7 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
             // The drive chosen for it, else this arcade's own (crate::chaindrive): its file starts there.
             crate::chaindrive::add(node, &key, &s("drive").unwrap_or_default(), || crate::chains::add(&node.self_arc(), &key, &s("mode").unwrap_or_else(|| "full".into()), with))
         }
+        "chains.queue" => Ok(crate::chains::queue_list(node)),
         "chains.unqueue" => crate::chains::unqueue(node, &s("key").ok_or("key required")?),
         "chains.pause" => crate::chains::set_paused(node, &s("key").ok_or("key required")?, true),
         "chains.resume" => crate::chains::set_paused(node, &s("key").ok_or("key required")?, false),

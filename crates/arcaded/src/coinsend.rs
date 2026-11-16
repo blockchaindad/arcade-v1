@@ -182,7 +182,7 @@ pub fn send(node: &Node, key: Option<&str>, to: &str, amount: u64, from: Option<
                          "size": tx.raw.len(), "vsize": vsize, "sent": false, "warning": warn});
     if broadcast {
         let r = if arc {
-            let (id, fee) = crate::arcsvc::send_raw(&tx.raw)?;
+            let (id, fee) = crate::ownwait::send_arc(node, &tx)?;
             json!({"txid": id.to_hex(), "fee": fee, "size": tx.raw.len()})
         } else {
             crate::sitesvc::broadcast(node, &json!({"hex": hex::encode(&tx.raw), "chain": p.key}))?
@@ -303,7 +303,7 @@ pub fn publish_blobs(node: &Node, items: &[(Vec<u8>, String, arcade_arc::blob::C
         for (bytes, ..) in items {
             crate::arcblob::hold(&net, bytes.clone()).ok_or("no room for more waiting blobs")?;
         }
-        let (txid, fee) = crate::arcsvc::send_raw(&tx.raw)?;
+        let (txid, fee) = crate::ownwait::send_arc(node, &tx)?;
         out["sent"] = json!(true);
         out["txid"] = json!(txid.to_hex());
         out["fee"] = json!(fee);

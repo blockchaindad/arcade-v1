@@ -10,6 +10,7 @@ const HELP: &str = "arcade — Arcade V1.0
   arcade status                  sync, tag index, mesh links
   arcade web                     the link that opens the app's window in a browser (here, or through an SSH tunnel)
   arcade peers                   mesh links
+  arcade peers dials             the last mesh dials, and whether this network refuses bare IPs
   arcade stop                    stop arcaded cleanly (writes its caches first)
   arcade wallet create           new wallet; shows the 12-word recovery phrase ONCE
   arcade wallet restore          restore from a recovery phrase (typed at a prompt, not shown)
@@ -23,9 +24,19 @@ const HELP: &str = "arcade — Arcade V1.0
   arcade faucet arc status       ARCADE top-up asks and what this arcade paid today
   arcade events                  recent activity
   arcade mempool                 unconfirmed transactions and pending tag claims
-  arcade chain list                         chains you can install, and their state
-  arcade chain add <key> [--mode full|chain] [--with ledger,profiles,ord,names,maps,tokens] [--drive <mount>]
-                     every index is opt-in; names, maps and tokens ride on ord
+  arcade chain list                         chains you can install, and their state (queued ones with their place)
+  arcade chain add <key> [--mode full|chain|light] [--with <index>,<index>,...] [--drive <mount>]
+                     every index is opt-in (--mode chain: addresses only; light: none):
+                       addresses, ledger, profiles     any chain
+                       ord                             chains with inscriptions: pep, peptest, doge, dgb, ltc, ltctest, shic, flop, wjk
+                       names, maps, collections        need ord (added with them)
+                       tokens                          need ord; pep, peptest, doge, dgb, ltc, ltctest, shic, wjk
+                       dogefeed                        Dogecoin (doge)
+                       messages                        the home chain only (always on there)
+                       dunes (Dogecoin), runes (Bitcoin)  coming
+                     while another chain is still being installed, the add waits in the queue (checked first)
+  arcade chain queue                        chains waiting to be installed, next first
+  arcade chain unqueue <key>                take a chain out of the install queue
   arcade chain drives                       drives a chain's file can go on (free space, whether the arcade can write there)
   arcade chain move <key> <mount|home>      move an installed chain's file to another drive (in the background)
   arcade chain status <key>                 staged progress (headers, blocks, coins, indexes)
@@ -86,6 +97,79 @@ fn step(n: u32, title: &str) {
     println!("\n[{n}/12] {title}");
 }
 
+/// A list of names, comma separated.
+fn names(v: &Value) -> String {
+    v.as_array().map(|x| x.iter().filter_map(|i| i.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default()
+}
+
+/// `chain list`: a row's state, mode and indexes; a queued chain shows its place and what it asked for.
+fn list_row(c: &Value) -> (String, String, String) {
+    if c["installed"] == true {
+        let st = if c["home"] == true { "home".to_string() } else { format!("{:.0}% {}", c["overall"].as_f64().unwrap_or(0.0), c["state"].as_str().unwrap_or("")) };
+        return (st, c["mode"].as_str().unwrap_or("").into(), names(&c["indexes"]));
+    }
+    if let Some(n) = c["queued"].as_u64() {
+        return (format!("queued #{n}"), c["queued_mode"].as_str().unwrap_or("").into(), names(&c["queued_with"]));
+    }
+    ("available".into(), String::new(), String::new())
+}
+
+/// The best height known: the arcade's own figure (headers, mesh, lenders), else what linked arcades report.
+fn best_known(s: &Value) -> u64 {
+    let mesh = s["mesh"]["tips"].as_array().map(|t| t.iter().filter_map(|t| t["height"].as_u64()).max().unwrap_or(0)).unwrap_or(0);
+    s["best_known"].as_u64().unwrap_or(0).max(mesh)
+}
+
+/// Setup step 4 is done when the arcade is synced with a coin peer and within 10 blocks of the best height
+/// known ("synced" alone also shows while a peer that is itself behind is followed).
+fn sync_done(s: &Value) -> bool {
+    let tip = s["tip"]["height"].as_u64().unwrap_or(0);
+    s["sync"].as_str().unwrap_or("").starts_with("synced") && tip > 0 && tip + 10 >= best_known(s)
+}
+
+fn sync_line(s: &Value) -> String {
+    let tip = s["tip"]["height"].as_u64().unwrap_or(0);
+    match best_known(s) {
+        0 => s["sync"].as_str().unwrap_or("").to_string(),
+        best => format!("block {tip} of {best} ({:.1}%)", tip.min(best) as f64 * 100.0 / best as f64),
+    }
+}
+
+fn index_line(s: &Value) -> String {
+    match (s["tags"]["indexed_to"].as_u64(), s["tip"]["height"].as_u64()) {
+        (None, _) => "not started yet (it starts as blocks come in)".into(),
+        (Some(i), Some(t)) if t > 0 => format!("indexed to {i} of {t} ({:.1}%), {} tags", i.min(t) as f64 * 100.0 / t as f64, s["tags"]["count"]),
+        (Some(i), _) => format!("indexed to {i}, {} tags", s["tags"]["count"]),
+    }
+}
+
+/// Whether the arcade runs as the .deb's system service (data in /var/lib/arcade) or as this user's.
+#[cfg(not(windows))]
+fn system_service(sock: &std::path::Path) -> bool {
+    sock.starts_with("/var/lib/arcade")
+}
+
+/// How to start the service again: the system one, the user one, or (installed without a systemd user
+/// session) the installer's start script.
+fn start_hint(sock: &std::path::Path) -> String {
+    #[cfg(windows)]
+    {
+        let _ = sock;
+        "start it from the Arcade V1.0 login task, or run arcaded".into()
+    }
+    #[cfg(not(windows))]
+    {
+        let script = sock.with_file_name("start-arcaded.sh");
+        if system_service(sock) {
+            "sudo systemctl enable --now arcaded".into()
+        } else if script.exists() {
+            format!("sh {}", script.display())
+        } else {
+            "systemctl --user enable --now arcaded".into()
+        }
+    }
+}
+
 /// Wait until `done(status)` holds, redrawing one progress line.
 fn wait_status(sock: &std::path::Path, what: &str, done: impl Fn(&Value) -> bool, line: impl Fn(&Value) -> String) -> Value {
     loop {
@@ -115,7 +199,7 @@ fn setup(sock: &std::path::Path) {
             #[cfg(windows)]
             println!("      {e}\n      start it from the Arcade V1.0 login task, or run arcaded, then run  arcade setup  again");
             #[cfg(not(windows))]
-            println!("      {e}\n      start it with:  sudo systemctl enable --now arcaded   then run  arcade setup  again");
+            println!("      {e}\n      start it with:  {}   then run  arcade setup  again", start_hint(sock));
             std::process::exit(2);
         }
     }
@@ -128,14 +212,15 @@ fn setup(sock: &std::path::Path) {
     println!("      chain: {}", st["chain"].as_str().unwrap_or("?"));
 
     step(4, "Get the Pepecoin testnet blockchain (mesh first, Pepecoin P2P as fallback)");
-    wait_status(sock, "sync", |s| s["sync"].as_str().unwrap_or("").starts_with("synced"), |s| s["sync"].as_str().unwrap_or("").to_string());
+    println!("      a full sync takes hours; it's safe to close setup (Ctrl-C) and run  arcade setup  again later: the arcade keeps going");
+    wait_status(sock, "sync", sync_done, sync_line);
 
     step(5, "Build the tag index");
     let st = wait_status(
         sock,
         "index",
         |s| s["tip"]["height"].as_u64().map(|t| s["tags"]["indexed_to"].as_u64().unwrap_or(0) >= t).unwrap_or(false),
-        |s| format!("indexed to {} ({} tags)", s["tags"]["indexed_to"], s["tags"]["count"]),
+        index_line,
     );
     let ours = st["tags"]["names_digest"].as_str().unwrap_or("");
     let tips = st["mesh"]["tips"].as_array().cloned().unwrap_or_default();
@@ -217,9 +302,22 @@ fn setup(sock: &std::path::Path) {
     }
     #[cfg(not(windows))]
     {
-        let enabled = std::process::Command::new("systemctl").args(["is-enabled", "arcaded"]).output()
+        let system = system_service(sock);
+        let mut is_enabled = std::process::Command::new("systemctl");
+        if !system {
+            is_enabled.arg("--user");
+        }
+        let enabled = is_enabled.args(["is-enabled", "arcaded"]).output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "enabled").unwrap_or(false);
-        println!("      {}", if enabled { "arcaded starts at boot" } else { "not enabled: sudo systemctl enable arcaded" });
+        let user = std::env::var("USER").unwrap_or_default();
+        let linger = system || std::process::Command::new("loginctl").args(["show-user", &user, "-p", "Linger", "--value"]).output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "yes").unwrap_or(false);
+        println!("      {}", match (enabled, linger) {
+            (true, true) => "arcaded starts at boot".to_string(),
+            (true, false) => format!("arcaded starts when you log in; to start it at boot:  sudo loginctl enable-linger {user}"),
+            (false, _) if system => "not enabled: sudo systemctl enable arcaded".to_string(),
+            (false, _) => format!("not started at boot: after a reboot start it with  {}", start_hint(sock)),
+        });
     }
 
     step(11, "Share bootstraps");
@@ -315,6 +413,7 @@ fn main() {
         ["status"] => json!({"cmd": "status"}),
         ["web"] => json!({"cmd": "ui.link"}),
         ["peers"] => json!({"cmd": "peers"}),
+        ["peers", "dials"] => json!({"cmd": "mesh.dials"}),
         ["stop"] => json!({"cmd": "service.stop"}),
         ["wallet", "create"] => json!({"cmd": "wallet.create"}),
         ["wallet", "restore", words @ ..] => match restore_phrase(words, || read_hidden("Your recovery phrase (not shown as you type): ")) {
@@ -354,6 +453,8 @@ fn main() {
         ["chain", "pause", k] => json!({"cmd": "chains.pause", "key": k}),
         ["chain", "resume", k] => json!({"cmd": "chains.resume", "key": k}),
         ["chain", "remove", k] => json!({"cmd": "chains.remove", "key": k}),
+        ["chain", "queue"] => json!({"cmd": "chains.queue"}),
+        ["chain", "unqueue", k] => json!({"cmd": "chains.unqueue", "key": k}),
         ["chain", "drives"] => json!({"cmd": "chains.drives"}),
         ["chain", "move", k, d] => json!({"cmd": "chains.move", "key": k, "drive": d}),
         ["chain", "copy", "status"] => json!({"cmd": "chains.copy_status"}),
@@ -469,8 +570,22 @@ fn main() {
         if a.first() == Some(&"chain") && a.get(1) == Some(&"list") || a.first() == Some(&"chains") {
             println!("{:<9} {:<20} {:<14} {:<6} INDEXES", "KEY", "CHAIN", "STATE", "MODE");
             for c in v["result"].as_array().unwrap() {
-                let st = if c["installed"] == true { if c["home"] == true { "home".to_string() } else { format!("{:.0}% {}", c["overall"].as_f64().unwrap_or(0.0), c["state"].as_str().unwrap_or("")) } } else { "available".into() };
-                println!("{:<9} {:<20} {:<14} {:<6} {}", c["key"].as_str().unwrap_or(""), c["name"].as_str().unwrap_or(""), st.chars().take(14).collect::<String>(), c["mode"].as_str().unwrap_or(""), c["indexes"].as_array().map(|x| x.iter().filter_map(|i| i.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default());
+                let (st, mode, ix) = list_row(c);
+                println!("{:<9} {:<20} {:<14} {:<6} {}", c["key"].as_str().unwrap_or(""), c["name"].as_str().unwrap_or(""), st.chars().take(14).collect::<String>(), mode, ix);
+            }
+            return;
+        }
+        if a.as_slice() == ["chain", "queue"] {
+            let r = &v["result"];
+            let q = r["queue"].as_array().cloned().unwrap_or_default();
+            if q.is_empty() {
+                println!("No chains are waiting to be installed.");
+                return;
+            }
+            println!("Waiting behind {} (one install at a time; the next starts when it has caught up):", r["installing"].as_str().unwrap_or("nothing: the next starts within 20 s"));
+            println!("{:<3} {:<9} {:<20} {:<6} INDEXES", "#", "KEY", "CHAIN", "MODE");
+            for e in q {
+                println!("{:<3} {:<9} {:<20} {:<6} {}", e["position"], e["key"].as_str().unwrap_or(""), e["name"].as_str().unwrap_or(""), e["mode"].as_str().unwrap_or(""), names(&e["with"]));
             }
             return;
         }
@@ -496,6 +611,62 @@ mod tests {
         assert!(asked);
         assert!(restore_phrase(&[], || Ok("\n".into())).is_err(), "nothing typed");
         assert!(restore_phrase(&[], || Err(std::io::Error::other("no terminal"))).is_err());
+    }
+
+    #[test]
+    fn a_queued_chain_shows_its_place_mode_and_indexes() {
+        let row = json!({"key": "shic", "installed": false, "queued": 1, "queued_mode": "full", "queued_with": ["addresses", "ord", "names"]});
+        assert_eq!(list_row(&row), ("queued #1".into(), "full".into(), "addresses, ord, names".into()));
+        let free = json!({"key": "kot", "installed": false, "queued": null});
+        assert_eq!(list_row(&free).0, "available");
+        let home = json!({"installed": true, "home": true, "mode": "full", "indexes": ["ledger"], "queued": null});
+        assert_eq!(list_row(&home), ("home".into(), "full".into(), "ledger".into()));
+    }
+
+    #[test]
+    fn setup_waits_for_the_best_height_not_any_synced() {
+        // The report: "synced at 2000" with the network near 1,569,400.
+        let early = json!({"sync": "synced at 2000", "tip": {"height": 2000}, "best_known": 1_569_400, "mesh": {"tips": []}});
+        assert!(!sync_done(&early));
+        assert_eq!(sync_line(&early), "block 2000 of 1569400 (0.1%)");
+        // An older arcade without best_known: the heights linked arcades report.
+        let old = json!({"sync": "synced at 56000", "tip": {"height": 56000}, "mesh": {"tips": [{"height": 1_569_400}]}});
+        assert!(!sync_done(&old));
+        let there = json!({"sync": "synced at 1569395", "tip": {"height": 1_569_395}, "best_known": 1_569_400});
+        assert!(sync_done(&there));
+        let alone = json!({"sync": "synced at 10", "tip": {"height": 10}});
+        assert!(sync_done(&alone), "nobody tells a better height");
+        assert_eq!(sync_line(&alone), "synced at 10");
+    }
+
+    #[test]
+    fn an_index_not_started_says_so() {
+        let s = json!({"tip": {"height": 100}, "tags": {"indexed_to": null, "count": 0}});
+        assert!(index_line(&s).starts_with("not started yet"));
+        let s = json!({"tip": {"height": 200}, "tags": {"indexed_to": 50, "count": 3}});
+        assert_eq!(index_line(&s), "indexed to 50 of 200 (25.0%), 3 tags");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn the_start_hint_matches_how_the_arcade_was_installed() {
+        assert_eq!(start_hint(std::path::Path::new("/var/lib/arcade/arcaded.sock")), "sudo systemctl enable --now arcaded");
+        let dir = std::env::temp_dir().join(format!("arcade-cli-hint-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("arcaded.sock");
+        assert_eq!(start_hint(&sock), "systemctl --user enable --now arcaded");
+        std::fs::write(dir.join("start-arcaded.sh"), "").unwrap();
+        assert_eq!(start_hint(&sock), format!("sh {}", dir.join("start-arcaded.sh").display()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn the_start_hint_on_windows_points_at_the_login_task() {
+        assert_eq!(
+            start_hint(std::path::Path::new(r"C:\Users\x\AppData\Local\arcade\arcaded.sock")),
+            "start it from the Arcade V1.0 login task, or run arcaded"
+        );
     }
 
     #[test]

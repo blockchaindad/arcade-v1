@@ -788,6 +788,11 @@ const WROTE_KEEP: usize = 1_000;
 /// The tip this arcade's own proof of time is running for (the writer's draw), if one is.
 static OWN_PROOF: Mutex<Option<Hash256>> = Mutex::new(None);
 
+/// The ARCADE chain's tip here, if it runs.
+pub fn tip_id() -> Option<Hash256> {
+    svc().map(|s| s.st.lock().unwrap().chain.tip().id)
+}
+
 /// Whether this arcade is in the middle of its own proof for the block after the tip: an update waits for the next
 /// block before it restarts (crate::updater), so the work isn't thrown away.
 pub fn proving_for_tip() -> bool {
@@ -1995,6 +2000,8 @@ pub fn status(node: &Node) -> Result<Value, String> {
             (v != (0, 0) || h.1 > 0).then(|| json!({"owner": hex::encode(owner), "served": v.0, "not_served": v.1, "held": h.0, "held_times": h.1}))
         }).collect::<Vec<_>>(),
         "accrued": st.chain.storage().accrued_of(&arcade_arc::registry::Earner::Owner(me)),
+        // This arcade's turn, next payout and why pay waits (docs/EARN.md).
+        "pay": crate::arcearn::pay(&svc.net, st.chain.storage(), &me, t.height),
     }))
 }
 
@@ -2013,7 +2020,6 @@ pub fn params_for(key: &str) -> Option<&'static ChainParams> {
 pub fn defined() -> Option<&'static ChainParams> {
     DEF.get().map(|d| d.params)
 }
-
 /// The (id, seed) of block `h` on the running ARCADE chain's best branch.
 pub fn block_at(h: u64) -> Option<(Hash256, arcade_arc::merkle::Hash)> {
     svc()?.st.lock().unwrap().chain.storage().block_at(h)
@@ -2076,6 +2082,11 @@ fn alone_streak<T: arcade_arc::time::TimeProofs, S: arcade_arc::chain::Storage>(
 /// Whether transaction `txid` waits in the ARCADE chain's pool.
 pub fn pooled(txid: &Hash256) -> bool {
     svc().is_some_and(|s| s.st.lock().unwrap().pool.iter().any(|w| w.tx.txid == *txid))
+}
+
+/// Whether the chain runs here and is as far as the arcades it is linked to (its pool takes what it should).
+pub fn ready() -> bool {
+    svc().is_some_and(|s| s.caught_up())
 }
 
 pub fn send_raw(raw: &[u8]) -> Result<(Hash256, u64), String> {
@@ -2513,12 +2524,16 @@ pub fn sealing(node: &Node, req: &Value) -> Result<Value, String> {
 
 /// `arc.earn {chain, on?}`: the coin's Earn ARCADE switch (docs/ARCADECHAIN.md §14.17) and where
 /// it stands. `on: true` installs the ARCADE chain here first when it isn't (the switch is the
-/// only step an operator takes); the coin must be kept in full.
+/// only step an operator takes); the coin must be kept in full and listed on the network (§2.3).
 pub fn earn(node: &Node, req: &Value) -> Result<Value, String> {
     let key = req["chain"].as_str().ok_or("give a chain")?;
     let p = node.chain_params(key).ok_or_else(|| format!("{key} isn't installed here"))?;
+    let paid = paid_here(p);
     if let Some(on) = req["on"].as_bool() {
         if on {
+            if !paid {
+                return Err(format!("{} is not paid on this network: the ARCADE chain doesn't list it", p.name));
+            }
             if node.mode_of(key).as_deref() != Some("full") {
                 return Err(format!("Earn ARCADE needs {} kept in full (its whole database is sealed)", p.name));
             }
@@ -2530,28 +2545,77 @@ pub fn earn(node: &Node, req: &Value) -> Result<Value, String> {
         crate::arcseg::set_earn(node, key, on)?;
         let _ = node.app.event("chains", &format!("Earn ARCADE {} for {}", if on { "on" } else { "off" }, p.name));
     }
-    // On by default for a coin kept in full; a coin kept otherwise can't be sealed, so it shows off.
-    let on = crate::arcseg::earn_on(node, key) && node.mode_of(key).as_deref() == Some("full");
-    let Some(svc) = svc() else { return Ok(json!({"chain": key, "on": on, "running": false})) };
-    let (sealed, of) = crate::arcseg::earn_progress(node, &svc.net, p);
+    earn_view(node, p)
+}
+
+/// Whether a coin's data can earn on the ARCADE network this arcade knows: one of its listed chains (params.rs
+/// `listed`; adding one is a rules version).
+fn paid_here(p: &ChainParams) -> bool {
+    svc().map(|s| s.net).or_else(|| defined_net().map(|d| d.0)).is_none_or(|n| n.listed.contains(&p.key))
+}
+
+/// `explorer.earn {chain?}` (/r/explorer/earn): what arc.earn shows, read only, for the Explorer and apps; without a
+/// chain, this arcade's pay and all its sealed replicas waiting to register.
+pub fn earn_read(node: &Node, req: &Value) -> Result<Value, String> {
+    if let Some(key) = req["chain"].as_str() {
+        let p = node.chain_params(key).ok_or_else(|| format!("{key} isn't installed here"))?;
+        return earn_view(node, p);
+    }
+    let Some(svc) = svc() else { return Ok(json!({"running": false})) };
     let me = node.identity.verifying_key().to_bytes();
-    let (weight, total, pot, height) = {
-        let st = svc.st.lock().unwrap();
-        let reg = st.chain.storage();
-        (reg.pay_weight(&me), reg.all_replicas().iter().map(|r| r.3).sum::<u64>() + genesis_total(), reg.pot(), st.chain.tip().height)
-    };
-    let sealing = crate::arcseal::sealing().map(|(_, d, o)| json!({"done": d, "of": o}));
-    // The indexes journaled here, sealed after the blocks.
-    let indexes: Vec<Value> = crate::arcseg::families(node, p)
+    let sealed = crate::arcseal::replicas(node, &svc.net);
+    let st = svc.st.lock().unwrap();
+    let (reg, tip) = (st.chain.storage(), st.chain.tip().height);
+    Ok(json!({"running": true, "net": svc.net.key, "height": tip, "pot": reg.pot(), "pay": crate::arcearn::pay(&svc.net, reg, &me, tip),
+              "registration": crate::arcearn::unregistered(&svc.net, reg, &me, tip, &sealed, None)}))
+}
+
+/// Where Earn ARCADE stands for a coin kept here: sealing, the catalog, registration and pay.
+fn earn_view(node: &Node, p: &'static ChainParams) -> Result<Value, String> {
+    let key = p.key;
+    let paid = paid_here(p);
+    // On by default for a coin kept in full; a coin kept otherwise can't be sealed, and one the network doesn't list
+    // isn't paid: both show off.
+    let on = paid && crate::arcseg::earn_on(node, key) && node.mode_of(key).as_deref() == Some("full");
+    // The indexes kept here that are never sealed: no journal family (addresses, collections, dogefeed), or journals
+    // that don't run from the index's start (an index taken in as a copy).
+    let fams = crate::arcseg::families(node, p);
+    let unpaid: Vec<Value> = crate::chains::indexes_of(node, p)
         .into_iter()
-        .filter(|f| *f != arcade_arc::segment::FAMILY_BLOCKS)
-        .map(|f| {
-            let (to, of) = crate::arcseg::family_progress(node, &svc.net, p, f);
-            json!({"family": f, "name": crate::arcseg::family_name(f), "sealed_to": to, "of": of})
+        .filter_map(|ix| match crate::arcseg::index_family(&ix) {
+            None => Some(json!({"index": ix, "why": "not paid on this network: it has no journal family to seal"})),
+            Some(f) if paid && !fams.contains(&f) => Some(json!({"index": ix, "why": "not sealed: its journals don't run here from the index's start (an index taken in as a copy)"})),
+            _ => None,
         })
         .collect();
-    Ok(json!({"chain": key, "on": on, "running": true, "sealed_to": sealed, "of": of, "indexes": indexes, "sealing": sealing, "weight": weight, "total_weight": total,
-              "pot": pot, "height": height, "note": update_needed().unwrap_or_else(crate::arcseg::seal_note)}))
+    let not_paid = (!paid).then(|| format!("not paid on this network: the ARCADE chain doesn't list {}", p.name));
+    let Some(svc) = svc().filter(|_| paid) else {
+        return Ok(json!({"chain": key, "on": on, "paid": paid, "not_paid": not_paid, "unpaid_indexes": unpaid, "running": svc().is_some()}));
+    };
+    let (sealed, of) = crate::arcseg::earn_progress(node, &svc.net, p);
+    let me = node.identity.verifying_key().to_bytes();
+    let replicas = crate::arcseal::replicas(node, &svc.net);
+    let sealing = crate::arcseal::sealing().map(|(_, d, o)| json!({"done": d, "of": o}));
+    let st = svc.st.lock().unwrap();
+    let reg = st.chain.storage();
+    let height = st.chain.tip().height;
+    let (weight, total, pot) = (reg.pay_weight(&me), reg.all_replicas().iter().map(|r| r.3).sum::<u64>() + genesis_total(), reg.pot());
+    // The indexes journaled here, sealed after the blocks, and how each stands in the catalog.
+    let indexes: Vec<Value> = fams
+        .iter()
+        .filter(|f| **f != arcade_arc::segment::FAMILY_BLOCKS)
+        .map(|&f| {
+            let (to, of) = crate::arcseg::family_progress(node, &svc.net, p, f);
+            json!({"family": f, "name": crate::arcseg::family_name(f), "sealed_to": to, "of": of, "catalog": crate::arcearn::listing(&svc.net, reg, key, f, height)})
+        })
+        .collect();
+    Ok(json!({"chain": key, "on": on, "paid": true, "running": true, "sealed_to": sealed, "of": of, "indexes": indexes, "unpaid_indexes": unpaid,
+              "catalog": crate::arcearn::listing(&svc.net, reg, key, arcade_arc::segment::FAMILY_BLOCKS, height),
+              "sealing": sealing, "weight": weight, "total_weight": total, "pot": pot, "height": height,
+              // This arcade's turn, next payout and why pay waits; its sealed replicas of this coin not registered yet.
+              "pay": crate::arcearn::pay(&svc.net, reg, &me, height),
+              "registration": crate::arcearn::unregistered(&svc.net, reg, &me, height, &replicas, Some(key)),
+              "note": update_needed().unwrap_or_else(crate::arcseg::seal_note)}))
 }
 
 /// The genesis holders' weight together.

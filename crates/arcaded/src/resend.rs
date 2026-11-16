@@ -35,6 +35,7 @@ pub fn send(node: &Node, p: &ChainParams, tx: &Tx) {
     if p.chain_no != node.params.chain_no {
         return;
     }
+    crate::ownwait::note(node, node.params, tx);
     let now = arcade_app::now();
     let mut m = load(node);
     m.entry(tx.txid.to_hex()).or_insert_with(|| json!({"first": now, "last": now}));
@@ -89,7 +90,8 @@ pub fn due(node: &Node, now: u64) -> usize {
     sent
 }
 
-/// How many of this arcade's own transactions are waiting for a block (for tests and status).
+/// How many of this arcade's own transactions are waiting for a block (for tests).
+#[cfg(test)]
 pub fn waiting(node: &Node) -> usize {
     load(node).len()
 }

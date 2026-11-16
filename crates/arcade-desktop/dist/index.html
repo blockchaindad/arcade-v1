@@ -426,8 +426,23 @@
     <div class="row">Monthly limit <input type="number" id="o-relay-gb" min="0" step="1" style="width:6em"> GB
       &nbsp; at most <input type="number" id="o-relay-max" min="0" step="1" style="width:5em"> links <button id="o-relay-set">Set</button></div>
     <p class="opt">Two arcades that can't reach each other, but both reach this one, get their mesh link through it. The link is encrypted end to end: this arcade passes sealed bytes it can't read. Off by default. When the month's limit is reached, relayed links end until the next month.</p>
+    <div class="row">Price <input type="number" id="o-relay-price" min="0" step="0.1" style="width:6em"> ARCADE a GB
+      &nbsp; free <input type="number" id="o-relay-free" min="0" step="10" style="width:6em"> MB a month for each arcade <button id="o-relay-fee-set">Set</button></div>
+    <div class="row">Paid to <input type="text" id="o-relay-payto-in" placeholder="this arcade's wallet" style="width:24em"> <button id="o-relay-payto-set">Set</button></div>
+    <div class="grid">
+      <div class="card"><div class="k">Earned</div><div class="v" id="o-relay-earned">—</div></div>
+      <div class="card"><div class="k">Paid to</div><div class="v" id="o-relay-payto" style="font-size:.8em">—</div></div>
+    </div>
+    <p class="opt">With a price, each arcade pays for what it sends through this relay past its free allowance, in ARCADE to this arcade's wallet. A payment counts once it is in a block. An arcade past what it paid has its relayed links ended until it pays.</p>
     <ul class="opt" id="o-relay-list"></ul>
     <p class="msg" id="o-relay-msg"></p>
+
+    <h3>Paying relays</h3>
+    <div class="row"><label class="sw"><input type="checkbox" id="o-pay-on"> Pay relays that charge</label>
+      &nbsp; up to <input type="number" id="o-pay-cap" min="0" step="0.1" style="width:6em"> ARCADE a month <button id="o-pay-set">Set</button></div>
+    <p class="opt">This arcade's links through a relay that charges are paid from this wallet, a little ahead, never past the month's cap, and never more than what this arcade sent through it. Off by default.</p>
+    <ul class="opt" id="o-pay-list"></ul>
+    <p class="msg" id="o-pay-msg"></p>
 
     <h2>Use this arcade from a browser</h2>
     <p class="opt">This same window, with every tab, opens in a web browser: on this computer, or on another one (a laptop) through an SSH tunnel. Nothing new is opened to the network: the arcade still answers only this computer, and the tunnel brings the other computer's browser here. <span class="web-only" hidden><b>You're using it in a browser now.</b></span></p>

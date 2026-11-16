@@ -9,7 +9,8 @@
 #   2. installs them in ~/.local/bin;
 #   3. installs the app icon (crates/arcade-desktop/icons/icon.png) into the user's icon theme, and an
 #      "Arcade V1.0" launcher in the app menu that opens the desktop app with that icon;
-#   4. installs and starts arcaded as a user service (systemd --user), started at login and at boot with linger.
+#   4. installs and starts arcaded as a user service (systemd --user), started at login and at boot with linger;
+#      without a systemd user session it starts arcaded in the background instead ($ARCADE_HOME/start-arcaded.sh).
 #
 # Needs: Rust (https://rustup.rs), clang/libclang, pkg-config, and for the desktop app the GTK/WebKit build
 # files (Debian/Ubuntu: sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev). Without them the desktop app is
@@ -37,7 +38,7 @@ while [ $# -gt 0 ]; do
     --http-port) HTTP_PORT="$2"; shift ;;
     --mesh-port) MESH_PORT="$2"; shift ;;
     --stun-port) STUN_PORT="$2"; shift ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
   shift
@@ -47,6 +48,30 @@ say() { printf '\033[1m%s\033[0m\n' "$*"; }
 taken_tcp() { ss -Hltn "sport = :$1" 2>/dev/null | grep -q .; }
 taken_udp() { ss -Hlun "sport = :$1" 2>/dev/null | grep -q .; }
 free_tcp() { local p="$1"; while taken_tcp "$p"; do p=$((p + 10)); done; echo "$p"; }
+
+# A systemd user session (systemctl --user reaches its bus). Without one (a VM or container, a login without
+# a user manager, root over su) arcaded runs in the background instead, started by $HOME_DIR/start-arcaded.sh.
+# ARCADE_NO_SYSTEMD=1 picks that way by hand.
+user_systemd() {
+  [ "${ARCADE_NO_SYSTEMD:-0}" != 1 ] && command -v systemctl >/dev/null && systemctl --user show-environment >/dev/null 2>&1
+}
+# An arcaded started by start-arcaded.sh: its pid, if it is still running.
+background_pid() {
+  local pid
+  pid="$(cat "$HOME_DIR/arcaded.pid" 2>/dev/null || true)"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = arcaded ] && echo "$pid"
+}
+# Stop it as the service unit would: it saves what it was writing first, up to 300 s.
+stop_background() {
+  local pid n=0
+  pid="$(background_pid)" || return 0
+  say "Stopping arcaded (pid $pid); it saves what it was writing first, which can take a few minutes..."
+  kill "$pid" 2>/dev/null || return 0
+  while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 300 ]; do sleep 1; n=$((n + 1)); done
+  kill -9 "$pid" 2>/dev/null || true
+  rm -f "$HOME_DIR/arcaded.pid"
+}
 
 if [ -n "$PREBUILT" ]; then
   # --- ready-made programs ------------------------------------------------------------------------------------------
@@ -115,8 +140,9 @@ fi
 # --- install --------------------------------------------------------------------------------------------------------
 mkdir -p "$BIN" "$HOME_DIR"
 chmod 700 "$HOME_DIR"   # the wallet, its key file and messages: this user only
-# Stop the service first so its binary can be replaced.
+# Stop the service first so its binary can be replaced (and one started without systemd, see below).
 systemctl --user stop arcaded.service 2>/dev/null || true
+stop_background
 install -m 0755 "$FROM/arcaded" "$BIN/arcaded"
 install -m 0755 "$FROM/arcade" "$BIN/arcade"
 
@@ -152,6 +178,10 @@ if [ "$MESH_PORT" = "$HTTP_PORT" ]; then MESH_PORT="$(free_tcp $((HTTP_PORT + 1)
 if [ -z "$STUN_PORT" ]; then
   if taken_udp 3478; then STUN_PORT=0; else STUN_PORT=3478; fi
 fi
+ARGS=(--home "$HOME_DIR" --http-port "$HTTP_PORT" --mesh-port "$MESH_PORT" --stun-port "$STUN_PORT")
+if user_systemd; then
+SYSTEMD=1
+rm -f "$HOME_DIR/start-arcaded.sh"   # an earlier install without systemd: the service takes over
 mkdir -p "$UNITS"
 cat > "$UNITS/arcaded.service" <<EOF
 [Unit]
@@ -173,14 +203,44 @@ WantedBy=default.target
 EOF
 systemctl --user daemon-reload
 systemctl --user enable --now arcaded.service
+else
+# No systemd user session: arcaded runs in the background, its output in arcaded.log in the data folder.
+SYSTEMD=0
+START="$HOME_DIR/start-arcaded.sh"
+{
+  echo '#!/bin/sh'
+  echo '# Starts arcaded in the background (written by install-linux.sh, which found no systemd user session).'
+  echo '# Run it again after a reboot. Output goes to arcaded.log beside it, the process id to arcaded.pid.'
+  printf 'home=%q\n' "$HOME_DIR"
+  echo 'pid="$(cat "$home/arcaded.pid" 2>/dev/null)"'
+  echo 'if [ -n "$pid" ] && [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = arcaded ]; then echo "arcaded is already running (pid $pid)"; exit 0; fi'
+  echo 'umask 077'
+  printf 'ARCADE_HOME="$home" nohup %q' "$BIN/arcaded"
+  printf ' %q' "${ARGS[@]}"
+  echo ' >>"$home/arcaded.log" 2>&1 </dev/null &'
+  echo 'echo $! >"$home/arcaded.pid"'
+  echo 'echo "arcaded started (pid $!); log: $home/arcaded.log"'
+} > "$START"
+chmod 700 "$START"
+sh "$START"
+fi
 
 say "Arcade V1.0 is installed and running."
 echo "  data:     $HOME_DIR"
 echo "  ports:    http $HTTP_PORT, mesh $MESH_PORT, STUN $([ "$STUN_PORT" = 0 ] && echo off || echo "$STUN_PORT")"
-echo "  service:  systemctl --user status arcaded"
+if [ "$SYSTEMD" = 1 ]; then
+  echo "  service:  systemctl --user status arcaded"
+else
+  echo "  service:  in the background, no systemd user session here (log: $HOME_DIR/arcaded.log)"
+fi
 [ "$DESKTOP" = 1 ] && echo "  app:      \"Arcade V1.0\" in your app menu (or run arcade-desktop)"
 echo "  setup:    the app's Home tab walks you through it (or: arcade --home $HOME_DIR setup)"
-if [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != "yes" ]; then
+if [ "$SYSTEMD" = 0 ]; then
+  echo
+  echo "It doesn't start by itself after a reboot. Start it again with:  sh $START"
+  echo "To run it as a service that starts at boot instead: sudo loginctl enable-linger $USER, log in again, and run"
+  echo "this installer again."
+elif [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != "yes" ]; then
   echo
   echo "To keep it running when you are logged out (and start it at boot):  sudo loginctl enable-linger $USER"
 fi

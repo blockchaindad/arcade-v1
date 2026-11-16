@@ -19,6 +19,7 @@ mod announce;
 mod api;
 mod apikeys;
 mod arcaudit;
+mod arcearn;
 mod arcfraud;
 mod arcborrow;
 mod arcseal;
@@ -46,6 +47,7 @@ mod chains;
 mod chaindrive;
 mod claims;
 mod resend;
+mod ownwait;
 mod cbimport;
 mod corecoins;
 mod coreboot;
@@ -543,6 +545,11 @@ fn main() {
     {
         let n = node.clone();
         std::thread::Builder::new().name("sizes".into()).spawn(move || sizes::run(n)).unwrap();
+    }
+    {
+        // This arcade's own waiting transactions: put back after a restart, dropped ones shown (ownwait.rs).
+        let n = node.clone();
+        std::thread::Builder::new().name("own waiting".into()).spawn(move || ownwait::run(n)).unwrap();
     }
     {
         // "cb" Core-data copies: asking, fetching, taking in, re-checking.

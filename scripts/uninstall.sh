@@ -53,6 +53,13 @@ fi
 
 say "Removing Arcade V1.0..."
 systemctl --user disable --now arcaded.service 2>/dev/null || true
+# One installed without a systemd user session runs in the background (install-linux.sh, start-arcaded.sh).
+pid="$(cat "$HOME_DIR/arcaded.pid" 2>/dev/null || true)"
+if [ -n "$pid" ] && [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = arcaded ]; then
+  kill "$pid" 2>/dev/null || true
+  n=0; while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 30 ]; do sleep 1; n=$((n + 1)); done
+  kill -9 "$pid" 2>/dev/null || true
+fi
 pkill -x arcade-desktop 2>/dev/null || true
 rm -f "$BIN/arcaded" "$BIN/arcade" "$BIN/arcade-desktop" "$UNITS/arcaded.service" "$APPS/arcade-v1.desktop" "$ICON"
 systemctl --user daemon-reload 2>/dev/null || true
