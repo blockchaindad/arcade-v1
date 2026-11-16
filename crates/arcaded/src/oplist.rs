@@ -232,11 +232,12 @@ fn keep(node: &Node, p: &ChainParams, mut head: Value, traits: &[String], rows: 
         }
     }
     let s = ensure(node, c)?;
-    drop_items(node, c, &slug)?;
+    // Refused before anything is dropped: a replace that fails keeps the list it would replace.
     let taken: Vec<String> = rows.iter().filter_map(|(id, _, _)| of(node, c, &ord::parse_iid(id)?).filter(|(s, _)| *s != slug).map(|(s, _)| s)).collect();
     if let Some(other) = taken.first() {
         return Err(format!("{} of its items are in the list {other} here already: remove that one first", taken.len()));
     }
+    drop_items(node, c, &slug)?;
     for chunk in rows.chunks(5_000) {
         s.write(|w| {
             for (id, n, vals) in chunk {
@@ -444,6 +445,13 @@ mod tests {
         let mut other = head.clone();
         other["slug"] = json!("other");
         assert!(keep(node, p, other.clone(), &traits, &rows).unwrap_err().contains("in the list add"));
+        // Replacing a list with items another list holds is refused, and keeps the list as it was.
+        let mut small = head.clone();
+        small["slug"] = json!("small");
+        keep(node, p, small.clone(), &traits, &[("aa".repeat(32) + "i0", 9, vec!["Red".into(), "None".into()])]).unwrap();
+        assert!(keep(node, p, small, &traits, &rows).unwrap_err().contains("in the list add"));
+        assert_eq!(items(node, c, "small", 0, 96).len(), 1, "small keeps its item");
+        remove(node, p, "small").unwrap();
         other["fp"] = json!("00".repeat(32));
         assert!(keep(node, p, other, &traits, &rows).unwrap_err().contains("not the list's"));
         remove(node, p, "add").unwrap();
