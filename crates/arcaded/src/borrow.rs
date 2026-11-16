@@ -879,15 +879,61 @@ fn trust_level(rec: &mut Value, hosts: usize, own_rules: bool, tips_note: Option
     }
 }
 
-/// Lenders' tips told at about the same time that are more than 3 blocks apart.
-fn tips_split(key: &str) -> Option<String> {
+/// Lenders' tips told at about the same time that are further apart than the chain allows
+/// (see `tips_apart`; `ours`: this arcade's tip of the borrowed chain).
+fn tips_split(key: &str, ours: u64) -> Option<String> {
     let told: Vec<(u64, u64)> = ST.tips.lock().unwrap().get(key).map(|m| m.values().copied().collect()).unwrap_or_default();
     // Only tips told at about the same time can disagree: one told a while ago is behind
     // because the chain went on, not because its lender is on another chain.
     let newest = told.iter().map(|x| x.1).max().unwrap_or(0);
     let tips: Vec<u64> = told.iter().filter(|x| x.1 + TIPS_TOGETHER >= newest).map(|x| x.0).collect();
-    match (tips.iter().min(), tips.iter().max()) {
-        (Some(a), Some(b)) if b - a > 3 => Some(format!("lenders disagree on the tip: {a} to {b}")),
+    tips_apart(key, &tips, ours)
+}
+
+/// About how many seconds a block of the chain takes, only to size the tip gaps below:
+/// 60 s unless the chain is known to be faster or slower.
+fn nominal_block_secs(key: &str) -> u64 {
+    match key {
+        "btc" => 600,
+        "ltc" | "ltctest" | "ltcregtest" | "arc" => 150,
+        "dgb" | "dgbtest" => 15,
+        _ => 60,
+    }
+}
+
+/// How many blocks apart lenders' tips told together may be: about two minutes of the chain's
+/// blocks (offers cross the mesh at different speeds), never under 3. DigiByte's 15 s blocks
+/// put honest lenders 4-6 blocks apart routinely; 3 blocks there was yellow most of the time.
+fn tips_slack(key: &str) -> u64 {
+    (120 / nominal_block_secs(key)).max(3)
+}
+
+/// How far below the reference tip a lender has stopped rather than fallen a little behind:
+/// about an hour of the chain's blocks, never under 10. Such a lender knows none of the newest
+/// payments, so it cannot speak against them; it is listed as far behind, not compared.
+fn stalled_gap(key: &str) -> u64 {
+    (3600 / nominal_block_secs(key)).max(10)
+}
+
+/// The tip lenders' tips are measured against: ours, which follows the chain's headers, but
+/// never above the highest lender's (a tip above every lender is not ours to trust alone).
+fn tips_reference(tips: &[u64], ours: u64) -> u64 {
+    tips.iter().max().map_or(ours, |&m| if ours == 0 { m } else { ours.min(m) })
+}
+
+/// Whether a lender at `tip` has stopped far below the others (see `stalled_gap`).
+fn stalled(key: &str, tip: u64, reference: u64) -> bool {
+    tip + stalled_gap(key) < reference
+}
+
+/// "lenders disagree on the tip: a to b" when the tips of lenders still following the chain
+/// are more than `tips_slack` apart. A lender far behind (`stalled`) is left out: it has
+/// stopped, it is not on another chain. A lender far ahead stays in.
+fn tips_apart(key: &str, tips: &[u64], ours: u64) -> Option<String> {
+    let reference = tips_reference(tips, ours);
+    let live: Vec<u64> = tips.iter().copied().filter(|&t| !stalled(key, t, reference)).collect();
+    match (live.iter().min(), live.iter().max()) {
+        (Some(a), Some(b)) if b - a > tips_slack(key) => Some(format!("lenders disagree on the tip: {a} to {b}")),
         _ => None,
     }
 }
@@ -898,7 +944,8 @@ fn refresh_trust(node: &Node, p: &ChainParams) {
     let mut rec = trust_rec(node, p.key);
     let before = rec.clone();
     let hosts = lender_hosts(node, p);
-    if let Some(ev) = trust_level(&mut rec, hosts, crate::arcborrow::is(p), tips_split(p.key), p.name, arcade_app::now()) {
+    let ours = state(node, p.key).and_then(|st| st["tip"].as_u64()).unwrap_or(0);
+    if let Some(ev) = trust_level(&mut rec, hosts, crate::arcborrow::is(p), tips_split(p.key, ours), p.name, arcade_app::now()) {
         let _ = node.app.event("borrow", &ev);
     }
     if rec != before {
@@ -2120,10 +2167,15 @@ pub fn status(node: &Node, key: &str) -> Option<Value> {
     // because the chain went on, not because its lender is on another chain.
     let newest = fresh.iter().map(|x| x.1).max().unwrap_or(0);
     let tips: Vec<u64> = fresh.iter().filter(|x| x.1 + TIPS_TOGETHER >= newest).map(|x| x.0).collect();
-    let mismatch = match (tips.iter().min(), tips.iter().max()) {
-        (Some(a), Some(b)) if b - a > 3 => Some(format!("lenders disagree on the tip: {a} to {b}")),
-        _ => None,
-    };
+    let mismatch = tips_apart(p.key, &tips, tip);
+    // Lenders that stopped far below the others: shown as such, left out of the comparison.
+    let all: Vec<u64> = lenders_v.iter().filter_map(|l| l["tip"].as_u64()).collect();
+    let reference = tips_reference(&all, tip);
+    for l in lenders_v.iter_mut() {
+        if l["tip"].as_u64().is_some_and(|t| stalled(p.key, t, reference)) {
+            l["behind"] = json!(true);
+        }
+    }
     // Before the chain's first look at its lenders (still starting) there is no record yet: count
     // the lender hosts now, so the dot shows from the start.
     let t = match trust_rec(node, p.key) {
@@ -2696,6 +2748,33 @@ fn scan_any(node: &Node, p: &'static ChainParams, addrs: &[String]) -> Result<(S
 
 #[cfg(test)]
 mod tests {
+    use super::{stalled, tips_apart, tips_slack};
+
+    #[test]
+    fn a_lender_stopped_far_behind_is_not_a_disagreement() {
+        // Pepecoin, 16 Nov: four lenders at the tip, one stopped about 6,850 blocks behind.
+        let tips = [1_296_303, 1_296_303, 1_296_303, 1_289_457, 1_289_457];
+        assert_eq!(tips_apart("pep", &tips, 1_296_303), None);
+        assert!(stalled("pep", 1_289_457, 1_296_303));
+        assert!(!stalled("pep", 1_296_281, 1_296_303));
+        // A few blocks behind is still compared: caution as before.
+        assert!(tips_apart("pep", &[1_296_303, 1_296_296], 1_296_303).is_some());
+        // A lender far AHEAD of us and the others is never left out.
+        assert!(tips_apart("pep", &[1_296_303, 1_296_303, 1_310_000], 1_296_303).is_some());
+        // Our tip above every lender: measured from the highest lender, so they are still compared.
+        assert!(tips_apart("pep", &[1_290_000, 1_290_010], 1_296_303).is_some());
+    }
+
+    #[test]
+    fn digibyte_tips_a_minute_apart_agree() {
+        // DigiByte, 16 Nov: 15 s blocks, lenders told 4 blocks apart.
+        assert_eq!(tips_slack("dgb"), 8);
+        assert_eq!(tips_apart("dgb", &[24_575_848, 24_575_852], 24_575_878), None);
+        assert!(tips_apart("dgb", &[24_575_840, 24_575_852], 24_575_852).is_some());
+        // Minute (and slower) chains keep the old 3-block limit.
+        assert_eq!(tips_slack("pep"), 3);
+        assert_eq!(tips_slack("btc"), 3);
+    }
     use super::*;
 
     #[test]
