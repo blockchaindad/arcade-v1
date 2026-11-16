@@ -14,6 +14,7 @@
 //! and the fee to THAT registrar's fee address (0.1 DOGE; 90/10 for tips and reveals), plus the author payout.
 
 use crate::node::Node;
+use crate::shares::Trust;
 use arcade_chain::params::{by_key, ChainParams};
 use arcade_ledger::dproto as dp;
 use arcade_store::KeyBuf;
@@ -987,6 +988,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_author_independent_arcades_name() {
+        let n = |a: &str, by: &str| (a.to_string(), by.to_string());
+        // Nobody answered: not found.
+        assert_eq!(author_verdict(&[]).unwrap(), None);
+        // One arcade: yellow (paid, with a caution).
+        assert_eq!(author_verdict(&[n("DAuthor", "n1")]).unwrap(), Some(("DAuthor".to_string(), Trust::Yellow)));
+        // The same arcade twice is still one.
+        assert_eq!(author_verdict(&[n("DAuthor", "n1"), n("DAuthor", "n1")]).unwrap().unwrap().1, Trust::Yellow);
+        // Two agree: green.
+        assert_eq!(author_verdict(&[n("DAuthor", "n1"), n("DAuthor", "n2")]).unwrap(), Some(("DAuthor".to_string(), Trust::Green)));
+        // They name different authors: refused, both named.
+        let e = author_verdict(&[n("DAuthor", "n1"), n("DOther", "n2"), n("DAuthor", "n3")]).unwrap_err();
+        assert!(e.contains("different authors") && e.contains("DAuthor") && e.contains("DOther") && e.contains("nothing is paid"), "{e}");
+    }
+
+    #[test]
+    fn a_tip_on_one_arcades_word_says_so() {
+        let t = crate::sitesvc::tests::setup();
+        let c = author_caution(&t.node, "DAuthor", Trust::Yellow, "tipping").expect("a caution on one source");
+        assert_eq!(c["level"], "yellow");
+        assert_eq!(c["note"], "Only one arcade says DAuthor wrote this post. Double-check the recipient before tipping.");
+        // This arcade's own index, or two arcades agreeing: nothing to say.
+        assert!(author_caution(&t.node, "DAuthor", Trust::Green, "tipping").is_none());
+    }
+
+    #[test]
     fn the_guides_worked_like_digest() {
         // §11: made-up values, its preimage and digest given.
         let target = [[0x11u8; 32].as_slice(), &0u32.to_le_bytes()].concat();
@@ -1403,14 +1430,20 @@ pub fn post(node: &Node, req: &Value) -> Result<Value, String> {
     let rec = stamped["record"].clone();
     let body = jcs(&rec);
     // Who a comment or quote pays: the parent's author (from the index here, or the mesh), else map.pay.
+    // (A parent's author named by one arcade only: yellow, said in the preview; arcades naming different authors:
+    // refused.)
+    let mut payee_by = Trust::Green;
     let payee = match ty {
         "comment" | "quote" => {
             let parent = rec["map"][if ty == "comment" { "reply" } else { "quote" }].as_str();
-            let from_index = parent.and_then(|id| {
-                crate::explorer::handle(node, "explorer.dogefeed_inscription", &json!({"chain": "doge", "id": id})).ok()
-                    .and_then(|v| v["author"].as_str().map(String::from))
-            });
-            Some(from_index.or_else(|| rec["map"]["pay"].as_str().map(String::from))
+            let from_index = match parent {
+                Some(id) => post_author(node, id)?,
+                None => None,
+            };
+            if let Some((_, t)) = &from_index {
+                payee_by = *t;
+            }
+            Some(from_index.map(|x| x.0).or_else(|| rec["map"]["pay"].as_str().map(String::from))
                 .ok_or("the post it answers isn't found on D:// here: give pay (its author's address)")?)
         }
         _ => None,
@@ -1450,6 +1483,8 @@ pub fn post(node: &Node, req: &Value) -> Result<Value, String> {
     let mut v = json!({"record": rec, "bytes": body.len(), "author": author, "registrar": stamped["att"]["kid"],
                        "fee": FEE, "payout": payee.as_ref().map(|a| json!({"address": a, "value": outs[2].0})),
                        "network_fee": reveal_fee(&outs) + commit_fee, "cost": cost, "inscription": format!("{}i0", rtx.txid.to_hex())});
+    let spent: Vec<arcade_chain::OutPoint> = commit.inputs.iter().map(|i| i.prevout).collect();
+    v["caution"] = json!(crate::shares::worse_caution(payee.as_deref().and_then(|a| author_caution(node, a, payee_by, "paying")), crate::ordsafe::caution(node, p, &spent)));
     if req["send"] != true {
         return Ok(v);
     }
@@ -1459,6 +1494,55 @@ pub fn post(node: &Node, req: &Value) -> Result<Value, String> {
     v["sent"] = json!(true);
     v["commit"] = json!(commit.txid.to_hex());
     Ok(v)
+}
+
+/// Who wrote post `id`, and how well that is backed: this arcade's own dogefeed index (green), else the arcades
+/// keeping it, asked at once (crate::shares::ask_explorer_each; see [`author_verdict`]). None: not found.
+fn post_author(node: &Node, id: &str) -> Result<Option<(String, Trust)>, String> {
+    let q = json!({"chain": "doge", "id": id});
+    let Ok(v) = crate::explorer::handle(node, "explorer.dogefeed_inscription", &q) else { return Ok(None) };
+    if v["_mesh"].is_null() {
+        return Ok(v["author"].as_str().map(|a| (a.to_string(), Trust::Green)));
+    }
+    let answers = crate::shares::ask_explorer_each(node, doge(), "dogefeed", "explorer.dogefeed_inscription", &q, 3, 6000);
+    let mut names: Vec<(String, String)> = answers.iter().filter_map(|(a, by)| a["author"].as_str().map(|s| (s.to_string(), by.clone()))).collect();
+    if names.is_empty() {
+        // None answered again in time: the one answer already heard.
+        names.extend(v["author"].as_str().map(|a| (a.to_string(), v["_mesh"]["node"].as_str().unwrap_or("").to_string())));
+    }
+    author_verdict(&names)
+}
+
+/// The author independent arcades name (author, node id): green when two or more name the same one, yellow for one;
+/// refused when they name different ones (paying either could pay the wrong person).
+pub fn author_verdict(names: &[(String, String)]) -> Result<Option<(String, Trust)>, String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut authors: Vec<&str> = Vec::new();
+    for (a, by) in names {
+        if seen.insert(by.as_str()) {
+            authors.push(a);
+        }
+    }
+    let Some(first) = authors.first() else { return Ok(None) };
+    if authors.iter().any(|a| a != first) {
+        let mut d = authors.clone();
+        d.sort();
+        d.dedup();
+        return Err(format!("arcades on the mesh name different authors for this post ({}); nothing is paid. Check the post on an arcade you trust, or keep the dogefeed index here.", d.join(", ")));
+    }
+    Ok(Some((first.to_string(), Trust::of_sources(authors.len()))))
+}
+
+/// The caution for paying a post's author whose address is backed only so well (`doing`: "tipping", "paying").
+fn author_caution(node: &Node, address: &str, t: Trust, doing: &str) -> Option<Value> {
+    let who = match handle_of(node, address) {
+        Some(h) => format!("@{h} / {address}"),
+        None => address.to_string(),
+    };
+    match t {
+        Trust::Yellow => Some(crate::shares::caution(t, &format!("Only one arcade says {who} wrote this post. Double-check the recipient before {doing}."))),
+        _ => None,
+    }
 }
 
 /// `dogefeed.act {op, target, amount?, send?}`: a like, branch, follow, tip, reveal, delete or keyrevoke from this
@@ -1473,13 +1557,15 @@ pub fn act(node: &Node, req: &Value) -> Result<Value, String> {
     let (full, t11) = full_target(op, &target)?;
     let (sk, pk, author, coins) = wallet(node)?;
     let (reg, rsk) = own(node)?;
-    // Who is paid: the post's author (from the index here or the mesh), or the followed address.
-    let to: Option<String> = match op {
-        3 => Some(target.clone()),
-        6 | 7 => None,
-        _ => Some(crate::explorer::handle(node, "explorer.dogefeed_inscription", &json!({"chain": "doge", "id": target})).ok()
-            .and_then(|v| v["author"].as_str().map(String::from))
-            .ok_or("that post isn't found on D:// (the dogefeed index, here or on the mesh)")?),
+    // Who is paid: the post's author (from the index here, or the arcades on the mesh keeping it), or the
+    // followed address.
+    let (to, by): (Option<String>, Trust) = match op {
+        3 => (Some(target.clone()), Trust::Green),
+        6 | 7 => (None, Trust::Green),
+        _ => {
+            let (a, t) = post_author(node, &target)?.ok_or("that post isn't found on D:// (the dogefeed index, here or on the mesh)")?;
+            (Some(a), t)
+        }
     };
     if op == 6 && to.is_none() {
         let post = crate::explorer::handle(node, "explorer.dogefeed_inscription", &json!({"chain": "doge", "id": target}))?;
@@ -1531,6 +1617,8 @@ pub fn act(node: &Node, req: &Value) -> Result<Value, String> {
                        "recipient": recipient.as_ref().map(|(val, _)| json!({"address": to, "value": val})),
                        "network_fee": in_sum.saturating_sub(tx.outputs.iter().map(|o| o.value).sum()),
                        "data": hex::encode(&data), "txid": tx.txid.to_hex()});
+    let spent: Vec<arcade_chain::OutPoint> = tx.inputs.iter().map(|i| i.prevout).collect();
+    v["caution"] = json!(crate::shares::worse_caution(to.as_deref().and_then(|a| author_caution(node, a, by, if matches!(op, 4 | 5) { "tipping" } else { "paying" })), crate::ordsafe::caution(node, p, &spent)));
     if req["send"] != true {
         return Ok(v);
     }

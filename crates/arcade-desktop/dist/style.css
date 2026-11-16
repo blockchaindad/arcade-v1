@@ -215,6 +215,10 @@ main:has(#explorer.on) { max-width: 1240px; }
 .stages li.now .sn { color: var(--accent); }
 .stages li.info .bar { display: none; }
 .note { background: var(--warn-bg); border: 1px solid var(--warn-line); border-radius: 10px; padding: 12px 14px; }
+/* A send's caution (one source only, or none): a line of its own above Send, not a tooltip. */
+.caution { background: var(--panel); border: 1px solid var(--warn-line); border-left-width: 4px; border-radius: 8px; padding: 8px 10px; margin: 8px 0; font-weight: 600; }
+.caution.grey { border-color: var(--muted); font-weight: normal; }
+.caution.red { border-color: var(--bad); color: var(--bad); }
 .addix { display: block; margin: 4px 0 16px; }
 .addix h3 { font-size: 14px; margin: 6px 0 8px; }
 .addrow { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; margin-bottom: 8px; background: var(--panel); }

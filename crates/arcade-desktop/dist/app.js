@@ -847,7 +847,8 @@ $("w-review").addEventListener("click", async () => {
       h("div", {}, `Pay ${coins(r.amount, ch.key)} to ${r.to}`),
       h("div", { class: "s" }, `fee ${coins(r.fee, ch.key)} · ${r.vsize || r.size} bytes · from ${r.from}${r.kind_label ? ` (${r.kind_label})` : ""}`),
       spent.length > 1 || (spent.length === 1 && spent[0] !== r.kind_label) ? h("div", { class: "s" }, `spends coins of your ${spent.join(", ")} address${spent.length > 1 ? "es" : ""}; change to your ${r.kind_label} address`) : null,
-      r.warning ? h("p", { class: "msg bad" }, r.warning) : null);
+      r.warning ? h("p", { class: "msg bad" }, r.warning) : null,
+      cautionLine(r.caution));
     $("w-confirm").hidden = false;
     msg(sm, "");
   } catch (e) {
@@ -857,6 +858,12 @@ $("w-review").addEventListener("click", async () => {
     msg(sm, text + (dogeLike ? " Also: D... addresses look the same on DigiByte and Dogecoin, so make sure whoever you're paying uses DigiByte." : ""), "bad");
   }
 });
+// How well what a send relies on is backed, said before Send (crate ordsafe / shares::Trust): yellow when one
+// arcade alone vouched, grey when none could, red when arcades disagree. Green says nothing.
+function cautionLine(c) {
+  if (!c || !c.note || c.level === "green") return null;
+  return h("p", { class: "caution " + c.level, role: "alert" }, c.note);
+}
 $("w-cancel").addEventListener("click", () => { pendingSend = null; $("w-confirm").hidden = true; });
 $("w-sendnow").addEventListener("click", async () => {
   if (!pendingSend) return;

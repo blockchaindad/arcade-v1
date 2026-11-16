@@ -325,6 +325,9 @@ pub fn send(node: &Node, key: Option<&str>, to: &str, amount: u64, from: Option<
     let mut out = json!({"chain": p.key, "txid": tx.txid.to_hex(), "from": change.0, "to": to, "amount": amount, "fee": fee,
                          "size": tx.raw.len(), "vsize": vsize, "sent": false, "warning": warn, "hex": hex::encode(&tx.raw),
                          "kind": kd.map(AddrKind::id), "kind_label": kd.map(AddrKind::label), "kinds_spent": kinds_spent(&tx, &coins, &kinds)});
+    // How well the coins it spends are known to carry no inscription: shown before Send.
+    let spent: Vec<arcade_chain::OutPoint> = tx.inputs.iter().map(|i| i.prevout).collect();
+    out["caution"] = json!(crate::ordsafe::caution(node, p, &spent));
     if broadcast {
         let r = if arc {
             let (id, fee) = crate::ownwait::send_arc(node, &tx)?;

@@ -657,6 +657,11 @@
       const lines = [`${from} asks to send ${pv.what} to ${pv.to_tag ? "@" + pv.to_tag + " " : ""}${pv.to}.`];
       if (pv.note) lines.push(`“${pv.note}”`);
       lines.push(outs, `Network fee: ${pep(pv.fee)}`);
+      // One arcade alone (or none) vouched that its coins carry no inscription: said above Approve.
+      if (pv.caution && pv.caution.note && pv.caution.level !== "green") {
+        const c = document.createElement("div"); c.className = "caution " + pv.caution.level; c.setAttribute("role", "alert"); c.textContent = pv.caution.note;
+        lines.push(c);
+      }
       const yes = await card("Approve this send?", lines, "Approve and send", "Refuse");
       await api(yes ? "wallet.approve" : "wallet.deny", { id: r.id });
     } catch (_) { /* answered elsewhere */ }
