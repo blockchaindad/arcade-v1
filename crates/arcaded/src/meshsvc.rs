@@ -862,6 +862,10 @@ fn serve_bk(node: &Node, link: &mut Link, addr: &str, h: &Value) -> Result<(), L
             };
             bk::send_answer(link, id, r)?;
         }
+        // A chain this arcade doesn't keep: say so at once, so the asker tries another instead of timing out (ARCADE #5).
+        "hq" | "bq" => {
+            bk::send_answer(link, id, Err(format!("not held: this arcade doesn't keep {}", h["net"].as_str().unwrap_or("that chain"))))?;
+        }
         _ => {}
     }
     Ok(())
