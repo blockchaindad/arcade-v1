@@ -103,6 +103,8 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
             }))
         }
         "mesh.udp" => Ok(crate::udpsvc::status(node)),
+        "mesh.relay" => Ok(crate::relaysvc::status(node)),
+        "mesh.relay_set" => crate::relaysvc::set(node, &req),
         "mesh.udp_set" => {
             if let Some(p) = req["drop"].as_str().filter(|p| !p.is_empty()) {
                 return Ok(json!({"dropped": crate::udpsvc::drop_path(p)}));

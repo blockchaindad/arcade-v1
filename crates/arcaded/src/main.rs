@@ -96,6 +96,7 @@ mod ringsvc;
 mod rpc;
 mod sizes;
 mod udpsvc;
+mod relaysvc;
 mod turnsvc;
 mod v1copy;
 mod vxshare;

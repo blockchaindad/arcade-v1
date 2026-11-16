@@ -615,6 +615,7 @@ pub fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> 
         serve_loop(node, link, addr, &peer, conn, &mut cr_reqs, &mut last_ping, &mut sent_outbox, &mut last_sz, &mut last_hold, &mut last_me, &mut last_offer)
     });
     crate::crvia::down(&peer);
+    crate::relaysvc::link_ended(link);
     crate::udpsvc::link_down(&peer, link.session_keys());
     crate::realtime::link_down(&peer, conn);
     r
@@ -661,6 +662,7 @@ fn serve_loop(
         crate::shares::tick(link)?;
         crate::mempoolshare::tick(node, peer, link)?;
         crate::crvia::tick(peer, link)?;
+        crate::relaysvc::tick(node, link)?;
         #[cfg(feature = "oldimport")]
         crate::lxfetch::tick(link)?;
         #[cfg(feature = "oldimport")]
@@ -746,6 +748,8 @@ fn serve_loop(
             "pub" | "sub" | "fx" => crate::realtime::on_frame(node, peer, conn, &f),
             "ud" | "st" | "ui" => crate::udpsvc::on_frame(node, link, &f)?,
             "ka" => {} // TCP keepalive while frames go over UDP
+            // Relayed links (crate::relaysvc): as the relay, or as one side.
+            "rl" => crate::relaysvc::on_frame(node, link, &f)?,
             "cb" => crate::coreboot::on_frame(node, link, &f)?,
             "vx" => crate::vxshare::on_frame(node, link, &f)?,
             // A blob piece we asked for over this link (crate::arcblob, crvia), else the ARCADE chain's own frames.

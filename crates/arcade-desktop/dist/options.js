@@ -27,8 +27,41 @@ $("o-cache-set").addEventListener("click", async () => {
   refreshCache();
 });
 
+// Relayed links (mesh.relay): the switch, the month's limit, the meter, and the links passed now.
+async function refreshRelay() {
+  try {
+    const r = await api("mesh.relay");
+    $("o-relay-state").textContent = r.on ? (r.over ? "on, limit reached" : "on") : "off";
+    $("o-relay-month").textContent = `${r.used_gb} of ${r.limit_gb} GB`;
+    $("o-relay-today").textContent = `${r.today_gb} GB`;
+    $("o-relay-links").textContent = `${r.passing.length} of ${r.max_links}`;
+    if (document.activeElement !== $("o-relay-on")) $("o-relay-on").checked = !!r.on;
+    if (document.activeElement !== $("o-relay-gb")) $("o-relay-gb").value = r.limit_gb;
+    if (document.activeElement !== $("o-relay-max")) $("o-relay-max").value = r.max_links;
+    const list = $("o-relay-list");
+    list.replaceChildren(
+      ...r.passing.map((c) => h("li", {}, `Passing ${c.a} ⇄ ${c.b}: ${c.mb} MB`)),
+      ...r.through_relays.map((c) => h("li", {}, `This arcade reaches ${c.arcade} through ${c.relay}`)));
+  } catch (e) {
+    $("o-relay-state").textContent = "—";
+  }
+}
+$("o-relay-on").addEventListener("change", async (e) => {
+  try { await api("mesh.relay_set", { on: e.target.checked }); say("o-relay-msg", e.target.checked ? "Relaying links for other arcades." : "Relay off."); }
+  catch (err) { say("o-relay-msg", err.message, true); }
+  refreshRelay();
+});
+$("o-relay-set").addEventListener("click", async () => {
+  const limit_gb = Math.max(0, Number($("o-relay-gb").value) || 0);
+  const max_links = Math.max(0, Math.floor(Number($("o-relay-max").value) || 0));
+  try { await api("mesh.relay_set", { limit_gb, max_links }); say("o-relay-msg", `Limit set: ${limit_gb} GB a month, ${max_links} links at once.`); }
+  catch (e) { say("o-relay-msg", e.message, true); }
+  refreshRelay();
+});
+
 async function refreshOptions() {
   refreshCache();
+  refreshRelay();
   const u = await api("update.status");
   $("o-ver").textContent = u.version || "local build";
   $("o-new").textContent = u.newest ? (u.newer ? `${u.newest} (newer)` : `${u.newest} (this one)`) : "—";
