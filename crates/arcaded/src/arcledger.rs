@@ -95,7 +95,7 @@ pub fn pay_with_memo(node: &Node, to: &str, value: u64, memo: &[u8]) -> Result<(
     let tx = arcade_wallet::tx::build_arcade_with(p, &arcade_wallet::tx::any_data(memo), vec![arcade_wallet::tx::TxOutSpec { value, script: to_script }], &sk, &coins,
         2 * arcade_arc::params::MIN_FEE_PER_KB, arcade_arc::params::DUST, arcade_app::now() as u32, arcade_wallet::tx::ARCADE_CLASS_C_MAX)
         .map_err(|e| format!("could not build the payment: {e}"))?;
-    let (txid, fee) = crate::arcsvc::send_raw(&tx.raw)?;
+    let (txid, fee) = crate::ownwait::send_arc(node, &tx)?;
     Ok((txid.to_hex(), fee))
 }
 
