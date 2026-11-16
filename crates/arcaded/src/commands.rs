@@ -79,11 +79,12 @@ cmds! {
     // Wallet
     "wallet.create" Local "phrase?" "Create a wallet (or restore one from 12 words). Returns the new words once.";
     "wallet.phrase" Local "" "The wallet's 12 words.";
-    "wallet.keys" Read "chain?" "Your addresses on a chain, their @tags and balances.";
+    "wallet.keys" Read "chain?" "Your addresses on a chain, their @tags and balances (on SegWit chains each address type's address and balance under kinds; balance counts every type).";
+    "wallet.addr_kind" Wallet "chain, kind?" "The address type the Wallet shows on a chain (legacy, p2sh-p2wpkh, p2wpkh, p2tr; remembered per chain) and the types it offers; kind: remember that one.";
     "dd.wallet" Read "chain?" "Your DigiDollar on DigiByte (chain dgb, the default, or dgbtest): address (DD.../TD...), cents, coins, borrowed, whole (false when only coins from the borrow floor on can be seen).";
     "dd.coins" Read "chain?, pubkey" "The DigiDollar address and coins (txid, vout, cents, height) of any DigiByte key (33-byte hex), as dd.wallet shows this wallet's: for a website whose accounts sign in their browsers.";
     "dd.send" Local "chain?, to, cents, send?" "Send DigiDollars (cents, $1 to $100,000 per send) to a DD.../TD... address, with DGB from the same wallet for the fee (0.35 DGB/kB, at least 0.1, at most 0.5 DGB); send: true broadcasts, otherwise it's only built and shown.";
-    "wallet.send" Local "chain?, to, amount, from?, send?" "Pay amount (satoshis) on a chain (home, installed or borrowed) from this wallet (from: one of its addresses or an imported wallet's; otherwise the own address with the most), signed here; send: true broadcasts, otherwise it's only built and shown with its fee (and a warning when the address could be meant for another chain).";
+    "wallet.send" Local "chain?, to, amount, from?, kind?, all_kinds?, send?" "Pay amount (satoshis) on a chain (home, installed or borrowed) from this wallet (from: one of its addresses or an imported wallet's; otherwise the own address with the most), signed here; kind: the address type it's sent from, change back to it (default: from's type, else the one the Wallet shows); all_kinds: also spend the wallet's other address types' coins; send: true broadcasts, otherwise it's only built and shown with its fee (and a warning when the address could be meant for another chain).";
     "wallet.link" Wallet "chain, wif, tag" "Link another wallet to your @tag (signed by both keys).";
     "wallet.unlink" Wallet "chain, address, tag" "Remove a linked wallet.";
     "wallet.links" Read "chain" "Your linked wallets on a chain.";
@@ -268,7 +269,7 @@ cmds! {
     "borrow.status" Read "" "Borrowed coins: the switches, and per chain its lenders, tip, floor, tip mismatch and your balance.";
     "borrow.set" Admin "on, chain?" "Turn borrowing on or off: for every coin (no chain) or for one chain (off removes its borrowed data).";
     "borrow.coins" Read "chain" "Your coins on a borrowed chain (from blocks read since the floor, and the lender's coin scan).";
-    "borrow.send" Local "chain, to, amount, from?, send?" "Pay amount (satoshis) on a borrowed chain, signed here; send: true broadcasts to every lender, otherwise only built and shown.";
+    "borrow.send" Local "chain, to, amount, from?, kind?, all_kinds?, send?" "Pay amount (satoshis) on a borrowed chain, signed here (kind, all_kinds: as wallet.send); send: true broadcasts to every lender, otherwise only built and shown.";
     // Mining
     "mine.start" Admin "threads?" "Mine the home chain: only at the tip (synced with a coin peer, no higher height known); until then it waits and mine.status says why.";
     "mine.stop" Admin "" "Stop mining.";

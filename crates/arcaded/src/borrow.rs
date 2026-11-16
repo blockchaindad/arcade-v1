@@ -90,6 +90,8 @@ pub fn set(node: &Node, chain: Option<&str>, on: bool) -> R {
 pub enum KeySrc {
     /// Home wallet tag slot (m/44'/coin'/0'/0/i).
     Tag(u32),
+    /// Another address kind of a home wallet tag slot (m/49', m/84', m/86').
+    TagKind(u32, arcade_wallet::keys::AddrKind),
     /// An imported key (wallet.link), by its name in the secrets ("<net>/<address>").
     Imported(String),
     /// Watched only here (no key known to this module).
@@ -122,10 +124,18 @@ pub fn watched(node: &Node, p: &ChainParams) -> Vec<Watched> {
     for k in keys {
         let pk = hex::decode(&k.pubkey).ok().and_then(|b| arcade_wallet::secp256k1::PublicKey::from_slice(&b).ok());
         match pk {
-            // Every address of the key: on DigiByte its dgb1... address first, then D...
+            // Every address of the key: on DigiByte its dgb1... address first, then D...; then
+            // the slot's other address kinds (nested and native SegWit, Taproot).
             Some(pk) => {
                 for (a, s) in crate::coinsend::key_scripts(p, &pk) {
                     add(&mut out, Watched { address: a, script: s, key: KeySrc::Tag(k.index) });
+                }
+                for (kd, v) in crate::coinsend::own_addresses(node, p, &k) {
+                    if kd != arcade_wallet::keys::AddrKind::Legacy {
+                        for (a, s) in v {
+                            add(&mut out, Watched { address: a, script: s, key: KeySrc::TagKind(k.index, kd) });
+                        }
+                    }
                 }
                 // DigiDollar coins sit at the key's Taproot output (zero-value outputs).
                 if let Some((a, _, s)) = crate::ddsvc::dd_address(p, &pk) {
@@ -171,6 +181,7 @@ pub fn watched(node: &Node, p: &ChainParams) -> Vec<Watched> {
 fn key_of(node: &Node, p: &ChainParams, src: &KeySrc) -> Option<arcade_wallet::SecretKey> {
     match src {
         KeySrc::Tag(i) => node.app.tag_key(p, *i).ok().map(|x| x.1),
+        KeySrc::TagKind(i, kd) => node.app.kind_keys(p, &[*kd], *i).ok().and_then(|v| v.first().copied()),
         KeySrc::Imported(name) => {
             // An imported wallet (WIF or words) first; else a linked wallet's WIF.
             let addr = name.rsplit('/').next().unwrap_or("");
@@ -1381,40 +1392,42 @@ fn fee_rate(node: &Node, p: &ChainParams) -> u64 {
 
 /// borrow.send: pay `amount` (satoshis) to `to` on a borrowed chain from one of this wallet's
 /// addresses, signed here; with send=false only built and shown. Broadcast to every lender of
-/// the chain (sendrawtransaction) and to its P2P peers we know.
-pub fn send(node: &Node, key: &str, to: &str, amount: u64, from: Option<&str>, broadcast: bool) -> R {
+/// the chain (sendrawtransaction) and to its P2P peers we know. `kind` and `all_kinds` as
+/// wallet.send has them (crate::coinsend::own_spend), for the wallet's own addresses.
+#[allow(clippy::too_many_arguments)]
+pub fn send(node: &Node, key: &str, to: &str, amount: u64, from: Option<&str>, kind: Option<&str>, all_kinds: bool, broadcast: bool) -> R {
     let p = by_key(key).ok_or_else(|| format!("unknown chain {key}"))?;
     if !is_borrowed(p.key) {
         return Err(format!("{} is not borrowed here (installed chains send from the Wallet tab)", p.name));
     }
     let to_script = script_for_address(p, to).ok_or_else(|| format!("{to} is not a {} address", p.name))?;
-    // Key-hash coins can be signed for here: P2PKH, and P2WPKH (BIP143) on SegWit chains. Other
-    // kinds (P2SH-wrapped SegWit imports) can't spend yet.
-    let keyhash = |sc: &[u8]| (sc.len() == 25 && sc[0] == 0x76 && sc[1] == 0xa9) || (sc.len() == 22 && sc[0] == 0 && sc[1] == 20);
-    let w: Vec<Watched> = watched(node, p).into_iter().filter(|x| keyhash(&x.script)).collect();
-    let pick = match from {
-        Some(f) => w.iter().find(|x| x.address == f).cloned().ok_or("that address is not this wallet's, or is a kind that can't be spent here yet")?,
-        None => w.iter().filter(|x| !matches!(x.key, KeySrc::None)).max_by_key(|x| spendable(node, p, &x.script).iter().map(|u| u.value).sum::<u64>()).cloned().ok_or("this wallet has no address on that chain")?,
+    // This wallet's own addresses, any kind (picked by `from`, else the slot with the most).
+    let own = crate::coinsend::own_spend(node, p, from, kind, all_kinds, |sc| Ok(spendable(node, p, sc)))?;
+    let (keys, change, coins, kd, kinds) = match own {
+        Some(o) => (o.keys, o.change, o.coins, Some(o.kind), o.kinds),
+        None => {
+            // An imported or linked wallet picked by its address: its own coins, change back to it.
+            // Key-hash coins (P2PKH, P2WPKH native or in P2SH) of a compressed key can be signed for here.
+            let f = from.unwrap_or_default();
+            let pick = watched(node, p).into_iter().find(|x| x.address == f).ok_or("that address is not this wallet's, or is a kind that can't be spent here yet")?;
+            let sk = key_of(node, p, &pick.key).ok_or("no key for that address here")?;
+            let pk = arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
+            if !["legacy", "p2sh-p2wpkh", "p2wpkh"].iter().any(|k| crate::importsvc::script_for(k, &pk) == pick.script) {
+                return Err("that address is a kind that can't be spent here yet".into());
+            }
+            (vec![sk], (pick.address.clone(), pick.script.clone()), spendable(node, p, &pick.script), None, Vec::new())
+        }
     };
-    let sk = key_of(node, p, &pick.key).ok_or("no key for that address here")?;
-    // Every key-hash address of the same key spends together; change goes to its receiving one.
-    let pk = arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
-    let mine = crate::coinsend::key_scripts(p, &pk);
-    let mut coins = Vec::new();
-    for (_, sc) in mine.iter().filter(|(_, sc)| w.iter().any(|x| &x.script == sc)) {
-        coins.extend(spendable(node, p, sc));
-    }
-    if !mine.iter().any(|(_, sc)| *sc == pick.script) {
-        coins.extend(spendable(node, p, &pick.script));
-    }
     // Coins carrying an inscription stay out (crate::ordsafe), as on a chain kept here.
     let coins = crate::ordsafe::keep_free(node, p, coins);
-    let change = if mine.iter().any(|(_, sc)| *sc == pick.script) { mine[0].1.clone() } else { pick.script.clone() };
     let fp = crate::coinsend::fee_policy(p);
-    let tx = arcade_wallet::tx::build_send_keyhash(p, &to_script, amount, &sk, &coins, &change, fee_rate(node, p), fp.dust, arcade_app::now() as u32)?;
+    let tx = arcade_wallet::tx::build_send_keys(p, &to_script, amount, &keys, &coins, &change.1, fee_rate(node, p), fp.dust, arcade_app::now() as u32)?;
     let ins: u64 = tx.inputs.iter().filter_map(|i| coins.iter().find(|c| c.outpoint == i.prevout).map(|c| c.value)).sum();
     let fee = ins.saturating_sub(tx.outputs.iter().map(|o| o.value).sum());
-    let mut out = json!({"txid": tx.txid.to_hex(), "from": pick.address, "to": to, "amount": amount, "fee": fee, "size": tx.raw.len(), "sent": false});
+    let vsize = (tx.encode_legacy().len() * 3 + tx.raw.len()).div_ceil(4);
+    let mut out = json!({"txid": tx.txid.to_hex(), "from": change.0, "to": to, "amount": amount, "fee": fee, "size": tx.raw.len(), "vsize": vsize, "sent": false,
+                         "kind": kd.map(arcade_wallet::keys::AddrKind::id), "kind_label": kd.map(arcade_wallet::keys::AddrKind::label),
+                         "kinds_spent": crate::coinsend::kinds_spent(&tx, &coins, &kinds)});
     if !broadcast {
         return Ok(out);
     }

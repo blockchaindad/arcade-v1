@@ -116,14 +116,27 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
             }
             // A borrowed copy answers while the installed one catches up.
             let installed = !crate::borrow::is_borrowed(cp.key) && crate::chains::kept(node, cp) && node.chain.addresses_on(cp.chain_no).unwrap_or(false);
+            let multi = arcade_wallet::keys::kinds_for(cp).len() > 1;
+            let pref = crate::coinsend::pref_kind(node, cp);
             Ok(json!(keys.iter().map(|k| {
                 let pk = arcade_wallet::secp256k1::PublicKey::from_slice(&hex::decode(&k.pubkey).unwrap()).unwrap();
                 // Every address of the key (DigiByte: dgb1... to receive, its D... still counted).
                 let scripts = crate::coinsend::key_scripts(cp, &pk);
                 let bal = |sc: &[u8]| if installed { node.chain.balance_for_script(cp.chain_no, sc).ok() } else { crate::borrow::balance(node, cp, sc) };
-                let balance = scripts.iter().map(|(_, sc)| bal(sc)).try_fold(0u64, |a, b| b.map(|x| a + x));
+                let sum = |v: &[(String, Vec<u8>)]| v.iter().map(|(_, sc)| bal(sc)).try_fold(0u64, |a, b| b.map(|x| a + x));
                 // Home chain: coins still waiting in the mempool, spendable already.
                 let pending: u64 = if cp.chain_no == p.chain_no && !crate::borrow::is_borrowed(cp.key) { scripts.iter().flat_map(|(_, sc)| crate::claims::unconfirmed_coins(node, sc)).map(|u| u.value).sum() } else { 0 };
+                // Address types (SegWit chains): each kind's address and coins; `balance` counts them all.
+                let kinds: Vec<Value> = if multi {
+                    crate::coinsend::own_addresses(node, cp, k)
+                        .into_iter()
+                        .map(|(kd, v)| json!({"id": kd.id(), "label": kd.label(), "path": kd.path(cp.bip44_coin_type, k.index),
+                                              "address": v[0].0, "legacy": v.get(1).map(|x| x.0.clone()), "balance": sum(&v)}))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let balance = if kinds.is_empty() { sum(&scripts) } else { kinds.iter().map(|x| x["balance"].as_u64()).try_fold(0u64, |a, b| b.map(|x| a + x)) };
                 json!({"index": k.index, "address": scripts[0].0, "legacy": scripts.get(1).map(|x| x.0.clone()), "pending": pending,
                        // @tags live on the home chain and on ARCADE (running here): there, the tag this address holds on
                        // ARCADE's own ledger, as tag.check reads it (a tag carried over at block 0 was never claimed
@@ -131,7 +144,8 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
                        "tag": if cp.chain_no == p.chain_no { k.tag.clone() } else if crate::arcsvc::runs(cp) {
                            k.tag.clone().or_else(|| arcade_ledger::index::tag_of(&node.chain, cp.chain_no, &scripts[0].0).ok().flatten())
                        } else { None },
-                       "balance": balance, "borrowed": !installed && crate::borrow::is_borrowed(cp.key)})
+                       "balance": balance, "borrowed": !installed && crate::borrow::is_borrowed(cp.key),
+                       "kinds": kinds, "kind": if multi { Some(pref.id()) } else { None }})
             }).collect::<Vec<_>>()))
         }
         "dd.wallet" => crate::ddsvc::wallet(node, s("chain").as_deref()),
@@ -143,9 +157,13 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         "wallet.send" => {
             let amount = req["amount"].as_u64().ok_or("amount required (satoshis)")?;
             crate::coinsend::OWNER_CHANGE_OK.with(|c| c.set(req["owner_changed_ok"] == true));
-            let r = crate::coinsend::send(node, s("chain").as_deref(), &s("to").ok_or("to required")?, amount, s("from").as_deref(), req["send"] == true);
+            let r = crate::coinsend::send(node, s("chain").as_deref(), &s("to").ok_or("to required")?, amount, s("from").as_deref(), s("kind").as_deref(), req["all_kinds"] == true, req["send"] == true);
             crate::coinsend::OWNER_CHANGE_OK.with(|c| c.set(false));
             r
+        }
+        "wallet.addr_kind" => {
+            let cp = crate::chains::find(&s("chain").ok_or("chain required")?).ok_or("unknown chain")?;
+            crate::coinsend::addr_kind(node, cp, s("kind").as_deref())
         }
         "wallet.link" => crate::links::link(node, &s("chain").ok_or("chain required")?, &s("wif").ok_or("wif required")?, &s("tag").ok_or("tag required")?),
         "wallet.unlink" => crate::links::unlink(node, &s("chain").ok_or("chain required")?, &s("address").ok_or("address required")?, &s("tag").ok_or("tag required")?),
@@ -816,7 +834,7 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         "borrow.coins" => crate::borrow::coins(node, &s("chain").ok_or("chain required")?),
         "borrow.send" => {
             let amount = req["amount"].as_u64().ok_or("amount required (satoshis)")?;
-            crate::borrow::send(node, &s("chain").ok_or("chain required")?, &s("to").ok_or("to required")?, amount, s("from").as_deref(), req["send"] == true)
+            crate::borrow::send(node, &s("chain").ok_or("chain required")?, &s("to").ok_or("to required")?, amount, s("from").as_deref(), s("kind").as_deref(), req["all_kinds"] == true, req["send"] == true)
         }
         "events" => {
             let n = req["n"].as_u64().unwrap_or(30).min(2000) as usize;

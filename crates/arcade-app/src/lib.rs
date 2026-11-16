@@ -401,6 +401,17 @@ impl AppDb {
         Ok((rec, x.key))
     }
 
+    /// The keys of tag slot `index` for each of `kinds` (m/<purpose>'/coin'/0'/0/index, the
+    /// chain's own coin type), from one reading of the phrase. Nothing is stored: Legacy's key
+    /// is the tag key, and the others are worked out again when needed.
+    pub fn kind_keys(&self, p: &arcade_wallet::ChainParams, kinds: &[arcade_wallet::keys::AddrKind], index: u32) -> Result<Vec<arcade_wallet::SecretKey>> {
+        let seed = arcade_wallet::keys::seed_from_phrase(&self.phrase()?).map_err(|e| AppError::Other(e.to_string()))?;
+        kinds
+            .iter()
+            .map(|&k| arcade_wallet::keys::kind_key(&seed[..], k, p.bip44_coin_type, index).map(|x| x.key).map_err(|e| AppError::Other(e.to_string())))
+            .collect()
+    }
+
     pub fn tag_keys(&self, chain: u16) -> Result<Vec<TagKey>> {
         self.ascan(TAG_KEYS, &KeyBuf::new().u16(chain).done())?.into_iter().map(|(_, v)| dec(TAG_KEYS, &v)).collect()
     }
