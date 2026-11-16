@@ -1284,7 +1284,9 @@ fn on_ui(node: &Node, from_link: &str, h: &Value) {
             drop(st);
             refresh_nat(node);
             let offer = our_offer(node, None, false);
-            if offer.is_empty() {
+            // With no address of ours (no STUN mapping) the asker can't knock at us, but our knocks at its addresses
+            // open our NAT to it, so answer anyway; only with no address on either side is there no path (ARCADE #5).
+            if offer.is_empty() && parse_addrs(&h["a"]).is_empty() {
                 return;
             }
             let eph = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
@@ -1336,10 +1338,9 @@ fn intro_round(node: &Node) {
     if links.is_empty() || links.len() >= crate::meshsvc::MAX_OUTBOUND || hub(node).is_none() {
         return;
     }
+    // Asked even with no address of ours (an empty offer says so): an arcade with addresses answers, and our knocks
+    // at them open our NAT to it (ARCADE #5).
     let offer = our_offer(node, None, false);
-    if offer.is_empty() {
-        return;
-    }
     let my = me(node);
     let ids: BTreeSet<String> = links.iter().map(|l| l.node_id.clone()).collect();
     let now = now_s();
@@ -1374,7 +1375,7 @@ fn intro_round(node: &Node) {
         st.pend.insert(origin.clone(), Pend { n, eph, we_hi: true, via: via.clone(), at: Instant::now(), cell: None, started: false });
         cool(&mut st, &origin);
         picked += 1;
-        let _ = node.app.event("mesh", &format!("asking {} for an introduction (via {})", short(&origin), short(&via)));
+        let _ = node.app.event("mesh", &format!("asking {} for an introduction (via {}){}", short(&origin), short(&via), if offer.is_empty() { ", with no address of ours" } else { "" }));
     }
 }
 

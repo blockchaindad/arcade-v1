@@ -202,6 +202,8 @@ pub struct Node {
     pub my_sizes: Mutex<BTreeMap<String, serde_json::Value>>,
     /// Sizes other arcades report: node id -> (received at, chains).
     pub mesh_sizes: Mutex<BTreeMap<String, (u64, serde_json::Value)>>,
+    /// `chains.list` made in the background (crate::chains::list_cached).
+    pub list_cache: crate::chains::ListCache,
     /// Chains installed by hand (Chains & Coins), by key.
     pub extra: Mutex<BTreeMap<String, std::sync::Arc<crate::chains::ChainRun>>>,
     /// Weak self-reference so API handlers can start threads that own the node.

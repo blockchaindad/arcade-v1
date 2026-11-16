@@ -76,7 +76,13 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
     if let Some(tag) = req["as"].as_str().filter(|_| cmd.starts_with("ledger.") || cmd.starts_with("a.") || cmd.starts_with("arc.blob_publish")) {
         return crate::arcledger::with_sign_as(Some(tag.to_string()), || dispatch_inner(node, req));
     }
-    dispatch_inner(node, req)
+    let out = dispatch_inner(node, req);
+    // A command that can change a chain or the wallet: chains.list's copy is made again.
+    use crate::commands::Perm;
+    if crate::commands::find(cmd).is_some_and(|c| matches!(c.perm, Perm::Admin | Perm::Wallet | Perm::Local)) && cmd != "ui.link" {
+        crate::chains::list_changed(node);
+    }
+    out
 }
 
 fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
@@ -89,8 +95,10 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         "status" => {
             let tip = node.chain.tip(c).map_err(|e| e.to_string())?;
             use arcade_ledger::index;
-            let tag_count = index::read_tags(&node.chain, c).map(|t| t.len()).unwrap_or(0);
-            let digest = index::names_digest(&node.chain, c).unwrap_or_default();
+            // The tags read once for both the count and the digest.
+            let tags = index::read_tags(&node.chain, c).ok();
+            let tag_count = tags.as_ref().map(|t| t.len()).unwrap_or(0);
+            let digest = tags.as_ref().map(|t| arcade_ledger::tags::digest(t.iter().map(|(n, r)| (n.as_str(), r)))).unwrap_or_default();
             let indexed_to = node.chain.indexed_to(c, "ledger.v1").ok().flatten();
             let tips = node.mesh_tips.lock().unwrap();
             let mesh: Vec<Value> = tips
@@ -134,11 +142,19 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
                 let pk = arcade_wallet::secp256k1::PublicKey::from_slice(&hex::decode(&k.pubkey).unwrap()).unwrap();
                 // Every address of the key (DigiByte: dgb1... to receive, its D... still counted).
                 let scripts = crate::coinsend::key_scripts(cp, &pk);
-                let bal = |sc: &[u8]| if installed { node.chain.balance_for_script(cp.chain_no, sc).ok() } else { crate::borrow::balance(node, cp, sc) };
-                let balance = scripts.iter().map(|(_, sc)| bal(sc)).try_fold(0u64, |a, b| b.map(|x| a + x));
-                // Home chain: coins still waiting in the mempool, spendable already.
-                let pending: u64 = if cp.chain_no == p.chain_no && !crate::borrow::is_borrowed(cp.key) { scripts.iter().flat_map(|(_, sc)| crate::claims::unconfirmed_coins(node, sc)).map(|u| u.value).sum() } else { 0 };
-                json!({"index": k.index, "address": scripts[0].0, "legacy": scripts.get(1).map(|x| x.0.clone()), "pending": pending,
+                // As tx.coins counts them, on any chain with a pool here: confirmed coins less those a waiting
+                // transaction spends, plus waiting outputs to this wallet (ARCADE #15).
+                let sc: Vec<Vec<u8>> = scripts.iter().map(|(_, s)| s.clone()).collect();
+                let f = if installed || crate::borrow::is_borrowed(cp.key) { crate::sitesvc::wallet_figures(node, cp, &sc) } else { None };
+                let balance = f.as_ref().map(|f| f.balance);
+                let waiting: Vec<_> = f.as_ref().map(|f| &f.waiting[..]).unwrap_or_default().iter()
+                    .map(|(id, received, spent)| json!({"txid": id.to_hex(), "received": received, "spent": spent})).collect();
+                json!({"index": k.index, "address": scripts[0].0, "legacy": scripts.get(1).map(|x| x.0.clone()),
+                       // confirmed: the blocks' figure; free: confirmed coins no waiting transaction spends (spendable
+                       // now); pending: waiting outputs arriving (pending_coins of them), spendable already.
+                       "confirmed": f.as_ref().map(|f| f.confirmed), "free": f.as_ref().map(|f| f.free),
+                       "pending": f.as_ref().map_or(0, |f| f.arriving), "pending_coins": f.as_ref().map_or(0, |f| f.arriving_coins),
+                       "waiting": waiting,
                        // @tags live on the home chain and on ARCADE (running here): there, the tag this address holds on
                        // ARCADE's own ledger, as tag.check reads it (a tag carried over at block 0 was never claimed
                        // from this wallet, so the key has none recorded).
@@ -655,7 +671,8 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
             let (known, good, resting) = crate::peerbook::summary(node, p.net);
             Ok(json!({"chain": p.key, "known": known, "working": good, "resting": resting, "good": crate::peerbook::good(node, p.net, 50), "next": node.coin_candidates(p).into_iter().take(10).collect::<Vec<_>>()}))
         }
-        "chains.list" => Ok(crate::chains::list(node)),
+        // From a copy made in the background: never held up by a slow chain.
+        "chains.list" => Ok(crate::chains::list_cached(node)),
         "mesh.overview" => Ok(crate::meshview::overview(node)),
         "chains.sizes" => {
             // Measure now (instead of waiting for the six-hourly pass) and show the result.

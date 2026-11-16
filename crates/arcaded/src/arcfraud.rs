@@ -40,6 +40,8 @@ static INBOX: Mutex<Option<HashMap<u64, (Value, Vec<u8>)>>> = Mutex::new(None);
 static CHECKED: Mutex<BTreeSet<Hash>> = Mutex::new(BTreeSet::new());
 /// Challenges this arcade couldn't answer (said once).
 static UNANSWERED: Mutex<BTreeSet<Hash>> = Mutex::new(BTreeSet::new());
+/// Merge-mined segments left undemanded (logged once each).
+static NOT_DEMANDED: Mutex<BTreeSet<Hash>> = Mutex::new(BTreeSet::new());
 
 // ---------------- the mesh ----------------
 
@@ -262,6 +264,16 @@ fn watch(node: &Node) -> Result<(), String> {
             }
             // A holder that hands out nothing can't be checked against: its leaves are demanded on the chain (§2.4).
             let reachable = holders.iter().any(|peer| ask(peer, json!({"seg": hex::encode(l.id), "kind": "h", "first": 0, "count": 1})).is_some_and(|a| !a.1.is_empty()));
+            // On a merge-mined chain one block can carry different, equally valid AuxPoW (its hash is the same), so a
+            // root that differs from ours isn't a sign of a bad segment until the leaves show it; and an answered
+            // demand silences this arcade for an audit period (ARCADE #11: the JB20B, for Flopcoin 539930). Ask the
+            // holders again next round instead of demanding.
+            if !reachable && p.format.auxpow {
+                if NOT_DEMANDED.lock().unwrap().insert(l.id) {
+                    eprintln!("arc: no holder of the listed {} segment {first}..={last} hands out its leaves; merge-mined, so not demanding them (AuxPoW may differ): asking again later", p.name);
+                }
+                continue;
+            }
             if !reachable {
                 eprintln!("arc: no holder of the listed {} segment {first}..={last} hands out its leaves: demanding them on the chain", p.name);
                 let _ = demand(node, &net, &l.id, 0, 16);

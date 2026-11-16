@@ -448,6 +448,7 @@ fn main() {
         holds: Mutex::new(Default::default()),
         my_sizes: Mutex::new(Default::default()),
         mesh_sizes: Mutex::new(Default::default()),
+        list_cache: Default::default(),
     });
     let _ = node.me.set(Arc::downgrade(&node));
     // Pruned blocks of coins held sealed for Earn ARCADE read back from their sealed copies.

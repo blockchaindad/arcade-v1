@@ -51,6 +51,7 @@
 
   <!-- Wallet -->
   <section id="wallet" class="tab">
+    <p class="msg" id="w-loading">Loading the wallet…</p>
     <div id="w-none" hidden>
       <h1>Wallet</h1>
       <p>Your wallet is a 12-word recovery phrase. It lives on this PC with no password; the phrase is the only backup.</p>
@@ -310,7 +311,7 @@
         <input id="x-q" placeholder="block height or hash, txid, address, @tag…" autocomplete="off" spellcheck="false">
       </label>
     </div>
-    <div id="x-view"></div>
+    <div id="x-view"><div class="x-empty x-loading">Loading the explorer…</div></div>
   </section>
 
   <!-- Chains & Coins (MOCKUP: simulated data and progress) -->
@@ -322,7 +323,7 @@
         <label class="sw"><input type="checkbox" id="c-borrow-on"> Borrow every coin other arcades lend</label>
       </div>
       <p class="opt">Install a chain to keep it on this arcade; nothing is installed unless you do it here. Coins you haven't installed can be borrowed through other arcades' Core nodes: this arcade keeps only their block headers and your own coins, and checks every block it reads. Installing a chain replaces its borrowed copy.</p>
-      <div class="blist" id="c-list"></div>
+      <div class="blist" id="c-list"><p class="msg">Loading chains…</p></div>
       <p class="msg" id="c-bmsg"></p>
     </div>
 
@@ -432,7 +433,7 @@
   <!-- Activity -->
   <section id="activity" class="tab">
     <h1>Activity</h1>
-    <ul class="events" id="a-list"></ul>
+    <ul class="events" id="a-list"><li>Loading…</li></ul>
   </section>
 </main>
 <script src="common.js"></script>

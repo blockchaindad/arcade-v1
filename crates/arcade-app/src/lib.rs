@@ -404,14 +404,21 @@ impl AppDb {
         let k = self.akey(TAG_KEYS, &KeyBuf::new().u16(p.chain_no).u32(index).done());
         let existing: Option<TagKey> =
             self.store.read(|r| Ok(r.get(TAG_KEYS, &k)?))?.map(|v| dec(TAG_KEYS, &v)).transpose()?;
-        let rec = existing.unwrap_or(TagKey {
-            chain: p.chain_no,
-            index,
-            address: arcade_wallet::keys::p2pkh_address(&pk, p.p2pkh_version),
-            pubkey: hex::encode(pk.serialize()),
-            tag: None,
-        });
-        self.store.write(|w| w.put(TAG_KEYS, &k, &enc(&rec)))?;
+        // Written down once: a write on every call waited behind any other write to this file.
+        let rec = match existing {
+            Some(rec) => rec,
+            None => {
+                let rec = TagKey {
+                    chain: p.chain_no,
+                    index,
+                    address: arcade_wallet::keys::p2pkh_address(&pk, p.p2pkh_version),
+                    pubkey: hex::encode(pk.serialize()),
+                    tag: None,
+                };
+                self.store.write(|w| w.put(TAG_KEYS, &k, &enc(&rec)))?;
+                rec
+            }
+        };
         Ok((rec, x.key))
     }
 
