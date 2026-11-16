@@ -836,7 +836,7 @@ fn memo_of(id: &str) -> Vec<u8> {
 }
 
 /// A transaction in a block on ARCADE (None while it waits, or if there's no such one).
-fn confirmed_tx(node: &Node, txid: &arcade_chain::hash::Hash256) -> Option<arcade_chain::Tx> {
+pub(crate) fn confirmed_tx(node: &Node, txid: &arcade_chain::hash::Hash256) -> Option<arcade_chain::Tx> {
     let p = crate::arcledger::chain().ok()?;
     if let Ok(Some((raw, _))) = node.chain.tx_raw(p, txid) {
         return arcade_chain::Tx::parse_with(&raw, &p.format).ok();
