@@ -152,14 +152,14 @@ pub fn list(node: &Node, p: &ChainParams, req: &Value) -> Result<Value, String> 
     let q = req["q"].as_str().unwrap_or("").trim().to_lowercase();
     let all = req["status"] == "all";
     let source = req["source"].as_str().unwrap_or("all");
-    if !matches!(source, "all" | "registry" | "known") {
-        return Err(format!("source is all, registry or known, not {source}"));
+    if !matches!(source, "all" | "registry" | "known" | "list") {
+        return Err(format!("source is all, registry, known or list, not {source}"));
     }
     let mut rows: Vec<Value> = Vec::new();
-    if source != "known" {
+    if matches!(source, "all" | "registry") {
         rows.extend(collreg::roots(&node.chain, p.chain_no).iter().filter(|(_, v)| all || v["status"] == "active").map(|(n, v)| root_row(*n, v)));
     }
-    if source != "registry" {
+    if matches!(source, "all" | "known") {
         rows.extend(crate::knowncoll::lines(node, p.chain_no).iter().map(|v| known_row(p, v)));
     }
     rows.retain(|r| q.is_empty() || r["name"].as_str().unwrap_or("").to_lowercase().contains(&q) || r["id"].as_str().is_some_and(|i| i.to_lowercase().starts_with(&q)));
@@ -175,8 +175,16 @@ pub fn list(node: &Node, p: &ChainParams, req: &Value) -> Result<Value, String> 
         "newest" => rows.sort_by(|a, b| when(b).cmp(&when(a))),
         s => return Err(format!("sort is newest, oldest, name, size or holders, not {s}")),
     }
-    if source != "known" && (q.is_empty() || "sub 1k".contains(&q) || q == collreg::SUB1K) {
+    if matches!(source, "all" | "registry") && (q.is_empty() || "sub 1k".contains(&q) || q == collreg::SUB1K) {
         rows.insert(0, sub1k_row(node, p));
+    }
+    // The operator's own lists come first (crate::oplist), by name.
+    if matches!(source, "all" | "list") {
+        let mut lists: Vec<Value> = crate::oplist::lines(node, p.chain_no).iter().map(|v| crate::oplist::row(v, p.key)).collect();
+        lists.retain(|r| q.is_empty() || r["name"].as_str().unwrap_or("").to_lowercase().contains(&q) || r["id"].as_str().is_some_and(|i| i.to_lowercase().starts_with(&q)));
+        lists.sort_by(|a, b| name(a).cmp(&name(b)));
+        lists.append(&mut rows);
+        rows = lists;
     }
     let total = rows.len();
     let off = req["offset"].as_u64().unwrap_or(0) as usize;
@@ -193,9 +201,12 @@ pub fn get(node: &Node, p: &ChainParams, req: &Value) -> Result<Value, String> {
     if let Some(slug) = req["slug"].as_str() {
         return get_known(node, p, slug.trim(), req);
     }
-    let id = req["id"].as_str().ok_or("give a collection's id (its root inscription, or sub1k), or a known collection's slug")?.trim();
+    let id = req["id"].as_str().ok_or("give a collection's id (its root inscription, sub1k or list:<slug>), or a known collection's slug")?.trim();
     let off = req["offset"].as_u64().unwrap_or(0);
     let n = req["n"].as_u64().unwrap_or(collreg::PAGE as u64).clamp(1, 96);
+    if let Some(slug) = id.strip_prefix(crate::oplist::PREFIX) {
+        return crate::oplist::get(node, p, slug, off, n as usize);
+    }
     let c = p.chain_no;
     if id.eq_ignore_ascii_case(collreg::SUB1K) {
         let mut v = sub1k_row(node, p);
@@ -277,6 +288,10 @@ pub fn of(node: &Node, p: &ChainParams, req: &Value) -> Result<Value, String> {
     let c = p.chain_no;
     let iid = ord::resolve(&node.chain, c, id.trim()).ok_or_else(|| format!("no inscription {id} on {}", p.name))?;
     let mut ins = Vec::new();
+    if let Some((slug, num)) = crate::oplist::of(node, c, &iid) {
+        let name = crate::oplist::line(node, c, &slug).map(|l| l["name"].clone()).unwrap_or(json!(slug));
+        ins.push(json!({"kind": "list", "id": format!("{}{slug}", crate::oplist::PREFIX), "slug": slug, "name": name, "number": num}));
+    }
     if let Some((rn, num)) = collreg::of(&node.chain, c, &iid) {
         if let Some(v) = collreg::roots(&node.chain, c).into_iter().find(|r| r.0 == rn).map(|r| r.1) {
             ins.push(json!({"kind": "registry", "id": v["id"], "name": v["name"], "number": num}));

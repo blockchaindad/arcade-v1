@@ -544,7 +544,29 @@
     const known = r.known ? h("p", { class: "x-note" }, h("label", {}, h("input", { type: "checkbox", checked: r.known.asks_nintondo, onchange: async (ev) => {
         try { await api("collections.known_set", { on: ev.target.checked }); } catch (e) { alert(e.message); } render(); } }),
       " Ask Nintondo for its known collections (the list once a day; a collection's pieces when it is opened)"), r.known.note ? ` · ${r.known.note}` : "") : "";
-    return sect(`Collections · ${fmt(r.total)}`, null, h("div", {}, sorts, note, known, pager(r.total, size, page, "collections"), grid, pager(r.total, size, page, "collections")));
+    // An operator list: a collection added from a list file (OW.json, a doggy.market trait file, or [{id, number, traits}]),
+    // nothing inscribed; shared on the mesh with its fingerprint.
+    const lname = h("input", { type: "text", placeholder: "Name, e.g. Anti Doginal Dogs", maxlength: 80 });
+    const lfile = h("input", { type: "file", accept: ".json,application/json" });
+    const addList = h("details", { class: "x-note" }, h("summary", {}, "Add a collection from a list file (operator)"),
+      h("p", { class: "faint" }, "Nothing is inscribed: the list joins this arcade's collections index and is shared on the mesh with its fingerprint. Other operators can keep a copy."),
+      h("div", {}, lname, " ", lfile, " ", h("button", { type: "button", class: "chip-btn", onclick: async (ev) => {
+        const f = lfile.files[0];
+        if (!lname.value.trim() || !f) { alert("Give the list a name and choose its file."); return; }
+        ev.target.disabled = true;
+        try { const v = await api("collections.list_add", { chain: chain.key, name: lname.value.trim(), file: await f.text() }); go("collection", `list:${v.slug}`); }
+        catch (e) { alert(e.message); ev.target.disabled = false; }
+      } }, "Add")));
+    return sect(`Collections · ${fmt(r.total)}`, null, h("div", {}, sorts, note, known, addList, pager(r.total, size, page, "collections"), grid, pager(r.total, size, page, "collections")));
+  }
+  /** A button on an operator list's page: keep a copy here, or remove it. */
+  function listBtn(label, cmd, c) {
+    return h("button", { type: "button", class: "chip-btn", onclick: async (ev) => {
+      if (cmd === "collections.list_remove" && !confirm(`Remove the list ${c.name} from this arcade?`)) return;
+      ev.target.disabled = true; ev.target.textContent = cmd === "collections.list_copy" ? "Copying…" : "Removing…";
+      try { await api(cmd, { chain: chain.key, slug: c.slug }); cmd === "collections.list_remove" ? go("collections", null) : render(); }
+      catch (e) { alert(e.message); ev.target.disabled = false; ev.target.textContent = label; }
+    } }, label);
   }
   async function vCollection() {
     // The arg is the collection's id, with "|p<n>" for a page of its items past the first.
@@ -560,12 +582,15 @@
       : h("div", { class: "x-empty" }, c.loading ? (c.loading.state === "skipped" ? `Not kept: ${c.loading.why}` : !c.loading.asks_nintondo ? "Not held here: this arcade doesn't ask Nintondo (switch it on in the Collections list)."
           : `Loading from Nintondo: ${fmt(c.loading.have || 0)} of ${fmt(c.loading.of || 0)} pieces so far. Come back in a moment.`) : "No items on this page.");
     const status = c.status !== "active" ? pill(c.status, false) : "";
-    return h("div", {}, crumbs(link("Collections", "collections"), c.name), head(c.name, status, h("span", { class: "chip" }, c.kind === "sub1k" ? "built in" : c.kind === "known" ? "Nintondo's list" : "on the chain")),
+    return h("div", {}, crumbs(link("Collections", "collections"), c.name), head(c.name, status, h("span", { class: "chip" }, c.kind === "sub1k" ? "built in" : c.kind === "list" ? "operator's list" : c.kind === "known" ? "Nintondo's list" : "on the chain")),
       kv([c.description && ["About", c.description], ["Items", c.kind === "known" ? `${fmt(c.count || 0)} held · ${fmt(c.supply)} listed` : `${fmt(c.count)} of ${fmt(c.supply)}${c.missing ? ` · ${fmt(c.missing)} numbers not listed` : ""}`],
         c.kind === "known" && c.owners != null && ["Holders", fmt(c.owners)], c.kind === "known" && c.fp && ["Fingerprint", h("span", { class: "mono" }, short(c.fp, 12, 6))],
         c.kind === "registry" && ["Published by", c.publisher ? addrLink(c.publisher) : "—"], c.kind === "registry" && ["Root", link(`inscription #${fmt(c.number)}`, "inscription", c.id)],
         c.height != null && ["Block", link(fmt(c.height), "block", String(c.height))], c.replaces && ["Replaces", link(short(c.replaces, 12, 6), "collection", c.replaces, "mono")],
-        (c.traits || []).length && ["Traits", c.traits.join(", ")], c.reason && ["Why", c.reason]]),
+        (c.traits || []).length && ["Traits", c.traits.join(", ")], c.reason && ["Why", c.reason],
+        c.kind === "list" && ["Fingerprint", h("span", { class: "mono", title: c.fp }, short(c.fp || "", 12, 6))],
+        c.kind === "list" && ["Kept", c._mesh ? h("span", {}, "by another arcade · ", listBtn("Keep a copy here", "collections.list_copy", c))
+          : h("span", {}, c.from === "mesh" ? "here, copied from the mesh · " : "here, from a list file · ", listBtn("Remove", "collections.list_remove", c))]]),
       cpager(), items, cpager());
   }
   let lastResults = null;

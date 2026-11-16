@@ -321,6 +321,15 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         "dogefeed.act" => crate::dproto::act(node, req),
         "dogefeed.registrars_add" | "dogefeed.registrars_remove" => crate::dproto::registrars_edit(node, req["cmd"].as_str().unwrap_or(""), req),
         "collections.known_set" => crate::knowncoll::set(node, req["on"] == true),
+        "collections.list_add" | "collections.list_remove" | "collections.list_copy" => {
+            let key = s("chain").ok_or("chain required")?;
+            let p = crate::chains::find(&key).ok_or_else(|| format!("unknown chain {key}"))?;
+            match req["cmd"].as_str().unwrap_or("") {
+                "collections.list_add" => crate::oplist::add(node, p, req),
+                "collections.list_remove" => crate::oplist::remove(node, p, &s("slug").ok_or("slug required")?),
+                _ => crate::oplist::copy(node, p, &s("slug").ok_or("slug required")?),
+            }
+        }
         "realtime.lanes" => crate::realtime::fast::lanes(node, &s("token").ok_or("token required")?),
         "ring.send" => crate::ringsvc::send(node, &s("page").ok_or("page required")?, &s("to").unwrap_or_default(), &s("line").unwrap_or_default(), &s("link").unwrap_or_default()),
         "ring.waiting" => Ok(crate::ringsvc::waiting(node)),
