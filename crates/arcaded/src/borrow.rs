@@ -14,11 +14,13 @@
 //! on trust; with several lenders their tips are compared and a disagreement is shown.
 //!
 //! How far a borrowed chain's blocks rest on more than one lender's word is shown as a colour
-//! (`trust`): green when lenders on AGREE or more different hosts name the same blocks, yellow
-//! with one lender host (everything still works on its word), grey with none, red on a problem
-//! (hosts naming different blocks, or a block far easier than the
-//! chain's recent difficulty, `too_cheap`). Where hosts name different blocks, the one most of
-//! them name is followed. Nothing waits for a second lender.
+//! (`trust`): green when lenders on AGREE or more different hosts named the block this arcade
+//! follows when they were last compared (AGREE_FRESH), yellow with one lender host or before
+//! lenders are compared (everything still works on one lender's word), grey with none, red on
+//! a problem (hosts naming different blocks, or another block than ours, or a block far easier
+//! than the chain's recent difficulty, `too_cheap`). Red is shown only: the chain keeps
+//! following its own blocks, and a real reorganisation comes in block by block (MAX_REORG).
+//! Nothing waits for a second lender.
 //!
 //! An installed chain (Chains & Coins) takes over once it is ready (caught up, its address
 //! rows built); until then its borrowed copy keeps running and answers balances and sends.
@@ -59,8 +61,15 @@ const SCAN_RETRY: u64 = 300;
 const AGREE: usize = 2;
 /// Most lenders asked when looking for agreement.
 const AGREE_ASK: usize = 8;
-/// Lenders are compared at most this often per chain (each look asks every lender).
+/// Lenders are compared at most this often per chain (each look asks one lender per host); the
+/// last answer is used in between.
 const AGREE_AGAIN: u64 = 60;
+/// Green needs lenders on AGREE+ hosts to have named our block at least this recently.
+const AGREE_FRESH: u64 = 900;
+/// A lender's host name, looked up for counting lenders by address, is kept this long.
+const RESOLVE_KEEP: u64 = 600;
+/// Most block hashes asked of a lender in one call when comparing (coin scans).
+const AGREE_BATCH: usize = 100;
 /// A chain stays red this long after hosts last named different blocks or told tips far apart
 /// (so one lender a few blocks behind for a moment doesn't turn it red and back each round).
 const RED_HOLD: u64 = 600;
@@ -253,8 +262,10 @@ struct State {
     scan_no: Mutex<BTreeMap<(String, String), u64>>,
     /// lender node id -> the nets we last asked it to push, over its mesh link (crvia)
     subbed_via: Mutex<BTreeMap<String, BTreeSet<String>>>,
-    /// chain key -> when lenders were last asked to agree on a block
-    agree_at: Mutex<BTreeMap<String, u64>>,
+    /// chain key -> what lenders last named a few blocks under their tips (`agree_now`)
+    agreed: Mutex<BTreeMap<String, Agreement>>,
+    /// lender host name -> (when looked up, its address), for counting lenders by address
+    resolved: Mutex<BTreeMap<String, (u64, Option<std::net::IpAddr>)>>,
 }
 
 static ST: LazyLock<State> = LazyLock::new(State::default);
@@ -529,41 +540,96 @@ fn call_any(node: &Node, p: &ChainParams, calls: Value) -> Result<(String, Vec<V
 
 // ---------------- agreement between lenders ----------------
 
-/// The host a lender is reached at, for counting lenders that agree: arcades on one host (or
-/// one IPv6 /64) count once, whatever node ids and ports they use. A lender over its mesh link
-/// counts by the address of that link, not by what its offer says.
-fn lender_host(node: &Node, lender: &str) -> String {
-    match crate::crvia::peer_of(lender) {
-        Some(id) => node.links.lock().unwrap().values().find(|x| x.node_id == id).map(|x| host_of(&x.addr)).unwrap_or_else(|| format!("node {id}")),
-        None => host_of(lender),
-    }
-}
-
-fn host_of(addr: &str) -> String {
+/// The host part of an address: "host:port", "[v6]:port" or a bare host.
+fn host_part(addr: &str) -> &str {
     let h = match addr.rsplit_once(':') {
         Some((h, port)) if port.parse::<u16>().is_ok() && (!h.contains(':') || h.starts_with('[')) => h,
         _ => addr,
     };
-    let h = h.trim_start_matches('[').trim_end_matches(']');
-    match h.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V6(v6)) => {
+    h.trim_start_matches('[').trim_end_matches(']')
+}
+
+/// Lenders are counted by IPv4 /24 and IPv6 /64: machines one operator runs side by side in one
+/// block of addresses count once.
+fn ip_bucket(ip: std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            format!("{}.{}.{}.0/24", o[0], o[1], o[2])
+        }
+        std::net::IpAddr::V6(v6) => {
             let s = v6.segments();
             format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
         }
-        Ok(ip) => ip.to_string(),
-        Err(_) => h.to_ascii_lowercase(),
     }
+}
+
+/// An address's bucket (`ip_bucket`). A name is looked up first (kept RESOLVE_KEEP seconds), so
+/// several names for one machine count once. None when it has no address.
+fn bucket(addr: &str) -> Option<String> {
+    let h = host_part(addr);
+    if h.is_empty() {
+        return None;
+    }
+    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+        return Some(ip_bucket(ip));
+    }
+    let name = h.to_ascii_lowercase();
+    let now = arcade_app::now();
+    if let Some((at, ip)) = ST.resolved.lock().unwrap().get(&name).copied() {
+        if now < at + RESOLVE_KEEP {
+            return ip.map(ip_bucket);
+        }
+    }
+    use std::net::ToSocketAddrs;
+    let ip = (name.as_str(), 0u16).to_socket_addrs().ok().and_then(|mut a| a.next()).map(|a| a.ip());
+    ST.resolved.lock().unwrap().insert(name, (now, ip));
+    ip.map(ip_bucket)
+}
+
+/// Lenders with the host each counts as: one over its mesh link by the remote address of that
+/// link, one dialled directly by the address it is dialled at. An arcade offered both ways
+/// counts as one host (the first listed); a lender with no address is left out.
+fn lender_host_list(node: &Node, p: &ChainParams, ls: &[String]) -> Vec<(String, String)> {
+    let ids: BTreeMap<String, String> = node.offers_for(p.key).into_iter().map(|(id, addr, _, _)| (addr, id)).collect();
+    let links: Vec<(String, String)> = node.links.lock().unwrap().values().map(|x| (x.node_id.clone(), x.addr.clone())).collect();
+    let mut of_node: BTreeMap<String, String> = BTreeMap::new();
+    let mut out = Vec::new();
+    for l in ls {
+        let (id, addr) = match crate::crvia::peer_of(l) {
+            Some(id) => match links.iter().find(|x| x.0 == id) {
+                Some(x) => (Some(id.to_string()), x.1.clone()),
+                None => continue,
+            },
+            None => (ids.get(l).cloned(), l.clone()),
+        };
+        let Some(host) = bucket(&addr) else { continue };
+        let host = match id {
+            Some(id) => of_node.entry(id).or_insert(host).clone(),
+            None => host,
+        };
+        out.push((l.clone(), host));
+    }
+    out
 }
 
 /// Lenders of a chain on different hosts.
 fn lender_hosts(node: &Node, p: &ChainParams) -> usize {
-    lenders(node, p).iter().map(|l| lender_host(node, l)).collect::<BTreeSet<_>>().len()
+    lender_host_list(node, p, &lenders(node, p)).into_iter().map(|x| x.1).collect::<BTreeSet<_>>().len()
 }
 
-/// What lenders named as the block at `height`: (host, hash) per lender that answered.
-#[derive(Debug)]
+/// One lender on each host, up to AGREE_ASK hosts: (lender, host).
+fn one_per_host(node: &Node, p: &ChainParams) -> Vec<(String, String)> {
+    let mut seen = BTreeSet::new();
+    lender_host_list(node, p, &lenders(node, p)).into_iter().filter(|x| seen.insert(x.1.clone())).take(AGREE_ASK).collect()
+}
+
+/// What lenders named as the block at `height` (asked at `at`): (host, hash) per lender that
+/// answered.
+#[derive(Debug, Clone)]
 struct Agreement {
     height: u32,
+    at: u64,
     answers: Vec<(String, Hash256)>,
 }
 
@@ -613,10 +679,31 @@ fn agree_height(tips: &[(String, u32)]) -> Option<u32> {
     Some(t.saturating_sub(FLOOR_DEPTH))
 }
 
-/// Ask each lender (on up to AGREE_ASK lenders) for the block at `height`, or, with None, at
-/// the height `agree_height` picks from their tips.
+/// What each of `ls` (one lender per host) names as the blocks at `heights`, AGREE_BATCH hashes a
+/// call.
+fn named_at(node: &Node, p: &ChainParams, ls: &[(String, String)], heights: &[u32]) -> BTreeMap<u32, Agreement> {
+    let now = arcade_app::now();
+    let mut out: BTreeMap<u32, Agreement> = heights.iter().map(|h| (*h, Agreement { height: *h, at: now, answers: Vec::new() })).collect();
+    for (l, host) in ls {
+        for chunk in heights.chunks(AGREE_BATCH.min(crate::coreshare::MAX_CALLS)) {
+            let calls: Vec<Value> = chunk.iter().map(|h| json!(["getblockhash", [h]])).collect();
+            let Ok(a) = call(node, l, p, Value::Array(calls)) else { break };
+            for (h, v) in chunk.iter().zip(a.iter()) {
+                if let Some(hash) = r(v).ok().and_then(|v| v.as_str().and_then(|s| Hash256::from_hex(s).ok())) {
+                    if let Some(x) = out.get_mut(h) {
+                        x.answers.push((host.clone(), hash));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Ask one lender on each host (up to AGREE_ASK hosts) for the block at `height`, or, with None,
+/// at the height `agree_height` picks from their tips.
 fn agree(node: &Node, p: &ChainParams, height: Option<u32>) -> Result<Agreement, String> {
-    let ls: Vec<String> = lenders(node, p).into_iter().take(AGREE_ASK).collect();
+    let ls = one_per_host(node, p);
     if ls.is_empty() {
         return Err(format!("no arcade on the mesh lends {} right now", p.name));
     }
@@ -624,44 +711,38 @@ fn agree(node: &Node, p: &ChainParams, height: Option<u32>) -> Result<Agreement,
         Some(h) => h,
         None => {
             let mut tips = Vec::new();
-            for l in &ls {
+            for (l, host) in &ls {
                 if let Some(t) = call(node, l, p, json!([["getblockcount", []]])).ok().and_then(|a| r(&a[0]).ok().and_then(|v| v.as_u64())) {
                     note_tip(p.key, l, t);
-                    tips.push((lender_host(node, l), t as u32));
+                    tips.push((host.clone(), t as u32));
                 }
             }
             agree_height(&tips).ok_or_else(|| format!("no lender of {} told its tip", p.name))?
         }
     };
-    let mut answers = Vec::new();
-    for l in &ls {
-        let a = call(node, l, p, json!([["getblockhash", [height]]])).ok();
-        if let Some(h) = a.and_then(|a| r(&a[0]).ok().and_then(|v| v.as_str().and_then(|s| Hash256::from_hex(s).ok()))) {
-            answers.push((lender_host(node, l), h));
-        }
-    }
-    Ok(Agreement { height, answers })
+    named_at(node, p, &ls, &[height]).remove(&height).ok_or_else(|| "no answer".to_string())
 }
 
-/// `agree`, at most once per AGREE_AGAIN seconds per chain (None: asked too lately).
-fn agree_now(node: &Node, p: &ChainParams, height: Option<u32>) -> Option<Result<Agreement, String>> {
+/// What lenders named a few blocks under their tips (`agree`), asked at most once per
+/// AGREE_AGAIN seconds per chain; in between the last answer (a failed look counts as one with
+/// no answers, so lenders that don't answer aren't asked every round).
+fn agree_now(node: &Node, p: &ChainParams) -> Result<Agreement, String> {
     let now = arcade_app::now();
-    {
-        let mut at = ST.agree_at.lock().unwrap();
-        if at.get(p.key).is_some_and(|t| now < t + AGREE_AGAIN) {
-            return None;
-        }
-        at.insert(p.key.to_string(), now);
+    if let Some(a) = ST.agreed.lock().unwrap().get(p.key).filter(|a| now < a.at + AGREE_AGAIN).cloned() {
+        return Ok(a);
     }
-    Some(agree(node, p, height))
+    let a = agree(node, p, None);
+    let keep = a.clone().unwrap_or(Agreement { height: 0, at: now, answers: Vec::new() });
+    ST.agreed.lock().unwrap().insert(p.key.to_string(), keep);
+    a
 }
 
 // ---------------- trust ----------------
 //
 // Kept under "borrow/<key>/trust", beside the floor's state (a new floor keeps it):
 //   trust, note               the level shown (green, yellow, grey, red) and its sentence
-//   base                      green or yellow: whether AGREE+ hosts named our block when lenders
-//                             were last compared
+//   agreed_at, agreed_hosts   when lenders on AGREE+ hosts last named our block as one, and how
+//                             many hosts
 //   cheap_from, ok_run        the first block far easier than the reference, and the blocks in
 //                             a row since that met it
 //   split_seen, split_note    when hosts last named different blocks, and where
@@ -698,22 +779,44 @@ fn trust_block(rec: &mut Value, height: u32, cheap: bool) -> bool {
     true
 }
 
-/// Lenders were compared at a block (a new floor, or one of ours): the base level, and a split
-/// when hosts named different blocks. AGREE+ hosts naming it as one, at or above a far easier
-/// block, end that block's mark (true: the reference should start again from our tip).
-fn trust_compared(rec: &mut Value, pk: &Pick, name: &str, now: u64) -> bool {
-    rec["base"] = json!(if pk.hosts >= AGREE { "green" } else { "yellow" });
-    if pk.split {
-        rec["split_seen"] = json!(now);
-        rec["split_note"] = json!(format!("Lenders of {name} name different blocks at height {}; following the one most of them name.", pk.height));
+/// Lenders were compared at a block (`pk`, asked at `at`; `ours`: the block this arcade keeps
+/// there, if any). Hosts naming different blocks, or one other than ours, mark the chain red
+/// (shown only: it keeps following its own blocks). AGREE+ hosts naming ours as one make it green
+/// for AGREE_FRESH; at or above a far easier block they end that block's mark (true: the
+/// reference should start again from our tip).
+fn trust_compared(rec: &mut Value, pk: &Pick, ours: Option<Hash256>, name: &str, at: u64) -> bool {
+    if pk.split || ours.is_some_and(|o| o != pk.hash) {
+        rec["split_seen"] = json!(at);
+        rec["split_note"] = json!(if pk.split {
+            format!("Lenders of {name} name different blocks at height {}.", pk.height)
+        } else {
+            format!("Lenders of {name} name another block at height {} than the one this arcade follows.", pk.height)
+        });
         return false;
     }
-    if pk.hosts >= AGREE && rec["cheap_from"].as_u64().is_some_and(|c| c <= pk.height as u64) {
+    if pk.hosts < AGREE {
+        return false;
+    }
+    rec["agreed_at"] = json!(at);
+    rec["agreed_hosts"] = json!(pk.hosts);
+    if rec["cheap_from"].as_u64().is_some_and(|c| c <= pk.height as u64) {
         rec["cheap_from"] = Value::Null;
         rec["ok_run"] = json!(0);
         return true;
     }
     false
+}
+
+fn note_none(name: &str) -> String {
+    format!("No arcade lends {name} right now.")
+}
+
+fn note_one() -> String {
+    "One lender vouches for these blocks: take care with payments until a second one agrees.".to_string()
+}
+
+fn note_unchecked(hosts: usize) -> String {
+    format!("Lenders on {hosts} hosts, their blocks not compared lately: take care with payments until they agree.")
 }
 
 /// The level now, from the record, the lender hosts reachable (`own_rules`: the chain's blocks
@@ -725,24 +828,30 @@ fn trust_level(rec: &mut Value, hosts: usize, own_rules: bool, tips_note: Option
         rec["tips_note"] = json!(t);
     }
     let recent = |k: &str| rec[k].as_u64().is_some_and(|t| now < t + RED_HOLD);
-    let (level, note) = if let Some(h) = rec["cheap_from"].as_u64() {
-        ("red", format!("Block {h} came in far easier than {name}'s recent difficulty: payments from block {h} on may not be real."))
+    // Hosts that named our block as one when lenders were last compared, if lately enough.
+    let agreed = if rec["agreed_at"].as_u64().is_some_and(|t| now < t + AGREE_FRESH) { (rec["agreed_hosts"].as_u64().unwrap_or(0) as usize).min(hosts) } else { 0 };
+    let (level, note, shown) = if let Some(h) = rec["cheap_from"].as_u64() {
+        ("red", format!("Block {h} came in far easier than {name}'s recent difficulty: payments from block {h} on may not be real."), hosts)
     } else if recent("split_seen") {
-        ("red", rec["split_note"].as_str().unwrap_or("Lenders name different blocks.").to_string())
+        ("red", rec["split_note"].as_str().unwrap_or("Lenders name different blocks.").to_string(), hosts)
     } else if hosts == 0 {
-        ("grey", format!("No arcade lends {name} right now."))
+        ("grey", note_none(name), 0)
     } else if recent("tips_seen") {
         // A lender a few blocks behind is usually only catching up: caution, not an alarm.
-        ("yellow", format!("Lenders of {name} are at different heights ({}): take care with the newest payments.", rec["tips_note"].as_str().unwrap_or("")))
-    } else if own_rules || hosts >= AGREE {
-        // Two or more lender hosts: green (any disagreement seen between them makes it red above).
-        ("green", if own_rules { "Every block is checked against the chain's own headers.".to_string() } else { format!("{hosts} lender hosts vouch for these blocks.") })
+        ("yellow", format!("Lenders of {name} are at different heights ({}): take care with the newest payments.", rec["tips_note"].as_str().unwrap_or("")), hosts)
+    } else if own_rules {
+        ("green", "Every block is checked against the chain's own headers.".to_string(), hosts)
+    } else if agreed >= AGREE {
+        // Green only once lenders on two or more hosts named our block as one, lately.
+        ("green", format!("{agreed} lender hosts named the same blocks as this arcade when last compared."), agreed)
+    } else if hosts >= AGREE {
+        ("yellow", note_unchecked(hosts), hosts)
     } else {
-        ("yellow", "One lender vouches for these blocks: take care with payments until a second one agrees.".to_string())
+        ("yellow", note_one(), hosts)
     };
     let was_red = rec["trust"] == "red";
-    // How many lender hosts vouch now (shown in the dot); no event of its own.
-    rec["hosts"] = json!(hosts);
+    // How many lender hosts vouch (shown in the dot; when green, those that agreed); no event.
+    rec["hosts"] = json!(shown);
     rec["trust"] = json!(level);
     rec["note"] = json!(note);
     match (was_red, level == "red") {
@@ -1330,7 +1439,7 @@ fn step(node: &Node, p: &'static ChainParams, watch: &HashSet<Vec<u8>>, run: &Ru
     };
     // Start again at a block: its header and the wallet's coins from there on; `pk`, how the
     // lenders named it, goes into the chain's level.
-    let floor_at = |why: &str, height: u32, hash: Hash256, pk: Option<Pick>| -> Result<bool, String> {
+    let floor_at = |why: &str, height: u32, hash: Hash256, pk: Option<(Pick, u64)>| -> Result<bool, String> {
         set(format!("Borrowed · starting at block {height} ({why})"));
         let (b, h, _) = fetch_checked(node, p, &hash)?;
         if h != height {
@@ -1338,51 +1447,54 @@ fn step(node: &Node, p: &'static ChainParams, watch: &HashSet<Vec<u8>>, run: &Ru
         }
         clear_chain_rows(node, key);
         connect(node, p, h, &b, watch, Add::Floor)?;
-        if let Some(pk) = pk {
+        if let Some((pk, at)) = pk {
             let mut rec = trust_rec(node, key);
             rec["cheap_from"] = Value::Null;
             rec["ok_run"] = json!(0);
-            trust_compared(&mut rec, &pk, p.name, arcade_app::now());
+            trust_compared(&mut rec, &pk, Some(pk.hash), p.name, at);
             put_trust(node, key, &rec);
         }
         let _ = node.app.event("borrow", &format!("{}: borrowing from block {h} on (older coins come from the lender's coin scan)", p.name));
         Ok(true)
     };
-    // A new floor now. On the ARCADE chain where its checked headers are; elsewhere the block
-    // most lender hosts name (one host's word when it is the only one: the chain shows yellow;
-    // hosts naming different blocks: red).
+    // A new floor now (first start). On the ARCADE chain where its checked headers are; elsewhere
+    // the block most lender hosts name (one host's word when it is the only one: the chain shows
+    // yellow; hosts naming different blocks: red). Lenders are asked at most every AGREE_AGAIN.
     let start_floor = |why: &str| -> Result<bool, String> {
         if arc {
             return floor_at(why, their, hash_at(node, p, None, their)?, None);
         }
-        let ag = agree(node, p, None)?;
-        let pk = ag.pick(stored_header(node, p, ag.height).map(|x| x.0)).ok_or_else(|| format!("no lender of {} named its block {}", p.name, ag.height))?;
-        floor_at(why, pk.height, pk.hash, Some(pk))
+        let ag = agree_now(node, p)?;
+        let pk = ag.pick(None).ok_or_else(|| format!("no lender of {} named its block {}", p.name, ag.height))?;
+        floor_at(why, pk.height, pk.hash, Some((pk, ag.at)))
     };
     let Some(tip) = tip else { return start_floor("first start") };
-    // Now and then, with lenders on several hosts or when far behind: the block lender hosts name
-    // a few blocks under their tips. The one most of them name is followed (a tie keeps ours);
-    // far behind, borrowing starts again there; otherwise (one claiming a tip the others don't
-    // have, or not asked this round) it reads on from our tip.
-    let looked = if !arc && (lender_hosts(node, p) >= AGREE || their.saturating_sub(tip) > MAX_GAP) { agree_now(node, p, None).and_then(|x| x.ok()) } else { None };
+    // With lenders on several hosts, or far behind: the block lender hosts name a few blocks under
+    // their tips (asked at most every AGREE_AGAIN, the last answer in between). Where we have that
+    // block, it goes into the chain's level only: a different one shows red, and the chain keeps
+    // following its own blocks. Far behind it, borrowing starts again there; one lender claiming a
+    // tip the others don't have moves nothing (it reads on from our tip).
+    let looked = if !arc && (lender_hosts(node, p) >= AGREE || their.saturating_sub(tip) > MAX_GAP) { agree_now(node, p).ok() } else { None };
+    let mut compared = false;
     if let Some(ag) = looked {
         let ours = stored_header(node, p, ag.height).map(|x| x.0);
         if let Some(pk) = ag.pick(ours) {
-            match ours {
-                Some(o) if pk.hash != o => return floor_at("most lenders follow another branch", pk.height, pk.hash, Some(pk)),
-                Some(_) => {
-                    let mut rec = trust_rec(node, key);
-                    if trust_compared(&mut rec, &pk, p.name, arcade_app::now()) {
-                        // Lenders agree above a far easier block: the reference starts again here.
-                        if let (Some(mut s), Some((_, hdr))) = (state(node, key), stored_header(node, p, tip)) {
-                            s["ref_bits"] = json!(hdr.bits);
-                            node.app.store.write(|w| w.put(arcade_app::META, &k(key, "st"), s.to_string().as_bytes())).map_err(e)?;
-                        }
+            compared = true;
+            if ours.is_some() {
+                let mut rec = trust_rec(node, key);
+                let before = rec.clone();
+                if trust_compared(&mut rec, &pk, ours, p.name, ag.at) {
+                    // Lenders agree above a far easier block: the reference starts again here.
+                    if let (Some(mut s), Some((_, hdr))) = (state(node, key), stored_header(node, p, tip)) {
+                        s["ref_bits"] = json!(hdr.bits);
+                        node.app.store.write(|w| w.put(arcade_app::META, &k(key, "st"), s.to_string().as_bytes())).map_err(e)?;
                     }
+                }
+                if rec != before {
                     put_trust(node, key, &rec);
                 }
-                None if pk.height > tip + MAX_GAP => return floor_at(&format!("{} blocks behind", pk.height - tip), pk.height, pk.hash, Some(pk)),
-                None => {}
+            } else if pk.height > tip + MAX_GAP {
+                return floor_at(&format!("{} blocks behind", pk.height - tip), pk.height, pk.hash, Some((pk, ag.at)));
             }
         }
     }
@@ -1405,8 +1517,11 @@ fn step(node: &Node, p: &'static ChainParams, watch: &HashSet<Vec<u8>>, run: &Ru
         set(format!("Borrowed · at block {tip}"));
         return Ok(false);
     }
-    if arc && their - tip > MAX_GAP {
-        return start_floor(&format!("{} blocks behind", their - tip));
+    // Far behind with nothing to compare (the ARCADE chain, or lenders that named no block):
+    // start again at the tip told, on that lender's word.
+    if their - tip > MAX_GAP && !compared {
+        let why = format!("{} blocks behind", their - tip);
+        return if arc { start_floor(&why) } else { floor_at(&why, their, hash_at(node, p, None, their)?, None) };
     }
     let n = (their - tip).min(match p.key { "btc" | "ltc" => 3, _ => 20 });
     let hashes: Vec<Hash256> = if arc {
@@ -1522,8 +1637,14 @@ fn coinscan(node: &Node, p: &'static ChainParams, w: &[Watched]) -> Result<Scan,
     if todo.is_empty() {
         return Ok(Scan::Done(0));
     }
-    // With lenders on several hosts, an older coin's block is the one most of them name there.
-    let compare = !crate::arcborrow::is(p) && lender_hosts(node, p) >= AGREE;
+    // With lenders on several hosts, an older coin's block is the one most of them name there:
+    // one lender per host is asked for every height at once (AGREE_BATCH hashes a call).
+    let named: BTreeMap<u32, Agreement> = if !crate::arcborrow::is(p) && lender_hosts(node, p) >= AGREE {
+        let heights: Vec<u32> = todo.iter().map(|c| c.height).collect::<BTreeSet<_>>().into_iter().collect();
+        named_at(node, p, &one_per_host(node, p), &heights)
+    } else {
+        BTreeMap::new()
+    };
     let mut checked: Vec<(&Found, Value)> = Vec::new();
     let mut blocks: HashMap<u32, Block> = HashMap::new();
     for c in &todo {
@@ -1532,12 +1653,12 @@ fn coinscan(node: &Node, p: &'static ChainParams, w: &[Watched]) -> Result<Scan,
             if blocks.len() >= 50 {
                 blocks.clear();
             }
-            let pk = if compare { agree(node, p, Some(c.height))?.pick(None) } else { None };
-            let bh = match pk {
-                Some(pk) => {
+            let ag = named.get(&c.height);
+            let bh = match ag.and_then(|a| a.pick(None).map(|pk| (pk, a.at))) {
+                Some((pk, at)) => {
                     if pk.split {
                         let mut rec = trust_rec(node, p.key);
-                        trust_compared(&mut rec, &pk, p.name, arcade_app::now());
+                        trust_compared(&mut rec, &pk, None, p.name, at);
                         put_trust(node, p.key, &rec);
                     }
                     pk.hash
@@ -1952,15 +2073,17 @@ pub fn status(node: &Node, key: &str) -> Option<Value> {
         _ => None,
     };
     // Before the chain's first look at its lenders (still starting) there is no record yet: count
-    // the lender hosts now, so the dot shows from the start (yellow until they are compared).
+    // the lender hosts now, so the dot shows from the start.
     let t = match trust_rec(node, p.key) {
         t if !t["trust"].is_null() => t,
         _ => {
             let hosts = lender_hosts(node, p);
+            // Never green before lenders are compared (the ARCADE chain is checked by its headers).
             let (level, note) = match hosts {
-                0 => ("grey", format!("No arcade lends {} right now.", p.name)),
-                1 => ("yellow", "One lender vouches for these blocks: take care with payments until a second one agrees.".to_string()),
-                n => ("green", format!("{n} lender hosts vouch for these blocks.")),
+                0 => ("grey", note_none(p.name)),
+                _ if crate::arcborrow::is(p) => ("green", "Every block is checked against the chain's own headers.".to_string()),
+                1 => ("yellow", note_one()),
+                n => ("yellow", note_unchecked(n)),
             };
             json!({"trust": level, "note": note, "hosts": hosts})
         }
@@ -2544,18 +2667,59 @@ mod tests {
     }
 
     fn ag(height: u32, answers: &[(&str, u8)]) -> Agreement {
-        Agreement { height, answers: answers.iter().map(|(h, n)| (host_of(h), hash(*n))).collect() }
+        Agreement { height, at: 0, answers: answers.iter().map(|(h, n)| (bucket(h).unwrap(), hash(*n))).collect() }
     }
 
     #[test]
     fn lenders_count_once_per_host() {
-        assert_eq!(host_of("203.0.113.5:8421"), "203.0.113.5");
-        assert_eq!(host_of("203.0.113.5:9000"), host_of("203.0.113.5:8421"));
-        // One IPv6 /64 is one host, with or without a port.
-        assert_eq!(host_of("[2001:db8:1:2::5]:8421"), "2001:db8:1:2::/64");
-        assert_eq!(host_of("2001:db8:1:2:ffff::9"), "2001:db8:1:2::/64");
-        assert_ne!(host_of("[2001:db8:1:3::5]:8421"), host_of("[2001:db8:1:2::5]:8421"));
-        assert_eq!(host_of("Lender.Example:8421"), "lender.example");
+        assert_eq!(host_part("203.0.113.5:8421"), "203.0.113.5");
+        assert_eq!(host_part("[2001:db8:1:2::5]:8421"), "2001:db8:1:2::5");
+        assert_eq!(host_part("2001:db8:1:2:ffff::9"), "2001:db8:1:2:ffff::9");
+        // Any port, and any address in one IPv4 /24 or IPv6 /64, is one host.
+        assert_eq!(bucket("203.0.113.5:9000"), bucket("203.0.113.77:8421"));
+        assert_eq!(bucket("203.0.113.5:8421").as_deref(), Some("203.0.113.0/24"));
+        assert_ne!(bucket("203.0.114.5:8421"), bucket("203.0.113.5:8421"));
+        assert_eq!(bucket("[2001:db8:1:2::5]:8421").as_deref(), Some("2001:db8:1:2::/64"));
+        assert_eq!(bucket("2001:db8:1:2:ffff::9"), bucket("[2001:db8:1:2::5]:8421"));
+        assert_ne!(bucket("[2001:db8:1:3::5]:8421"), bucket("[2001:db8:1:2::5]:8421"));
+        // No address: not counted.
+        assert_eq!(bucket(""), None);
+        assert_eq!(bucket(":8421"), None);
+    }
+
+    #[test]
+    fn green_needs_lenders_to_have_agreed_lately() {
+        // Two lender hosts on offer, not compared yet: yellow, never green.
+        let mut rec = json!({});
+        trust_level(&mut rec, 2, false, None, "Dogecoin", 1000);
+        assert_eq!(rec["trust"], "yellow");
+        // Both named our block: green, counting the hosts that agreed.
+        let pk = ag(500, &[("203.0.113.5:1", 1), ("192.0.2.9:1", 1)]).pick(Some(hash(1))).unwrap();
+        trust_compared(&mut rec, &pk, Some(hash(1)), "Dogecoin", 1000);
+        trust_level(&mut rec, 3, false, None, "Dogecoin", 1000);
+        assert_eq!((rec["trust"].as_str(), rec["hosts"].as_u64()), (Some("green"), Some(2)));
+        // Not compared again for AGREE_FRESH: yellow again.
+        trust_level(&mut rec, 3, false, None, "Dogecoin", 1000 + AGREE_FRESH);
+        assert_eq!(rec["trust"], "yellow");
+        // Only one host answered: no agreement to show.
+        let mut rec = json!({});
+        let pk = ag(500, &[("203.0.113.5:1", 1)]).pick(Some(hash(1))).unwrap();
+        trust_compared(&mut rec, &pk, Some(hash(1)), "Dogecoin", 1000);
+        trust_level(&mut rec, 2, false, None, "Dogecoin", 1000);
+        assert_eq!(rec["trust"], "yellow");
+    }
+
+    #[test]
+    fn another_block_than_ours_is_red_and_only_shown() {
+        // Every host names another block than ours: red, and nothing to act on (false).
+        let pk = ag(500, &[("203.0.113.5:1", 1), ("192.0.2.9:1", 1)]).pick(Some(hash(2))).unwrap();
+        assert_eq!(pk.hash, hash(1));
+        let mut rec = json!({});
+        assert!(!trust_compared(&mut rec, &pk, Some(hash(2)), "Dogecoin", 1000));
+        assert!(rec["agreed_at"].is_null());
+        trust_level(&mut rec, 2, false, None, "Dogecoin", 1000);
+        assert_eq!(rec["trust"], "red");
+        assert!(rec["note"].as_str().unwrap().contains("than the one this arcade follows"));
     }
 
     #[test]
@@ -2565,7 +2729,7 @@ mod tests {
         let pk = ag(1_000_355, &[("198.51.100.7:8421", 9), ("198.51.100.7:8422", 9)]).pick(None).unwrap();
         assert_eq!((pk.hash, pk.hosts, pk.split), (hash(9), 1, false));
         let mut rec = json!({});
-        trust_compared(&mut rec, &pk, "Dogecoin", 1000);
+        trust_compared(&mut rec, &pk, None, "Dogecoin", 1000);
         assert_eq!(trust_level(&mut rec, 1, false, None, "Dogecoin", 1000), None, "no event for yellow");
         assert_eq!(rec["trust"], "yellow");
         // Nobody answered: nothing to pick (and no lender: grey, no event).
@@ -2589,7 +2753,7 @@ mod tests {
         let pk = ag(500, &[("203.0.113.5:8421", 1), ("192.0.2.9:8421", 1)]).pick(None).unwrap();
         assert_eq!((pk.hash, pk.hosts, pk.split), (hash(1), 2, false));
         let mut rec = json!({});
-        trust_compared(&mut rec, &pk, "Dogecoin", 1000);
+        trust_compared(&mut rec, &pk, None, "Dogecoin", 1000);
         assert_eq!(trust_level(&mut rec, 2, false, None, "Dogecoin", 1000), None, "no event for green");
         assert_eq!(rec["trust"], "green");
         // The same two hosts, with one of them gone now: yellow.
@@ -2598,16 +2762,17 @@ mod tests {
     }
 
     #[test]
-    fn disagreeing_hosts_are_red_and_the_majority_is_followed() {
+    fn disagreeing_hosts_are_red() {
         let a = ag(500, &[("198.51.100.7:1", 2), ("203.0.113.5:1", 1), ("192.0.2.9:1", 1)]);
         let pk = a.pick(Some(hash(2))).unwrap();
-        assert_eq!((pk.hash, pk.hosts, pk.split), (hash(1), 2, true), "most hosts win over what we follow");
+        // The block most hosts name (a new floor or a coin's block takes it); shown red.
+        assert_eq!((pk.hash, pk.hosts, pk.split), (hash(1), 2, true));
         // A tie keeps what we follow; with nothing followed, the first-listed lender's block.
         let tie = ag(500, &[("203.0.113.5:1", 1), ("198.51.100.7:1", 2)]);
         assert_eq!(tie.pick(Some(hash(2))).unwrap().hash, hash(2));
         assert_eq!(tie.pick(None).unwrap().hash, hash(1));
         let mut rec = json!({});
-        trust_compared(&mut rec, &pk, "Dogecoin", 1000);
+        trust_compared(&mut rec, &pk, None, "Dogecoin", 1000);
         let ev = trust_level(&mut rec, 3, false, None, "Dogecoin", 1000);
         assert_eq!(rec["trust"], "red");
         assert!(ev.is_some_and(|x| x.contains("marked red") && x.contains("height 500")));
@@ -2615,7 +2780,7 @@ mod tests {
         // passed, green again, with one event.
         assert_eq!(trust_level(&mut rec, 3, false, None, "Dogecoin", 1100), None);
         let agreed = ag(510, &[("203.0.113.5:1", 1), ("192.0.2.9:1", 1)]).pick(None).unwrap();
-        trust_compared(&mut rec, &agreed, "Dogecoin", 1200);
+        trust_compared(&mut rec, &agreed, None, "Dogecoin", 1200);
         assert_eq!(trust_level(&mut rec, 3, false, None, "Dogecoin", 1200), None, "split seen less than RED_HOLD ago");
         let ev = trust_level(&mut rec, 3, false, None, "Dogecoin", 1000 + RED_HOLD);
         assert_eq!(rec["trust"], "green");
@@ -2625,7 +2790,7 @@ mod tests {
     #[test]
     fn far_apart_tips_are_yellow_and_quiet() {
         // A lender behind is caution, not a problem: yellow, and no event.
-        let mut rec = json!({"base": "green"});
+        let mut rec = json!({"agreed_at": 1000, "agreed_hosts": 2});
         let ev = trust_level(&mut rec, 2, false, Some("lenders disagree on the tip: 10 to 20".into()), "Dogecoin", 1000);
         assert_eq!(rec["trust"], "yellow");
         assert_eq!(rec["hosts"], 2, "the dot shows how many lender hosts vouch");
@@ -2637,7 +2802,7 @@ mod tests {
 
     #[test]
     fn a_cheap_block_is_taken_and_red_until_it_recovers() {
-        let mut rec = json!({"base": "yellow"});
+        let mut rec = json!({});
         let mut events = Vec::new();
         let mut tick = |rec: &mut Value, t: u64| events.extend(trust_level(rec, 1, false, None, "Dogecoin", t));
         tick(&mut rec, 1000);
@@ -2660,13 +2825,13 @@ mod tests {
         let mut rec = json!({});
         trust_block(&mut rec, 50, true);
         let pk = ag(60, &[("203.0.113.5:1", 1), ("192.0.2.9:1", 1)]).pick(None).unwrap();
-        assert!(trust_compared(&mut rec, &pk, "Dogecoin", 1000));
+        assert!(trust_compared(&mut rec, &pk, None, "Dogecoin", 1000));
         assert!(rec["cheap_from"].is_null());
         // Agreeing below it does not.
         let mut rec = json!({});
         trust_block(&mut rec, 50, true);
         let pk = ag(40, &[("203.0.113.5:1", 1), ("192.0.2.9:1", 1)]).pick(None).unwrap();
-        assert!(!trust_compared(&mut rec, &pk, "Dogecoin", 1000));
+        assert!(!trust_compared(&mut rec, &pk, None, "Dogecoin", 1000));
         assert_eq!(rec["cheap_from"], 50);
     }
 

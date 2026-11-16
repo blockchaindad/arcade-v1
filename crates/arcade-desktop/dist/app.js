@@ -322,8 +322,10 @@ async function refreshWallet() {
     for (const p of ["w-send-panel", "w-recv-panel", "w-imp-panel"]) $(p).hidden = true;
     $("w-confirm").hidden = true; msg($("w-send-msg"), "");
   }
-  const [keys, imps] = await Promise.all([api("wallet.keys", { chain: ch.key }), api("wallet.imports").catch(() => [])]);
+  const [keys, imps, st] = await Promise.all([api("wallet.keys", { chain: ch.key }), api("wallet.imports").catch(() => []), api("chains.status", { key: ch.key }).catch(() => null)]);
   state.keys = keys;
+  // The chain's status, for its trust dot (drawCard runs again without asking for it).
+  W.st = st; W.stKey = ch.key;
   W.list = [
     ...keys.map((k) => ({ id: "own:" + k.index, own: true, index: k.index, address: k.address, legacy: k.legacy, tag: k.tag, balance: k.balance, pending: k.pending || 0,
       label: k.tag ? "@" + k.tag : k.index ? `This arcade's wallet · address ${k.index}` : "This arcade's wallet" })),
@@ -377,18 +379,15 @@ function drawCard(ch) {
   $("w-who").textContent = w.own ? (w.tag ? "@" + w.tag : "This arcade's wallet") : `${w.name || "Imported wallet"} · imported ${w.kind === "phrase" ? "from words" : "key"}`;
   $("w-bal").textContent = w.balance == null ? "—" : coinNum(w.balance);
   $("w-unit").textContent = tk;
-  // A borrowed chain: its trust colour beside the balance (red adds its note below).
+  // A borrowed chain: its trust colour beside the balance (red adds its note below), from the
+  // status refreshWallet loaded. Kept here: a plain green dot; borrowed: its colour and count.
+  const st = W.stKey === ch.key ? W.st : null;
   $("w-trust").replaceChildren();
-  api("chains.status", { key: ch.key }).then((st) => {
-    if (cur() !== w || !st) return;
-    // Kept here: a plain green dot; borrowed: its trust colour and lender count.
-    if (!st.borrowed && (st.installed || st.home)) { $("w-trust").replaceChildren(trustDot("green", `${ch.name} is kept on this arcade: every block is checked here.`, null, true)); return; }
-    if (!st.borrowed || !st.trust) return;
-    $("w-trust").replaceChildren(trustDot(st.trust, st.trust_note, st.trust_hosts));
-    if (st.trust === "red" && st.trust_note && !$("w-sub").textContent.includes(st.trust_note)) $("w-sub").textContent = [st.trust_note, $("w-sub").textContent].filter(Boolean).join(" · ");
-  }).catch(() => {});
+  if (st && !st.borrowed && (st.installed || st.home)) $("w-trust").replaceChildren(trustDot("green", `${ch.name} is kept on this arcade: every block is checked here.`, null, true));
+  else if (st && st.borrowed && st.trust) $("w-trust").replaceChildren(trustDot(st.trust, st.trust_note, st.trust_hosts));
   const ddOn = w.own && w.index === 0 && isDD(ch.key) && W.dd && !W.dd.error;
   const sub = [];
+  if (st && st.borrowed && st.trust === "red" && st.trust_note) sub.push(st.trust_note);
   if (w.balance == null) sub.push(`${ch.name} isn't installed or borrowed with addresses here: add it in Chains & Coins to see balances.`);
   if (w.pending > 0) sub.push(`+${coinNum(w.pending)} ${tk} arriving (in the mempool, spendable now)`);
   if (ddOn) sub.push(`${usd(W.dd.cents)} DigiDollar`);

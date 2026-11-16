@@ -118,7 +118,8 @@ const ICON_FILE = (k) => `coins/${k}.${k === "btc" ? "svg" : "png"}`;
 // A borrowed chain's trust colour (borrow.rs): green = 2+ lenders agree, yellow = one lender's
 // word, grey = no lender now, red = a problem; the note is its tooltip.
 const TRUST_WORD = { green: "lenders agree", yellow: "one lender", grey: "no lender", red: "problem" };
-// `hosts`: how many lender hosts vouch for the chain now, written in the dot (0 grey, 1 yellow, 2+ green).
+// `hosts`: how many lender hosts vouch for the chain now, written in the dot (green: those that
+// named the same blocks when last compared; yellow: one, or several not compared lately).
 // `kept`: the chain is kept on this arcade (a plain green dot, no count).
 function trustDot(level, note, hosts, kept) {
   const d = document.createElement("span");
