@@ -348,6 +348,11 @@
     };
     const title = document.createElement("div"); title.className = "earn-h";
     title.append(Object.assign(document.createElement("img"), { src: "coins/arctest.png", alt: "" }), Object.assign(document.createElement("b"), { textContent: "Earn ARCADE" }), sw);
+    // This arcade's earning light (the whole arcade's, not this coin's alone; details on the ARCADE chain's panel).
+    api("arc.earning").then((x) => {
+      if (!x || !x.light) return;
+      title.insertBefore(Object.assign(document.createElement("span"), { className: `edot ${x.light}`, title: `${x.why} (details: the ARCADE chain in Chains & Coins)` }), sw);
+    }).catch(() => {});
     const line = document.createElement("div"); line.className = "earn-line";
     const bar = document.createElement("div"); bar.className = "bar"; const fill = document.createElement("i"); bar.append(fill);
     let pct = 0;
@@ -366,6 +371,50 @@
     }
     fill.style.width = pct + "%";
     box.replaceChildren(title, line, ...(e.on && full ? [bar] : []));
+  }
+
+  // Your ARCADE earnings (arc.earning), on the ARCADE chain's panel: one light, as the trust dots (green: earning
+  // and paid · yellow: earning, nothing paid yet · grey: not earning · red: a problem that costs pay), why, and
+  // when the next audits and payout come, at the chain's recent pace.
+  const LIGHT_WORD = { green: "Earning and paid", yellow: "Earning · nothing paid yet", grey: "Not earning", red: "Problem: pay at risk" };
+  const arcAmt = (sats) => `${(Number(sats || 0) / 1e8).toLocaleString(undefined, { maximumFractionDigits: 2 })} ARCADE`;
+  const inTime = (s) => {
+    if (s == null) return "";
+    const h = Math.round(s / 3600);
+    return s < 3600 ? `in ${Math.max(1, Math.round(s / 60))} min` : h < 48 ? `in about ${h} h` : `in about ${Math.floor(h / 24)} d ${h % 24} h`;
+  };
+  async function earningBox(st) {
+    let box = document.getElementById("c-earning");
+    if (!box) { box = document.createElement("div"); box.id = "c-earning"; box.className = "earning"; $("c-stages").after(box); }
+    if (!st.arcade) { box.hidden = true; return; }
+    let e;
+    try { e = await api("arc.earning"); } catch (err) { box.hidden = true; return; }
+    box.hidden = false;
+    const dot = Object.assign(document.createElement("span"), { className: `edot ${e.light}`, title: e.why });
+    const head = document.createElement("div"); head.className = "earn-h";
+    head.append(dot, Object.assign(document.createElement("b"), { textContent: "Your ARCADE earnings" }),
+      Object.assign(document.createElement("span"), { className: "eword", textContent: LIGHT_WORD[e.light] || e.light }));
+    const why = Object.assign(document.createElement("div"), { className: "earn-line", textContent: e.why });
+    if (!e.on) { box.replaceChildren(head, why); return; }
+    const rows = [];
+    const row = (k, v) => rows.push([k, v]);
+    row("Built up", `${arcAmt(e.accrued)} waiting for the next payout`);
+    const acct = e.payout.account;
+    const who = acct ? (acct.tag ? `@${acct.tag}` : acct.own ? "this arcade's own wallet" : "an added account") + (acct.own ? " (this arcade's own wallet)" : "")
+      : "an account that isn't on this arcade";
+    if (e.payout.address) row("Paid to", `${who} · ${e.payout.address} · ${arcAmt(e.payout.balance)} there now`);
+    if (e.next_turn != null) row("Next payout", `block ${fmtN(e.next_turn)} · ${inTime(e.next_turn_eta_secs)} · paid only if this period's audits pass`);
+    const aud = (e.audits || []).map((a) => `block ${fmtN(a.at)}: ${a.state}${a.state === "ahead" ? ` (${inTime(a.eta_secs)})` : ""}`);
+    row("Audits this period", aud.length ? aud.join(" · ") : "none drawn yet (drawn at this arcade's turn)");
+    row("Replicas", `${fmtN(e.replicas)} registered · ${mib(e.bytes)}`);
+    row("Writes blocks", e.silenced_until ? `not until block ${fmtN(e.silenced_until)}` : e.draw.weight > 0 ? "yes" :
+      e.draw.from ? `from block ${fmtN(e.draw.from)} (${inTime(e.draw.from_eta_secs)})` : "after its first passed audit, 200 blocks on");
+    const sv = e.serving;
+    row("Serving checks", `${fmtN(sv.served)} served · ${fmtN(sv.not_served)} not served${sv.held_times ? ` · pay held ${sv.held_times}×` : ""}`);
+    const tbl = document.createElement("div"); tbl.className = "earn-rows";
+    for (const [k, v] of rows) tbl.append(Object.assign(document.createElement("div"), { className: "k", textContent: k }), Object.assign(document.createElement("div"), { textContent: v }));
+    const pace = Object.assign(document.createElement("div"), { className: "s", textContent: `ARCADE block ${fmtN(e.height)} · about ${Math.round(e.block_secs / 60)} min a block lately (times are estimates)` });
+    box.replaceChildren(head, why, tbl, pace);
   }
 
   function showProgress(st) {
@@ -393,6 +442,7 @@
     }));
     copyBox(st);
     earnBox(st);
+    earningBox(st);
     driveBox(st);
     // Indexes the chain doesn't have yet: a clear list at the top of the panel (opt-in, one at a time).
     let add = document.getElementById("c-addix");

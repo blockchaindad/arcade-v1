@@ -679,6 +679,7 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         "chains.drives" => Ok(crate::chaindrive::drives(node)),
         "chains.move" => crate::chaindrive::start(&node.self_arc(), &s("key").ok_or("key required")?, &s("drive").unwrap_or_else(|| "home".into())),
         "arc.status" => crate::arcsvc::status(node),
+        "arc.earning" => crate::arcsvc::earning(node),
         "arc.block" => crate::arcsvc::block(req),
         "arc.submit" => crate::arcsvc::submit(req),
         "arc.pool" => crate::arcsvc::pool(req),

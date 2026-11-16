@@ -1998,6 +1998,131 @@ pub fn status(node: &Node) -> Result<Value, String> {
     }))
 }
 
+/// What decides this arcade's earning light (`arc.earning`).
+#[derive(Debug, Clone, Default)]
+struct EarnFacts {
+    /// Replicas registered on the chain under this arcade's key.
+    registered: usize,
+    /// Its key signed two blocks on one parent: it never earns again.
+    punished: bool,
+    /// Most audits any of its replicas missed in a row.
+    missed: u32,
+    /// A sampled audit of this period whose answer window passed without a passed opening.
+    failed_pick: bool,
+    /// Turns in a row its pay was held back by serving checks.
+    held_times: u32,
+    /// No draw weight for now (a challenge or reveal demand of its was answered).
+    silenced: bool,
+    /// Something has been paid to its payout address.
+    paid: bool,
+}
+
+/// The earning light, as the trust dots: green = earning and paid, yellow = earning but nothing paid yet (or a
+/// note that doesn't cost pay), grey = not earning, red = a problem that costs pay. With the reason, in plain words.
+fn earn_light(f: &EarnFacts) -> (&'static str, String) {
+    if f.punished {
+        return ("red", "This arcade's key was proved to have signed two blocks at one height: it earns nothing from now on.".into());
+    }
+    if f.registered == 0 {
+        return ("grey", "Not earning: no replicas registered. Turn on Earn ARCADE for a coin kept in full.".into());
+    }
+    if f.failed_pick || f.missed > 0 {
+        return ("red", "An audit was missed: this period's pay goes back to the pot. The arcade asks for a new audit by itself; three missed in a row remove a replica.".into());
+    }
+    if f.held_times > 0 {
+        return ("red", format!("Serving checks found this arcade not handing out its data: pay held back {} time{} (the third in a row is lost).",
+            f.held_times, if f.held_times == 1 { "" } else { "s" }));
+    }
+    if f.silenced {
+        return ("yellow", "Earning, but writing no blocks for now: a challenge or reveal demand this arcade made was answered (one audit period).".into());
+    }
+    if !f.paid {
+        return ("yellow", "Earning: pay is building up. The first payout comes at this arcade's turn once its audits pass.".into());
+    }
+    ("green", "Earning and paid: audits passing.".into())
+}
+
+/// `arc.earning`: whether this arcade earns ARCADE, at a glance: the light and why, what has built up, its audits and
+/// its next turn (when pay is released) with times from the last 100 blocks' pace, and who is paid.
+pub fn earning(node: &Node) -> Result<Value, String> {
+    let Some(svc) = svc() else {
+        return Ok(json!({"on": false, "light": "grey", "why": "The ARCADE chain isn't installed here."}));
+    };
+    let st = svc.st.lock().unwrap();
+    let reg = st.chain.storage();
+    let tip = st.chain.tip();
+    let height = tip.height;
+    let me = node.identity.verifying_key().to_bytes();
+    let period = svc.net.audit_period;
+    // Seconds a block: the last 100 blocks' average (the target while there are none).
+    let back = height.min(100);
+    let then = st.chain.id_at(height - back).and_then(|id| st.chain.entry(&id).map(|e| e.time));
+    let block_secs = match then {
+        Some(t0) if back > 0 && tip.time > t0 => (tip.time - t0) as f64 / back as f64,
+        _ => svc.net.block_seconds as f64,
+    };
+    let eta = |h: u64| (h > height).then(|| ((h - height) as f64 * block_secs) as u64);
+    let reps = reg.replicas_of(&me);
+    let window = params::CHALLENGE_DELAY + 2 * params::ANSWER_WINDOW;
+    let picks = reg.audits_of(&me);
+    let audits: Vec<Value> = picks
+        .iter()
+        .map(|p| {
+            let state = if p.passed { "passed" } else if height > p.at + window { "missed" } else if p.at > height { "ahead" } else { "running" };
+            json!({"at": p.at, "eta_secs": eta(p.at), "state": state})
+        })
+        .collect();
+    // Its turn: pay is released at the blocks whose height leaves this remainder.
+    let next_turn = reg.turn_of(&me).map(|t| {
+        let r = height % period;
+        height - r + if t > r { t } else { period + t }
+    });
+    let payout = reg.payout_of(&me);
+    let address = payout.map(|pay| arcade_ledger::address::base58check(pay[0], &pay[1..]));
+    let script = payout.and_then(|pay| arcade_arc::script::pay_to(&svc.net, &pay));
+    let at_address: u64 = script.as_ref().map_or(0, |s| st.chain.coins().values().filter(|c| &c.script == s).map(|c| c.value).sum());
+    // Which account here the payout address belongs to (each account's stored ARCADE key, read without switching).
+    let account = address.as_ref().and_then(|a| {
+        crate::accountsvc::ids(node).into_iter().find_map(|(id, tag)| {
+            let k = node.app.stored_tag_key_of(&id, svc.params.chain_no, 0).ok().flatten()?;
+            (k.address == *a).then(|| json!({"id": id, "own": id.is_empty(), "tag": k.tag.or(tag)}))
+        })
+    });
+    let (served, not_served) = reg.verdicts_of(&me);
+    let (held, held_times) = reg.held_of(&me);
+    let silenced = reg.silenced_until(&me).filter(|&u| height + 1 < u);
+    let facts = EarnFacts {
+        registered: reps.len(),
+        punished: reg.punished(&me),
+        missed: reps.iter().map(|r| r.1).max().unwrap_or(0),
+        failed_pick: picks.iter().any(|p| !p.passed && height > p.at + window),
+        held_times,
+        silenced: silenced.is_some(),
+        paid: at_address > 0,
+    };
+    let (light, why) = earn_light(&facts);
+    let draw_from = reps.iter().filter_map(|r| r.2).min();
+    Ok(json!({
+        "on": true,
+        "net": svc.net.key,
+        "height": height,
+        "block_secs": block_secs.round() as u64,
+        "light": light,
+        "why": why,
+        "accrued": reg.accrued_of(&arcade_arc::registry::Earner::Owner(me)),
+        "replicas": reps.len(),
+        "bytes": reps.iter().map(|r| r.0).sum::<u64>(),
+        "audits": audits,
+        "next_turn": next_turn,
+        "next_turn_eta_secs": next_turn.and_then(eta),
+        "payout": {"address": address, "account": account, "balance": at_address},
+        "serving": {"served": served, "not_served": not_served, "held": held, "held_times": held_times},
+        "draw": {"weight": reg.weight(&me), "from": draw_from, "from_eta_secs": draw_from.and_then(eta)},
+        "silenced_until": silenced,
+        "punished": facts.punished,
+    }))
+}
+
 // For the wallet, the Explorer and Chains & Coins. The chain isn't in the list of coins
 // (`ALL_CHAINS`): these are its own entries. It is known by its key whenever this arcade
 // can install it: installed it is read from this arcade's own copy, not installed it can be
@@ -3074,5 +3199,28 @@ mod tests {
         // With a cap of 2 runs, a long proof is cut in no more than 2.
         let two = prove_in_pieces_of(dir.path(), &c, steps, 2, piece).unwrap();
         assert!(ChiaVdf.verify_pot(&c, steps, &two, 2));
+    }
+}
+
+#[cfg(test)]
+mod earn_light_tests {
+    use super::{earn_light, EarnFacts};
+
+    #[test]
+    fn the_earning_light_follows_the_trust_colours() {
+        let ok = EarnFacts { registered: 3, ..Default::default() };
+        assert_eq!(earn_light(&EarnFacts::default()).0, "grey", "no replicas: not earning");
+        assert_eq!(earn_light(&ok).0, "yellow", "registered, nothing paid yet");
+        assert_eq!(earn_light(&EarnFacts { paid: true, ..ok.clone() }).0, "green");
+        assert_eq!(earn_light(&EarnFacts { paid: true, silenced: true, ..ok.clone() }).0, "yellow", "silenced still earns");
+        for bad in [
+            EarnFacts { missed: 1, paid: true, ..ok.clone() },
+            EarnFacts { failed_pick: true, ..ok.clone() },
+            EarnFacts { held_times: 2, paid: true, ..ok.clone() },
+            EarnFacts { punished: true, ..ok.clone() },
+        ] {
+            assert_eq!(earn_light(&bad).0, "red", "{bad:?}");
+        }
+        assert!(earn_light(&EarnFacts { held_times: 2, ..ok }).1.contains("2 times"));
     }
 }
