@@ -56,6 +56,16 @@ pub fn create_wallet(node: &Node, phrase: Option<&str>) -> Result<Value, String>
 }
 
 pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
+    // `"as": "@tag"` on an ARCADE write (ledger.*, a.*, arc.blob_publish*): signed by the key holding that tag, the
+    // wallet's own or an imported one (crate::arcledger::with_sign_as).
+    let cmd = req["cmd"].as_str().unwrap_or("");
+    if let Some(tag) = req["as"].as_str().filter(|_| cmd.starts_with("ledger.") || cmd.starts_with("a.") || cmd.starts_with("arc.blob_publish")) {
+        return crate::arcledger::with_sign_as(Some(tag.to_string()), || dispatch_inner(node, req));
+    }
+    dispatch_inner(node, req)
+}
+
+fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
     let s = |k: &str| req[k].as_str().map(String::from);
     let p = node.params;
     let c = p.chain_no;

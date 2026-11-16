@@ -236,8 +236,14 @@ pub fn publish_blobs(node: &Node, items: &[(Vec<u8>, String, arcade_arc::blob::C
         return Err("more than one block's 4 MB of new blobs: split them into several".into());
     }
     let tip = node.chain.tip(p.chain_no).map_err(|e| e.to_string())?.map(|t| t.height).unwrap_or(0);
-    let (k, sk) = node.app.tag_key(p, 0).map_err(|e| e.to_string())?;
-    let pk = PublicKey::from_slice(&hex::decode(&k.pubkey).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    // Signing as a tag (crate::arcledger::with_sign_as): that tag's key pays; else the wallet's first key, as always.
+    let (pk, sk) = if crate::arcledger::sign_as().is_some() {
+        let (_, _, sk) = crate::arcledger::sender(node, p)?;
+        (PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk), sk)
+    } else {
+        let (k, sk) = node.app.tag_key(p, 0).map_err(|e| e.to_string())?;
+        (PublicKey::from_slice(&hex::decode(&k.pubkey).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?, sk)
+    };
     let scripts = key_scripts(p, &pk);
     let mut coins = Vec::new();
     for (_, sc) in &scripts {

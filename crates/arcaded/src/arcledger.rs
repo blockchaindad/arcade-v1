@@ -11,8 +11,43 @@ pub fn chain() -> Result<&'static ChainParams, String> {
     crate::arcsvc::defined().filter(|p| crate::arcsvc::runs(p)).ok_or_else(|| "the ARCADE chain isn't running here".to_string())
 }
 
-/// The wallet's key on ARCADE that holds an @tag there (else its first tag key): (address, tag, secret key).
+thread_local! {
+    /// The @tag this request signs as (`"as"` on a socket request; api::dispatch sets it): one of this wallet's own tags,
+    /// or one held by a wallet imported for the ARCADE chain (wallet.import), such as a publisher's key.
+    static SIGN_AS: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` signing ARCADE writes as `tag` (None: as before, the wallet's own tag key).
+pub fn with_sign_as<T>(tag: Option<String>, f: impl FnOnce() -> T) -> T {
+    let tag = tag.map(|t| t.trim().trim_start_matches('@').to_lowercase()).filter(|t| !t.is_empty());
+    let before = SIGN_AS.with(|s| s.replace(tag));
+    let out = f();
+    SIGN_AS.with(|s| *s.borrow_mut() = before);
+    out
+}
+
+/// The @tag this request signs as, if it names one.
+pub fn sign_as() -> Option<String> {
+    SIGN_AS.with(|s| s.borrow().clone())
+}
+
+/// The wallet's key on ARCADE that holds an @tag there (else its first tag key): (address, tag, secret key). A request
+/// that signs as a tag (`with_sign_as`) gets the key holding exactly that tag, its own or an imported wallet's, or an error.
 pub fn sender(node: &Node, p: &'static ChainParams) -> Result<(String, Option<String>, arcade_wallet::SecretKey), String> {
+    if let Some(want) = sign_as() {
+        for k in node.app.tag_keys(p.chain_no).map_err(|e| e.to_string())? {
+            if arcade_ledger::index::tag_of(&node.chain, p.chain_no, &k.address).ok().flatten().as_deref() == Some(want.as_str()) {
+                let (k, sk) = node.app.tag_key(p, k.index).map_err(|e| e.to_string())?;
+                return Ok((k.address, Some(want), sk));
+            }
+        }
+        for (address, _, sk, kind) in crate::importsvc::wallets_on(node, p.key) {
+            if kind == "legacy" && arcade_ledger::index::tag_of(&node.chain, p.chain_no, &address).ok().flatten().as_deref() == Some(want.as_str()) {
+                return Ok((address, Some(want), sk));
+            }
+        }
+        return Err(format!("no key here holds @{want} on the ARCADE chain (import it first: wallet.import with chain {})", p.key));
+    }
     for k in node.app.tag_keys(p.chain_no).map_err(|e| e.to_string())? {
         if let Ok(Some(t)) = arcade_ledger::index::tag_of(&node.chain, p.chain_no, &k.address) {
             let (k, sk) = node.app.tag_key(p, k.index).map_err(|e| e.to_string())?;
@@ -256,6 +291,15 @@ pub fn repo_manifest(node: &Node, full: &str) -> Option<String> {
 /// A text as a blob (Permanent, JSON): its id. The record that names it can go at once: the ledger keeps the id.
 fn body_blob(node: &Node, v: &Value) -> Result<[u8; 32], String> {
     let bytes = serde_json::to_vec(v).map_err(|e| e.to_string())?;
+    // The text's blob and then the record are two transactions, and the record spends only confirmed coins: with one
+    // free coin the blob would take it and the record fail, and every retry would pay for the blob again. So wait (the
+    // error says "not enough", which callers retry) until there's a coin for each.
+    let p = chain()?;
+    let (_, _, sk) = sender(node, p)?;
+    let pk = arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
+    if crate::claims::arc_coins(node, p, &arcade_wallet::keys::p2pkh_script_for(&pk)).len() < 2 {
+        return Err("not enough free coins yet: the text and its record need one each (wait for a block)".into());
+    }
     let r = crate::coinsend::publish_blob(node, &bytes, "application/json", arcade_arc::blob::Class::Permanent, arcade_arc::blob::Encoding::Plain, true)?;
     r["blob"].as_str().and_then(|h| hex::decode(h).ok()).and_then(|b| b.try_into().ok()).ok_or_else(|| "the body's blob has no id".to_string())
 }
