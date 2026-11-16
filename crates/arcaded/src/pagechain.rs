@@ -72,6 +72,12 @@ use std::sync::Mutex;
 static KEPT: Mutex<Vec<(String, String, std::sync::Arc<(String, String, Vec<u8>)>)>> = Mutex::new(Vec::new());
 const KEPT_MOST: usize = 64 << 20;
 
+/// A page kept as if an arcade on the mesh had sent it (for tests of how it is served).
+#[cfg(test)]
+pub(crate) fn keep_for_test(p: &ChainParams, id: &str, content_type: &str, bytes: &[u8]) {
+    KEPT.lock().unwrap().push((p.key.to_string(), id.to_string(), std::sync::Arc::new((content_type.to_string(), String::new(), bytes.to_vec()))));
+}
+
 /// An arcade inscription's (content type, sha256, bytes) on chain `p`: from this arcade's ledger
 /// when it keeps it, else from an arcade on the mesh that does (checked against its sha256).
 pub fn content(node: &Node, p: &'static ChainParams, id: &str) -> Result<std::sync::Arc<(String, String, Vec<u8>)>, String> {

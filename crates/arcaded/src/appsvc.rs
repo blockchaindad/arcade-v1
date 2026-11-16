@@ -589,16 +589,19 @@ pub fn trust(node: &Node, address: &str, on: bool) -> Result<Value, String> {
     Ok(json!({"trusted": t}))
 }
 
-/// What the app window needs: the page to run (served sandboxed by this arcade) and the card.
+/// What the app window needs: the page to run (served sandboxed by this arcade, with its pass for the page API: the
+/// address carries the page's key, crate::http::page_key) and the card.
 pub fn launch(node: &Node, chain: &str, txid: &str) -> Result<Value, String> {
     let e = card(node, chain, txid)?;
     if e["removed"] == true {
         return Err("its publisher removed this app".into());
     }
     let port = node.http_port.get().copied().unwrap_or(8420);
+    let opens = e["opens"].as_str().unwrap_or("").to_ascii_lowercase();
+    let key = crate::chains::find(chain).map(|cp| crate::http::page_key(node, cp.key, &opens)).unwrap_or_default();
     Ok(json!({
         "id": e["id"], "title": format!("{}{}", e["card"]["name"].as_str().unwrap_or("App"), e["card"]["version"].as_str().filter(|v| !v.is_empty()).map(|v| format!(" {v}")).unwrap_or_default()),
-        "frame": format!("http://127.0.0.1:{port}/app/{chain}/{}", e["opens"].as_str().unwrap_or("")),
+        "frame": format!("http://127.0.0.1:{port}/app/{chain}/{opens}?pass={key}"),
         "card": e["card"], "permissions": e["permissions"], "creator": e["creator"], "chain": chain,
     }))
 }
