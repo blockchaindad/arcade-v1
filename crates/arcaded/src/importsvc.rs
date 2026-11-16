@@ -144,7 +144,8 @@ pub fn list(node: &Node) -> Value {
                 node.chain.balance_for_script(p.chain_no, &sc).ok()
             });
             e["balance"] = json!(bal);
-            e["spendable_here"] = json!(e["addr_kind"] == "legacy");
+            // Compressed keys of every import kind sign here (P2SH-P2WPKH too, since the address kinds).
+            e["spendable_here"] = json!(e["compressed"] != false);
             e
         })
         .collect();

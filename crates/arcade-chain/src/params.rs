@@ -228,6 +228,28 @@ impl ChainParams {
         }
     }
 
+    /// Whether a block's confirmations for money count the checked work above it rather than
+    /// its depth (arcade_chaindb::proven). True where a header's bits are not tied to the
+    /// chain's difficulty here (no MAX_EASIER step, no retarget check: DigiByte, Kotia,
+    /// Wojakcoin) or some headers' work can't be checked at all (DigiByte's Groestl, Qubit and
+    /// Odocrypt; Kotia's staked blocks): there a block at the minimum difficulty, or one whose
+    /// work isn't checked, costs next to nothing to make, so a block on top proves nothing.
+    /// Not the ARCADE chain: its blocks carry no work, and its own rules settle them.
+    pub fn confirms_by_proven_work(&self) -> bool {
+        let arcade = ARCADE_CHAINS.iter().any(|(c, _)| *c == self.chain_no);
+        !arcade && ((!self.max_easier && self.digishield_from.is_none()) || !matches!(self.pow, PowRule::Single(_)))
+    }
+
+    /// Whether a block at `height` can carry work this arcade checks: false on Kotia after its
+    /// last proof-of-work height, where every block is staked (no stake kernel is checked
+    /// here), so nothing there can confirm a payment.
+    pub fn work_checkable_at(&self, height: u32) -> bool {
+        match self.pow {
+            PowRule::PowThenStake { last_pow_height, .. } => height <= last_pow_height,
+            _ => true,
+        }
+    }
+
     /// The checkpoint hash at `height`, if there is one.
     pub fn checkpoint_at(&self, height: u32) -> Option<Hash256> {
         self.checkpoints.iter().find(|(h, _)| *h == height).map(|(_, x)| Hash256::from_hex(x).expect("valid checkpoint hex"))
@@ -1819,6 +1841,20 @@ mod tests {
         let g = p.genesis_header().unwrap();
         let forged = Header { version: 0x0400 | 2, prev: p.block_id(&g), merkle_root: Hash256::ZERO, time: g.time + 15, bits: tiny, nonce: 0 };
         assert_eq!(check_header(p, &forged, &g, 1), Ok(PowCheck::NotCheckable));
+    }
+
+    /// Confirmations count checked work exactly on the chains whose bits aren't tied to their
+    /// difficulty here or whose work isn't always checked; Kotia confirms nothing once staked.
+    #[test]
+    fn proven_work_chains() {
+        let proven: Vec<&str> = ALL_CHAINS.iter().filter(|p| p.confirms_by_proven_work()).map(|p| p.key).collect();
+        assert_eq!(proven, ["dgb", "dgbtest", "kot", "wjk"]);
+        // The ARCADE chain's copies (arcade_arc::store::chain_params) carry no work.
+        let arc = ChainParams { chain_no: ARCADE_CHAINS[0].0, key: "arc", max_easier: false, digishield_from: None, ..WOJAKCOIN_MAIN.clone() };
+        assert!(!arc.confirms_by_proven_work());
+        assert!(KOTIA_MAIN.work_checkable_at(1_000_000));
+        assert!(!KOTIA_MAIN.work_checkable_at(1_000_001));
+        assert!(DIGIBYTE_MAIN.work_checkable_at(u32::MAX) && WOJAKCOIN_MAIN.work_checkable_at(u32::MAX));
     }
 
     fn child(p: &ChainParams, parent: &Header, time: u32, bits: u32) -> Header {

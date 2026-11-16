@@ -1614,6 +1614,24 @@ impl Registry {
         self.punished.contains(key)
     }
 
+    /// The address an owner is paid at, as its registration named it.
+    pub fn payout_of(&self, owner: &Key) -> Option<Payout> {
+        self.owners.get(owner).map(|o| o.payout)
+    }
+
+    /// An owner's turn in each audit period ([`turn`]): its pay is released at the blocks whose height leaves this
+    /// remainder.
+    pub fn turn_of(&self, owner: &Key) -> Option<u64> {
+        self.owners.get(owner).map(|o| o.turn)
+    }
+
+    /// An owner's replicas: their bytes, the audits each missed in a row, and the height each counts for the draw from.
+    pub fn replicas_of(&self, owner: &Key) -> Vec<(u64, u32, Option<u64>)> {
+        self.owners.get(owner).map_or_else(Vec::new, |o| {
+            o.replicas.iter().filter_map(|id| self.replicas.get(id)).map(|r| (r.bytes, r.missed, r.draw_from)).collect()
+        })
+    }
+
     /// At an owner's turn: its audits for the period ahead, drawn with the turn block's seed.
     fn draw_audits(&mut self, height: u64, seed: &Hash, ops: &mut Vec<Op>) {
         let t = height % self.net.audit_period;

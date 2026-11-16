@@ -39,6 +39,19 @@ const ALLOCATION_RATE: f64 = 1_500_000.0;
 const TOTAL_RATE: f64 = 25_000_000.0;
 pub const MONTH_LIMIT_GB: f64 = 100.0;
 const SAVE_EVERY: Duration = Duration::from_secs(60);
+/// Logins lent to other arcades' players ("tu", answer_tu) are counted by the host the asking
+/// link comes from (crate::refill::host_group; node ids cost nothing to make): at most
+/// LEND_PER_HOST per LEND_WINDOW for one host and LEND_ALL for all, and what one host's logins
+/// use is limited to HOST_ALLOCATIONS at once, HOST_RATE bytes a second (a few cameras) and
+/// HOST_SHARE of the month's limit. The rest of the relay stays for everyone else.
+const LEND_WINDOW: u64 = 600;
+const LEND_PER_HOST: u32 = 30;
+const LEND_ALL: u32 = 300;
+const HOST_ALLOCATIONS: usize = 64;
+const HOST_RATE: f64 = 5_000_000.0;
+const HOST_SHARE: f64 = 0.1;
+/// Hosts whose month's use is kept at most; past it, those with no live login go.
+const HOSTS_KEPT: usize = 4096;
 
 const MAGIC: u32 = 0x2112_A442;
 const ALLOCATE: u16 = 0x003;
@@ -271,6 +284,8 @@ struct Allocation {
     numbers: HashMap<SocketAddrV4, (u16, Instant)>,
     bucket: Bucket,
     stop: Arc<AtomicBool>,
+    /// The host its login was lent to (answer_tu); None for this arcade's own players.
+    host: Option<String>,
 }
 
 struct Turn {
@@ -287,6 +302,13 @@ struct Turn {
     /// Addresses of this machine (never relayed to) and the IPv4 a relay socket is reached at.
     own: Vec<Ipv4Addr>,
     outside: Option<Ipv4Addr>,
+    /// Logins lent to other arcades: username -> the host it was lent to.
+    lent: HashMap<String, String>,
+    /// Logins lent in the current LEND_WINDOW: (window start, per host, in all).
+    lent_window: (u64, HashMap<String, u32>, u32),
+    /// Per host its logins went to: bytes relayed this month, and its rate.
+    host_bytes: HashMap<String, u64>,
+    host_rate: HashMap<String, Bucket>,
 }
 
 fn st() -> &'static Mutex<Option<Turn>> {
@@ -344,6 +366,10 @@ pub fn init(node: &Node, sock: Arc<UdpSocket>) {
         saved_at: Instant::now(),
         own: own_ipv4s(),
         outside: None,
+        lent: HashMap::new(),
+        lent_window: (0, HashMap::new(), 0),
+        host_bytes: HashMap::new(),
+        host_rate: HashMap::new(),
     });
     let _ = node.app.event("mesh", "media relay (TURN) on the STUN port");
 }
@@ -365,17 +391,34 @@ impl Turn {
         self.bytes as f64 >= self.limit_gb * 1e9
     }
 
-    fn pass_through(&mut self, client: &SocketAddr, size: usize) -> bool {
+    fn new_month(&mut self) {
         let month = this_month();
         if month != self.month {
             self.month = month;
             self.bytes = 0;
+            self.host_bytes.clear();
         }
+    }
+
+    /// A lending host's share of the month is used up.
+    fn host_over(&self, host: &str) -> bool {
+        self.host_bytes.get(host).copied().unwrap_or(0) as f64 >= self.limit_gb * 1e9 * HOST_SHARE
+    }
+
+    fn pass_through(&mut self, client: &SocketAddr, size: usize) -> bool {
+        self.new_month();
         if self.over_limit() || !self.total.take(size) {
             return false;
         }
-        if !self.allocations.get_mut(client).is_some_and(|a| a.bucket.take(size)) {
+        let Some(a) = self.allocations.get_mut(client) else { return false };
+        if !a.bucket.take(size) {
             return false;
+        }
+        if let Some(h) = a.host.clone() {
+            if self.host_over(&h) || !self.host_rate.entry(h.clone()).or_insert_with(|| Bucket::new(HOST_RATE)).take(size) {
+                return false;
+            }
+            *self.host_bytes.entry(h).or_default() += size as u64;
         }
         self.bytes += size as u64;
         if self.saved_at.elapsed() > SAVE_EVERY {
@@ -400,7 +443,51 @@ impl Turn {
         if let Some(a) = self.allocations.remove(client) {
             a.stop.store(true, Ordering::Relaxed);
             self.by_address.remove(&a.address);
+            if let Some(h) = a.host {
+                if !self.allocations.values().any(|x| x.host.as_ref() == Some(&h)) {
+                    self.host_rate.remove(&h);
+                }
+            }
         }
+    }
+
+    /// Whether `user` (lent to `host`, if it was) may have one more allocation.
+    fn may_allocate(&self, user: &str, host: Option<&str>) -> bool {
+        if self.over_limit() || self.allocations.len() >= MAX_ALLOCATIONS || self.allocations.values().filter(|a| a.user == user).count() >= MAX_PER_LOGIN {
+            return false;
+        }
+        match host {
+            Some(h) => !self.host_over(h) && self.allocations.values().filter(|a| a.host.as_deref() == Some(h)).count() < HOST_ALLOCATIONS,
+            None => true,
+        }
+    }
+
+    /// A login for one of another arcade's players, asked over a link from `host`; None when the
+    /// relay is off or over its limit, or that host (or everyone) had their logins for now.
+    fn lend(&mut self, host: &str, tag: &str) -> Option<(String, String)> {
+        self.new_month();
+        if self.over_limit() || self.host_over(host) {
+            return None;
+        }
+        let now = now_s();
+        if now.saturating_sub(self.lent_window.0) >= LEND_WINDOW {
+            self.lent_window = (now, HashMap::new(), 0);
+        }
+        let (_, per, all) = &mut self.lent_window;
+        let n = per.get(host).copied().unwrap_or(0);
+        if n >= LEND_PER_HOST || *all >= LEND_ALL {
+            return None;
+        }
+        per.insert(host.to_string(), n + 1);
+        *all += 1;
+        let (u, p) = login_with(&self.secret, tag, LOGIN_TTL);
+        self.lent.retain(|name, _| name.split(':').next().and_then(|s| s.parse::<u64>().ok()).is_some_and(|t| t > now));
+        self.lent.insert(u.clone(), host.to_string());
+        if self.host_bytes.len() > HOSTS_KEPT {
+            let live: std::collections::HashSet<&String> = self.lent.values().collect();
+            self.host_bytes.retain(|h, _| live.contains(h));
+        }
+        Some((u, p))
     }
 
     fn sweep(&mut self) {
@@ -595,7 +682,8 @@ fn allocate(t: &mut Turn, m: &Msg, client: SocketAddr, key: &[u8], user: String)
         t.error(ALLOCATE, &m.tid, 442, "Unsupported Transport Protocol", client, Some(key), false);
         return;
     }
-    if t.over_limit() || t.allocations.len() >= MAX_ALLOCATIONS || t.allocations.values().filter(|a| a.user == user).count() >= MAX_PER_LOGIN {
+    let host = t.lent.get(&user).cloned();
+    if !t.may_allocate(&user, host.as_deref()) {
         t.error(ALLOCATE, &m.tid, 486, "Allocation Quota Reached", client, Some(key), false);
         return;
     }
@@ -622,6 +710,7 @@ fn allocate(t: &mut Turn, m: &Msg, client: SocketAddr, key: &[u8], user: String)
         numbers: HashMap::new(),
         bucket: Bucket::new(ALLOCATION_RATE),
         stop: stop.clone(),
+        host,
     });
     t.by_address.insert(address, client);
     let _ = relay.set_read_timeout(Some(Duration::from_secs(1)));
@@ -687,11 +776,7 @@ fn to_peer(t: &mut Turn, client: SocketAddr, data: &[u8], peer: SocketAddrV4) {
 pub fn charge(bytes: usize) -> bool {
     let mut g = st().lock().unwrap();
     let Some(t) = g.as_mut() else { return false };
-    let month = this_month();
-    if month != t.month {
-        t.month = month;
-        t.bytes = 0;
-    }
+    t.new_month();
     if t.over_limit() || !t.total.take(bytes) {
         return false;
     }
@@ -759,10 +844,16 @@ fn with_v4(servers: Vec<Value>, count: usize) -> Vec<Value> {
     pick
 }
 
-/// "tu" from a linked arcade: a login on this relay for one of its players (shares.rs answer).
-pub fn answer_tu(peer: &str, tag: &str) -> Result<Value, String> {
+/// "tu" from a linked arcade: a login on this relay for one of its players (shares.rs answer),
+/// within what is lent to the host its link comes from (`host`).
+pub fn answer_tu(peer: &str, host: &str, tag: &str) -> Result<Value, String> {
     let tag: String = tag.chars().take(64).collect();
-    let (u, p) = login(&format!("{peer}:{tag}")).ok_or("no relay here")?;
+    let mut g = st().lock().unwrap();
+    let t = g.as_mut().ok_or("no relay here")?;
+    if t.over_limit() {
+        return Err("no relay here".into());
+    }
+    let (u, p) = t.lend(host, &format!("{peer}:{tag}")).ok_or("this relay lent its logins for now; try again later")?;
     Ok(json!({"u": u, "p": p}))
 }
 
@@ -882,6 +973,110 @@ mod tests {
         assert!(may_reach(Ipv4Addr::new(192, 168, 1, 9), home, &own), "a client already on one");
         assert!(!may_reach(Ipv4Addr::LOCALHOST, home, &own));
         assert!(!may_reach(own[0], public, &own), "never this machine");
+    }
+
+    fn turn() -> Turn {
+        Turn {
+            sock: Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap()),
+            secret: vec![7; 32],
+            usage_file: std::env::temp_dir().join("arcade-turn-test-unused.json"),
+            limit_gb: 1.0,
+            allocations: HashMap::new(),
+            by_address: HashMap::new(),
+            total: Bucket::new(TOTAL_RATE),
+            month: this_month(),
+            bytes: 0,
+            saved_at: Instant::now(),
+            own: vec![],
+            outside: None,
+            lent: HashMap::new(),
+            lent_window: (0, HashMap::new(), 0),
+            host_bytes: HashMap::new(),
+            host_rate: HashMap::new(),
+        }
+    }
+
+    fn alloc(t: &mut Turn, relay: &Arc<UdpSocket>, port: u16, user: &str, host: Option<&str>) -> SocketAddr {
+        let client: SocketAddr = format!("198.51.100.9:{port}").parse().unwrap();
+        let address = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 1), port);
+        t.allocations.insert(client, Allocation {
+            user: user.into(),
+            tid: [0; 12],
+            relay: relay.clone(),
+            address,
+            expires: Instant::now() + Duration::from_secs(600),
+            permissions: HashMap::new(),
+            channels: HashMap::new(),
+            numbers: HashMap::new(),
+            bucket: Bucket::new(ALLOCATION_RATE),
+            stop: Arc::new(AtomicBool::new(false)),
+            host: host.map(String::from),
+        });
+        t.by_address.insert(address, client);
+        client
+    }
+
+    #[test]
+    fn logins_lent_per_host_and_in_all() {
+        let mut t = turn();
+        // One host (however many node ids ask from it): LEND_PER_HOST a window.
+        for i in 0..LEND_PER_HOST {
+            let (u, _) = t.lend("198.51.100.7", &format!("id{i}:player")).unwrap();
+            assert_eq!(t.lent[&u], "198.51.100.7");
+        }
+        assert!(t.lend("198.51.100.7", "another-id:player").is_none());
+        // Another host still gets its own.
+        assert!(t.lend("192.0.2.44", "b:player").is_some());
+        // In all: LEND_ALL a window.
+        let mut n = LEND_PER_HOST + 1;
+        for h in 0..100u32 {
+            for i in 0..LEND_PER_HOST {
+                if t.lend(&format!("10.0.{h}.1"), &format!("{h}:{i}")).is_some() {
+                    n += 1;
+                }
+            }
+        }
+        assert_eq!(n, LEND_ALL);
+        assert!(t.lend("192.0.2.99", "c:player").is_none());
+        // The next window: lent again.
+        t.lent_window.0 = now_s() - LEND_WINDOW;
+        assert!(t.lend("198.51.100.7", "id0:player").is_some());
+        // A host that used its share of the month: none.
+        t.host_bytes.insert("192.0.2.44".into(), (t.limit_gb * 1e9 * HOST_SHARE) as u64);
+        assert!(t.lend("192.0.2.44", "b:player").is_none());
+    }
+
+    #[test]
+    fn a_lending_host_gets_only_its_share_of_the_relay() {
+        let mut t = turn();
+        let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let (a, b) = ("198.51.100.7", "192.0.2.44");
+        // Allocations: HOST_ALLOCATIONS per lending host, over many logins.
+        for i in 0..HOST_ALLOCATIONS {
+            assert!(t.may_allocate(&format!("u{i}"), Some(a)));
+            alloc(&mut t, &relay, 1000 + i as u16, &format!("u{i}"), Some(a));
+        }
+        assert!(!t.may_allocate("u-next", Some(a)));
+        assert!(t.may_allocate("u-next", Some(b)), "another host");
+        assert!(t.may_allocate("own-player", None), "this arcade's own players");
+        // Rate: HOST_RATE a second for all of a host's allocations together.
+        let clients: Vec<SocketAddr> = (0..4).map(|i| format!("198.51.100.9:{}", 1000 + i).parse().unwrap()).collect();
+        let chunk = 1_400_000;
+        assert!(clients[..3].iter().all(|c| t.pass_through(c, chunk)));
+        assert!(!t.pass_through(&clients[3], chunk), "past the host's rate");
+        let other = alloc(&mut t, &relay, 2000, "v", Some(b));
+        let own = alloc(&mut t, &relay, 2001, "w", None);
+        assert!(t.pass_through(&other, chunk) && t.pass_through(&own, chunk));
+        assert_eq!(t.host_bytes[a], 3 * chunk as u64);
+        // Month: HOST_SHARE of the limit per host; the others go on.
+        t.host_bytes.insert(b.into(), (t.limit_gb * 1e9 * HOST_SHARE) as u64);
+        assert!(!t.pass_through(&other, 100));
+        assert!(!t.may_allocate("v2", Some(b)));
+        assert!(t.pass_through(&own, 100));
+        // A host's rate goes with its last allocation.
+        t.drop_allocation(&other);
+        assert!(!t.host_rate.contains_key(b));
+        assert!(t.host_rate.contains_key(a));
     }
 
     #[test]

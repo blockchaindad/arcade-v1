@@ -4,7 +4,10 @@
 //! - Coin keys: BIP32/BIP44 m/44'/<coin>'/0'/0/<i>, matching the existing arcade's
 //!   coins.js (coin type: test 1, main/doge/ltc/dgb/kot/flop 3). Tag i uses index i, so one
 //!   phrase holds several tags (one tag per address on chain).
+//! - Address kinds (AddrKind) on SegWit chains: m/49' nested SegWit, m/84' native SegWit,
+//!   m/86' Taproot, each with the chain's own coin type and the same tag index.
 
+use arcade_chain::params::ChainParams;
 use hmac::{Hmac, KeyInit, Mac};
 use secp256k1::{PublicKey, Scalar, SecretKey, SECP256K1};
 use sha2::Sha512;
@@ -134,6 +137,112 @@ impl XPriv {
 /// The coin key for tag slot `index` on a chain: m/44'/coin'/0'/0/index.
 pub fn tag_key(seed: &[u8], coin_type: u32, index: u32) -> Result<XPriv, KeyError> {
     XPriv::master(seed)?.derive(&[44 | HARDENED, coin_type | HARDENED, HARDENED, 0, index])
+}
+
+/// A kind of address the wallet's words give on a chain, as the existing arcade's Wallet card
+/// offers them (wallet_js.js ADDRESS_KINDS): each kind has its own key, at its BIP purpose
+/// with the chain's own coin type (the one Legacy already uses), so Legacy addresses never
+/// change. Menu order: Legacy, P2SH (Nested SegWit), Native SegWit, Taproot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum AddrKind {
+    /// P2PKH, m/44'.
+    Legacy,
+    /// BIP49: P2WPKH wrapped in P2SH, m/49'.
+    NestedSegwit,
+    /// BIP84: P2WPKH (bech32), m/84'.
+    NativeSegwit,
+    /// BIP86: the key-path-only Taproot output (bech32m), m/86'.
+    Taproot,
+}
+
+impl AddrKind {
+    pub const ALL: [AddrKind; 4] = [AddrKind::Legacy, AddrKind::NestedSegwit, AddrKind::NativeSegwit, AddrKind::Taproot];
+
+    /// The id the API and the existing arcade use.
+    pub fn id(self) -> &'static str {
+        match self {
+            AddrKind::Legacy => "legacy",
+            AddrKind::NestedSegwit => "p2sh-p2wpkh",
+            AddrKind::NativeSegwit => "p2wpkh",
+            AddrKind::Taproot => "p2tr",
+        }
+    }
+
+    pub fn from_id(s: &str) -> Option<AddrKind> {
+        AddrKind::ALL.into_iter().find(|k| k.id() == s)
+    }
+
+    /// The menu's words.
+    pub fn label(self) -> &'static str {
+        match self {
+            AddrKind::Legacy => "Legacy",
+            AddrKind::NestedSegwit => "P2SH (Nested SegWit)",
+            AddrKind::NativeSegwit => "Native SegWit",
+            AddrKind::Taproot => "Taproot",
+        }
+    }
+
+    /// The BIP43 purpose of the kind's key.
+    pub fn purpose(self) -> u32 {
+        match self {
+            AddrKind::Legacy => 44,
+            AddrKind::NestedSegwit => 49,
+            AddrKind::NativeSegwit => 84,
+            AddrKind::Taproot => 86,
+        }
+    }
+
+    /// The derivation path as people read it: m/84'/3'/0'/0/0.
+    pub fn path(self, coin_type: u32, index: u32) -> String {
+        format!("m/{}'/{coin_type}'/0'/0/{index}", self.purpose())
+    }
+}
+
+/// The address kinds a chain offers, in menu order (Legacy first, the default). Chains with
+/// SegWit as the existing arcade offers them: Litecoin and DigiByte (and their test chains) all
+/// four; Bellscoin Legacy and Native SegWit (its scripthash byte is Dogecoin's "D", so no
+/// nested kind; no Taproot there); Bitcoin all four, since V1.0 keeps it. Everything else
+/// (Dogecoin, Pepecoin, ...) has Legacy alone, and shows no menu.
+pub fn kinds_for(p: &ChainParams) -> &'static [AddrKind] {
+    const LEGACY: &[AddrKind] = &[AddrKind::Legacy];
+    if !p.format.segwit || p.bech32_hrp.is_none() {
+        return LEGACY;
+    }
+    match p.key {
+        "btc" | "ltc" | "ltctest" | "ltcregtest" | "dgb" | "dgbtest" => &AddrKind::ALL,
+        "bel" => &[AddrKind::Legacy, AddrKind::NativeSegwit],
+        _ => LEGACY,
+    }
+}
+
+/// The key of address kind `kind` for tag slot `index`: m/<purpose>'/coin'/0'/0/index.
+pub fn kind_key(seed: &[u8], kind: AddrKind, coin_type: u32, index: u32) -> Result<XPriv, KeyError> {
+    XPriv::master(seed)?.derive(&[kind.purpose() | HARDENED, coin_type | HARDENED, HARDENED, 0, index])
+}
+
+/// The output script an address of `kind` of key `pk` pays to.
+pub fn kind_script(kind: AddrKind, pk: &PublicKey) -> Vec<u8> {
+    use arcade_ledger::address::{hash160, p2pkh_script, p2sh_script, p2wpkh_script};
+    let h = hash160(&pk.serialize());
+    match kind {
+        AddrKind::Legacy => p2pkh_script(&h),
+        AddrKind::NestedSegwit => p2sh_script(&hash160(&p2wpkh_script(&h))),
+        AddrKind::NativeSegwit => p2wpkh_script(&h),
+        AddrKind::Taproot => crate::taproot::p2tr_script(&crate::taproot::output_key(pk).expect("a tweak that fails is astronomically unlikely")),
+    }
+}
+
+/// The address of `kind` of key `pk` on chain `p`; None where the chain has no such address
+/// (no bech32 prefix).
+pub fn kind_address(p: &ChainParams, kind: AddrKind, pk: &PublicKey) -> Option<String> {
+    use arcade_ledger::address::{base58check, bech32, hash160, p2wpkh_script};
+    let h = hash160(&pk.serialize());
+    Some(match kind {
+        AddrKind::Legacy => base58check(p.p2pkh_version, &h),
+        AddrKind::NestedSegwit => base58check(p.p2sh_version, &hash160(&p2wpkh_script(&h))),
+        AddrKind::NativeSegwit => bech32::encode_segwit(p.bech32_hrp?, 0, &h),
+        AddrKind::Taproot => bech32::encode_segwit(p.bech32_hrp?, 1, &crate::taproot::output_key(pk)?.serialize()),
+    })
 }
 
 /// P2PKH address of a key on a chain.
@@ -284,6 +393,57 @@ mod tests {
         assert_eq!(hex::encode(&seed[..8]), "5eb00bbddcf06908");
         let k = tag_key(&seed[..], 0, 0).unwrap();
         assert_eq!(p2pkh_address(&k.public(), 0), "1LqBGSKuX5yYUonjxT5qGfpUsXKYYWeabA");
+    }
+
+    /// BIP49 / BIP84 / BIP86 test vectors: "abandon ... about", Bitcoin mainnet, first address.
+    #[test]
+    fn bip49_84_86_vectors() {
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let seed = seed_from_phrase(phrase).unwrap();
+        let p = &arcade_chain::params::BITCOIN_MAIN;
+        let want = [
+            (AddrKind::Legacy, "1LqBGSKuX5yYUonjxT5qGfpUsXKYYWeabA"),
+            (AddrKind::NestedSegwit, "37VucYSaXLCAsxYyAPfbSi9eh4iEcbShgf"),
+            (AddrKind::NativeSegwit, "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu"),
+            (AddrKind::Taproot, "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr"),
+        ];
+        for (kind, addr) in want {
+            let k = kind_key(&seed[..], kind, 0, 0).unwrap();
+            assert_eq!(kind_address(p, kind, &k.public()).unwrap(), addr, "{kind:?}");
+            // The address reads back as the kind's script.
+            assert_eq!(arcade_ledger::address::script_for_address(p, addr).unwrap(), kind_script(kind, &k.public()), "{kind:?}");
+            assert_eq!(AddrKind::from_id(kind.id()), Some(kind));
+        }
+        // BIP84's second receiving address, and BIP86's.
+        let k = kind_key(&seed[..], AddrKind::NativeSegwit, 0, 1).unwrap();
+        assert_eq!(kind_address(p, AddrKind::NativeSegwit, &k.public()).unwrap(), "bc1qnjg0jd8228aq7egyzacy8cys3knf9xvrerkf9g");
+        let k = kind_key(&seed[..], AddrKind::Taproot, 0, 1).unwrap();
+        assert_eq!(kind_address(p, AddrKind::Taproot, &k.public()).unwrap(), "bc1p4qhjn9zdvkux4e44uhx8tc55attvtyu358kutcqkudyccelu0was9fqzwh");
+        // Legacy is the tag key itself: the same path as before.
+        assert_eq!(kind_key(&seed[..], AddrKind::Legacy, 3, 2).unwrap().key, tag_key(&seed[..], 3, 2).unwrap().key);
+        assert_eq!(AddrKind::Taproot.path(3, 0), "m/86'/3'/0'/0/0");
+    }
+
+    #[test]
+    fn kinds_per_chain() {
+        use arcade_chain::params::*;
+        let ids = |p: &ChainParams| kinds_for(p).iter().map(|k| k.id()).collect::<Vec<_>>().join(",");
+        for p in [&LITECOIN_MAIN, &LITECOIN_TEST, &DIGIBYTE_MAIN, &DIGIBYTE_TEST, &BITCOIN_MAIN] {
+            assert_eq!(ids(p), "legacy,p2sh-p2wpkh,p2wpkh,p2tr", "{}", p.key);
+        }
+        assert_eq!(ids(&BELLSCOIN_MAIN), "legacy,p2wpkh");
+        for p in [&DOGECOIN_MAIN, &PEPECOIN_MAIN, &PEPECOIN_TEST, &KOTIA_MAIN, &LUCKYCOIN_MAIN] {
+            assert_eq!(ids(p), "legacy", "{}", p.key);
+        }
+        // Each kind's address has the chain's own prefix.
+        let k = SecretKey::from_slice(&[9u8; 32]).unwrap().public_key(SECP256K1);
+        assert!(kind_address(&LITECOIN_MAIN, AddrKind::NativeSegwit, &k).unwrap().starts_with("ltc1q"));
+        assert!(kind_address(&LITECOIN_MAIN, AddrKind::Taproot, &k).unwrap().starts_with("ltc1p"));
+        assert!(kind_address(&LITECOIN_MAIN, AddrKind::NestedSegwit, &k).unwrap().starts_with('M'));
+        assert!(kind_address(&DIGIBYTE_MAIN, AddrKind::Taproot, &k).unwrap().starts_with("dgb1p"));
+        assert!(kind_address(&DIGIBYTE_MAIN, AddrKind::NestedSegwit, &k).unwrap().starts_with('S'));
+        assert!(kind_address(&LITECOIN_TEST, AddrKind::NativeSegwit, &k).unwrap().starts_with("tltc1q"));
+        assert!(kind_address(&BELLSCOIN_MAIN, AddrKind::NativeSegwit, &k).unwrap().starts_with("bel1q"));
     }
 
     #[test]

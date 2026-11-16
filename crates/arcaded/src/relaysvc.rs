@@ -697,6 +697,28 @@ fn run_end(node: Arc<Node>, e: Arc<End>, ip: String, dialer: bool) {
     }
 }
 
+/// A link to `peer` is wanted now (a buyer of its shared model, llmsvc): ask the first relay that lists it to open one,
+/// whichever of the two ids is lower (round() leaves that to the lower id, which may not be asking). False when no
+/// relay we use lists it, or one is already open or being asked for.
+pub fn want(node: &Node, peer: &str) -> bool {
+    let mut st = g().lock().unwrap();
+    if peer == node.id_hex() || st.up.contains_key(peer) || st.asking.values().any(|a| a.1 == peer) || linked(node, peer) {
+        return false;
+    }
+    if st.ends.len() + st.asking.len() >= MAX_OWN {
+        return false;
+    }
+    let Some(relay) = st.relays.iter().find(|(_, ids)| ids.iter().any(|i| i == peer)).map(|(r, _)| r.clone()) else { return false };
+    // Asked for by hand: a cooling-off from an earlier try doesn't stop this one.
+    st.cooling.remove(peer);
+    let n = format!("{:016x}", rand_core::RngCore::next_u64(&mut rand_core::OsRng));
+    st.asking.insert(n.clone(), (relay.clone(), peer.to_string(), Instant::now()));
+    st.ctl.entry(relay.clone()).or_default().push_back(rl(json!({"op": "open", "n": n, "to": peer})));
+    drop(st);
+    let _ = node.app.event("mesh", &format!("asked relay {} for a link to {} (wanted now)", short(&relay), short(peer)));
+    true
+}
+
 /// Every so often: ask our relays for links to arcades we can't otherwise reach.
 pub fn round(node: &Node) {
     let mut st = g().lock().unwrap();

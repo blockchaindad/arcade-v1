@@ -10,8 +10,9 @@ Everything the desktop app does goes through one set of commands. Programs reach
 
 **Only this computer.** `/rpc` and `/api/v1` answer only requests from this computer, addressed to
 `127.0.0.1`, `localhost` or `[::1]` with the arcade's port (the `Host` header), that didn't come
-through a proxy (requests carrying `X-Forwarded-For`, `Forwarded` or `X-Real-IP` are refused). A
-reverse proxy or tunnel that adds none of those (a plain `proxy_pass`, `ssh -L`, `socat`) would make
+through a proxy (requests carrying a proxy's headers, such as `X-Forwarded-*`, `Forwarded`, `Via`,
+`X-Real-IP`, `CF-Connecting-IP` or `True-Client-IP`, are refused). A reverse proxy or tunnel that
+adds none of those (a plain `proxy_pass`, `ssh -L`, `socat`) would make
 its visitors look like this computer: run arcaded with `--behind-proxy` there, and nothing over the
 web port counts as this computer (programs then use the socket). Answers carry no CORS headers. The
 operator can open the HTTP port (`arcaded --http-bind 0.0.0.0`) and serve a website from it
@@ -103,8 +104,9 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 |---|---|---|---|---|
 | `wallet.create` | `/api/v1/wallet/create` | local | phrase? | Create a wallet (or restore one from 12 words). Returns the new words once. |
 | `wallet.phrase` | `/api/v1/wallet/phrase` | local | — | The wallet's 12 words. |
-| `wallet.keys` | `/api/v1/wallet/keys` | read | chain? | Your addresses on a chain, their @tags and balances. balance follows the mempool (confirmed coins less those a waiting transaction spends, plus waiting outputs to you); confirmed is the blocks' figure; free the confirmed coins spendable now (not spent by a waiting transaction, mature, no inscription); pending / pending_coins what is arriving; waiting and dropped this wallet's transactions in the mempool and those that left it without a block. |
-| `wallet.send` | `/api/v1/wallet/send` | local | chain?, to, amount, from?, send? | Pay amount (satoshis) on a chain (home, installed or borrowed) from this wallet (from: one of its addresses or an imported wallet's; otherwise the own address with the most), signed here; send: true broadcasts, otherwise it's only built and shown with its fee (and a warning when the address could be meant for another chain). |
+| `wallet.keys` | `/api/v1/wallet/keys` | read | chain? | Your addresses on a chain, their @tags and balances (on SegWit chains each address type's address and balance under kinds; balance counts every type). balance follows the mempool (confirmed coins less those a waiting transaction spends, plus waiting outputs to you); confirmed is the blocks' figure; free the confirmed coins spendable now (not spent by a waiting transaction, mature, no inscription); pending / pending_coins what is arriving; waiting and dropped this wallet's transactions in the mempool and those that left it without a block. |
+| `wallet.addr_kind` | `/api/v1/wallet/addr_kind` | wallet | chain, kind? | The address type the Wallet shows on a chain (legacy, p2sh-p2wpkh, p2wpkh, p2tr; remembered per chain) and the types it offers; kind: remember that one. |
+| `wallet.send` | `/api/v1/wallet/send` | local | chain?, to, amount, from?, kind?, all_kinds?, send? | Pay amount (satoshis) on a chain (home, installed or borrowed) from this wallet (from: one of its addresses or an imported wallet's; otherwise the own address with the most), signed here; kind: the address type it's sent from, change back to it (default: from's type, else the one the Wallet shows); all_kinds: also spend the wallet's other address types' coins; send: true broadcasts, otherwise it's only built and shown with its fee (and a warning when the address could be meant for another chain). |
 | `wallet.link` | `/api/v1/wallet/link` | wallet | chain, wif, tag | Link another wallet to your @tag (signed by both keys). |
 | `wallet.unlink` | `/api/v1/wallet/unlink` | wallet | chain, address, tag | Remove a linked wallet. |
 | `wallet.links` | `/api/v1/wallet/links` | read | chain | Your linked wallets on a chain. |
@@ -164,6 +166,7 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | `msg.send` | `/api/v1/msg/send` | message | to, text?, file? | Send a private message to a @tag, address or key; file = {name, type, data (base64)}. |
 | `msg.delete` | `/api/v1/msg/delete` | message | id | Stop showing a message here (the chain keeps it). |
 | `msg.announce` | `/api/v1/msg/announce` | wallet | — | Publish your messaging key now if it isn't on chain. |
+| `profile.publish_addresses` | `/api/v1/profile/publish_addresses` | wallet | send? | List this wallet's own addresses (Pepecoin mainnet, Dogecoin, each other coin installed here) on your @tag's profile, keeping the rest of it; no private key is pasted. send: true broadcasts, otherwise it's only built and shown with its fee and total cost. |
 
 ### Contacts
 
@@ -260,6 +263,7 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | `chains.remove` | `/api/v1/chains/remove` | admin | key | Remove a chain and its data. |
 | `chains.copy_status` | `/api/v1/chains/copy_status` | public | key? | Core-data copies (cb) linked arcades offer for installed chains, the fetch and import in progress, and whether a chain's coin set is trusted from a copy or verified. |
 | `chains.copy_start` | `/api/v1/chains/copy_start` | admin | key, what? | Bootstrap a chain from the best copy offered: what = coins (the coin set; missing blocks are fetched from the network and stored, default) or all (the copy's blocks too). |
+| `chains.copy_from_dir` | `/api/v1/chains/copy_from_dir` | admin | key, dir | Bootstrap a chain once from a Core datadir on this computer (dir: the folder holding blocks/ and chainstate/, e.g. an old arcade's Dogecoin Core), instead of a copy fetched over the mesh. Read in place and never written; refused while that Core runs (stop it first), if pruned, or of another chain. Taken in as an all copy (headers checked by proof of work, every coin against our blocks), trusted until re-checked from the blocks in the background. This arcade keeps its own database afterwards: the folder can be removed later. |
 | `chains.copy_cancel` | `/api/v1/chains/copy_cancel` | admin | key | Stop fetching a copy (its pieces are deleted) or decline the offer: the chain syncs the usual way. |
 | `chains.refill` | `/api/v1/chains/refill` | admin | key, from?, to?, sources? | Fetch back block bodies lost here (pruned, and no sealed copy answers for them) between from and to (default: the whole chain), 50 at a time: a batch is taken only when at least sources (default 2, at most 5) independent sources (different node ids and IP addresses: arcades holding the blocks, arcades lending their Core, coin P2P peers) sent the same bytes, each block matching our header, merkle root and stored txids. Runs in the background; see chains.refill_status. |
 | `chains.refill_status` | `/api/v1/chains/refill_status` | public | key? | Block refills (chains.refill): state, heights from/to/at, lost bodies found, restored, batches that couldn't be agreed, and the sources that agreed last. |
@@ -289,7 +293,7 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | `borrow.status` | `/api/v1/borrow/status` | read | — | Borrowed coins: the switches, and per chain its lenders, tip, floor, tip mismatch and your balance. |
 | `borrow.set` | `/api/v1/borrow/set` | admin | on, chain? | Turn borrowing on or off: for every coin (no chain) or for one chain (off removes its borrowed data). |
 | `borrow.coins` | `/api/v1/borrow/coins` | read | chain | Your coins on a borrowed chain (from blocks read since the floor, and the lender's coin scan). |
-| `borrow.send` | `/api/v1/borrow/send` | local | chain, to, amount, from?, send? | Pay amount (satoshis) on a borrowed chain, signed here; send: true broadcasts to every lender, otherwise only built and shown. |
+| `borrow.send` | `/api/v1/borrow/send` | local | chain, to, amount, from?, kind?, all_kinds?, send? | Pay amount (satoshis) on a borrowed chain, signed here (kind, all_kinds: as wallet.send); send: true broadcasts to every lender, otherwise only built and shown. |
 
 ### Mining
 
@@ -303,7 +307,7 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 
 | method | route | needs | params | what |
 |---|---|---|---|---|
-| `apps.store` | `/api/v1/apps/store` | public | sort?, q?, flagged? | The App Store: app cards from every chain with the arcade ledger (popular or new; starred first). |
+| `apps.store` | `/api/v1/apps/store` | public | sort?, q?, flagged? | The App Store: app cards from every chain with the arcade ledger (popular or new; starred first). Each card's `trust` {level, holders, checked, note}: green = this arcade's ledger or 2+ arcades alike, yellow = one arcade's word. |
 | `apps.installed` | `/api/v1/apps/installed` | read | — | Apps installed on this arcade, each at its newest version. |
 | `apps.install` | `/api/v1/apps/install` | admin | chain, txid | Install an app (it follows its author's updates). |
 | `apps.uninstall` | `/api/v1/apps/uninstall` | admin | id | Uninstall an app. |
@@ -316,7 +320,7 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | `apps.owner` | `/api/v1/apps/owner` | read | page | arcade.owner.identity: whether this wallet created the page and still holds it. |
 | `apps.owner_send` | `/api/v1/apps/owner_send` | local | page, request | arcade.owner.send: a page this wallet created and holds sends at once (testnet). |
 | `apps.node` | `/api/v1/apps/node` | local | op, page, to?, body?, after?, limit? | arcade.node for a page: identity, send (sealed node-to-node), sent, replies. |
-| `apps.launch` | `/api/v1/apps/launch` | read | chain, txid | What an app window opens: the sandboxed page URL and the card. |
+| `apps.launch` | `/api/v1/apps/launch` | read | chain, txid | What an app window opens: the sandboxed page URL and the card; `caution` when the version that opens is one arcade's word. |
 
 ### Realtime
 
@@ -408,6 +412,18 @@ pays with the key that holds that tag on ARCADE: one of the wallet's own, or a k
 `wallet.import {chain: "arctest", secret: <WIF or words>}` (kept encrypted like the wallet). Without `as`, nothing changes.
 `scripts/git-publish.py --as @tag` uses it. A text record (an issue, a comment) is two transactions, its text's blob and
 the record, so it waits until the key has a free coin for each.
+
+**Plain `git push` and `git clone`:** `scripts/git-remote-arcade` is a git remote helper (put it on PATH). With the remote
+`arcade::@owner/name`, `git clone`, `git fetch` and `git push` work through this computer's arcade socket: a push packs
+what the repository's manifest doesn't reach yet, publishes it (any size: a pack over 3.5 MB, one big file, goes as
+parts joined by a file manifest blob, `{"arcade": "file", ...}`, which the arcade's git reads join back), then the
+manifest and the push record; a push that isn't a fast-forward needs `--force`, and the first push to a name under
+your own tag creates it. Settings: `ARCADE_SOCK`/`git config arcade.sock`, `ARCADE_AS`/`arcade.as` (sign as a tag).
+
+**Arcades that borrow the ARCADE chain** (it isn't installed, so no ledger or blobs are kept) answer `/r/git/*` and
+`/git/*` by asking an arcade that lends the chain (core RPC method `arcade_git [path, query]` →
+`{code, ctype, gzip, b64}`); packs, indexes and blobs are kept 96 MB deep. The lender's word, like borrowed blocks;
+git checks every object it clones.
 
 **Arcade V1.0's own code** shows as the read-only repository `@arcade/arcade-v1` (`relrepo.rs`): the newest held
 signed release's git bundle, its pack served as is and its index built once beside it, with a tag per release.

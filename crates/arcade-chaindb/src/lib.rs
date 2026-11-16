@@ -9,6 +9,7 @@ pub mod db;
 pub mod indexer;
 pub mod journal;
 pub mod rules;
+pub mod proven;
 pub mod schema;
 pub mod split;
 pub mod sync;
@@ -16,6 +17,7 @@ pub mod txruns;
 pub mod undo;
 
 pub use db::{ChainDb, Coin, HeaderRec, Tip};
+pub use proven::MoneyDepth;
 pub use indexer::{BlockCtx, Indexer, Prevout};
 
 #[cfg(test)]

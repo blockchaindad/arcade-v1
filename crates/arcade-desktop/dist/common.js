@@ -123,6 +123,23 @@ const COLORS = { peptest: "#2e8b44", pep: "#3f9c55", doge: "#c2a633", dgb: "#006
 const COIN_ICONS = ["peptest", "pep", "doge", "dgb", "dgbtest", "kot", "flop", "ltc", "ltctest", "btc", "wjk", "arc", "arctest", "bel", "lky", "shic", "jkc"];
 const ICON_FILE = (k) => `coins/${k}.${k === "btc" ? "svg" : "png"}`;
 // A chain's coin as an element (`tag`.`cls`): its icon, or its first letter on its colour.
+// A borrowed chain's trust colour (borrow.rs): green = 2+ lenders agree, yellow = one lender's
+// word, grey = no lender now, red = a problem; the note is its tooltip.
+const TRUST_WORD = { green: "lenders agree", yellow: "one lender", grey: "no lender", red: "problem" };
+// `hosts`: how many lender hosts vouch for the chain now, written in the dot (green: those that
+// named the same blocks when last compared; yellow: one, or several not compared lately).
+// `kept`: the chain is kept on this arcade (a plain green dot, no count).
+function trustDot(level, note, hosts, kept) {
+  const d = document.createElement("span");
+  d.className = "trust " + (TRUST_WORD[level] ? level : "grey") + (kept ? " kept" : "");
+  const n = kept ? null : Number.isFinite(Number(hosts)) && hosts !== null && hosts !== undefined ? Math.min(Number(hosts), 99) : (level === "grey" ? 0 : null);
+  if (n !== null) d.textContent = String(n);
+  const lenders = n === null ? "" : `${n} lender${n === 1 ? "" : "s"}. `;
+  d.title = lenders + (note || TRUST_WORD[level] || "");
+  d.setAttribute("aria-label", "Trust: " + (TRUST_WORD[level] || "unknown") + ". " + lenders + (note || ""));
+  return d;
+}
+
 function coinLogo(key, name, tag, cls) {
   const e = document.createElement(tag); e.className = cls;
   if (COIN_ICONS.includes(key)) { const i = document.createElement("img"); i.src = ICON_FILE(key); i.alt = ""; e.append(i); e.classList.add("img"); }
@@ -177,3 +194,21 @@ function contentEmbeds(text) {
   });
 }
 
+
+// How far an answer from the mesh is vouched for (arcaded vouch.rs): green = this arcade's own data or 2+ arcades
+// agree, yellow = one arcade's word, grey = nobody, red = they disagree. A dot with the note as its tooltip, and the
+// note as a caution line where one arcade's word is all there is.
+const VOUCH_WORD = { green: "vouched for", yellow: "one arcade's word", grey: "nobody vouches for it", red: "arcades disagree" };
+function vouchDot(level, note) {
+  const d = document.createElement("span");
+  d.className = "vouch " + (VOUCH_WORD[level] ? level : "grey");
+  d.title = note || VOUCH_WORD[level] || "";
+  d.setAttribute("aria-label", "Trust: " + (VOUCH_WORD[level] || "unknown") + (note ? ". " + note : ""));
+  return d;
+}
+function vouchLine(level, note) {
+  const p = document.createElement("div");
+  p.className = "vouch-line " + (VOUCH_WORD[level] ? level : "grey");
+  p.append(vouchDot(level, note), document.createTextNode(note || VOUCH_WORD[level] || ""));
+  return p;
+}

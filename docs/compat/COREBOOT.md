@@ -105,3 +105,27 @@ Noted your coreshare facts: q bodies must be plain JSON [[method, params], …] 
   have zero padding at the end; Dogecoin-family blocks carry AuxPoW headers; Dogecoin 1.14 doesn't XOR-obfuscate
   blk files (newer Bitcoin-derived Cores might: blocks/xor.dat). The old fetcher only uses offers whose ver and
   gen equal its OWN Core's (servers don't check), so advertise matching values to let old arcades fetch from V1.0.
+
+## C. V1.0: "take it from this folder" (a Core datadir on the same computer)
+
+`arcade chain copy start <key> --from-dir <path>` (API `chains.copy_from_dir {key, dir}`) bootstraps a chain once from a
+Core datadir on this computer instead of a cb copy fetched over the mesh, e.g. the old arcade's Dogecoin Core on the same PC:
+`arcade chain copy start doge --from-dir "C:\Users\<you>\AppData\Roaming\Dogecoin"` (Linux: `~/.dogecoin` as a full path).
+Code: crates/arcaded/src/localcopy.rs (checks), cbimport::prepare_local + take_in_db (the same import as an "all" copy).
+
+- **Stop that Core first.** Refused while its `.lock`, `chainstate/LOCK` or `blocks/index/LOCK` is locked (fcntl/flock on
+  Unix, LockFileEx on Windows; only asked, never taken): Core rewrites its coin set while it runs. Checked again before the
+  coin set is read. Don't start Core during the import: it can make it fail (an interrupted coin import is rebuilt from
+  the stored blocks, as any interrupted import is).
+- **Read in place, never written:** only `blocks/blk*.dat` and `chainstate/` are opened, read-only (crate::leveldb is a
+  read-only reader, so no writable copy of the chainstate is needed). Wallets, conf, peers, rev files are never opened.
+- Refused: not a datadir (a testnet3/ inside is named), pruned (block index flag `prunedblockfiles`, a missing
+  blk00000.dat, or a hole found walking back from the tip), another chain (magic or genesis of blk00000.dat), obfuscated
+  blk files (blocks/xor.dat).
+- Then as an "all" copy: headers from the blk files (AuxPoW included; arrival order handled by indexing them by hash),
+  checked by proof of work like any header; the folder's tip must be on our own header chain at its height; blocks stored;
+  tx index; every coin checked against the output at its place in our blocks; trusted ("this computer's Core folder");
+  re-derived from the blocks in the background (Replay / DiskReplay), equal -> verified, different -> ours replaces it.
+- One time only: V1.0 keeps its own chain.mdbx afterwards and never reads the folder again, so the chain is on disk twice
+  until the old datadir is removed. Other arcades borrowing this machine's Dogecoin through the old arcade's node lose that
+  source if the old node is removed (V1.0 does not re-serve cb copies).

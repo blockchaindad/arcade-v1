@@ -192,6 +192,22 @@ pub fn check() -> Result<Option<(String, String, String)>, String> {
     }
 }
 
+/// The folder a release is unpacked in: inside the arcade's own home (which only its user can open), made new
+/// and private each time. Not in the shared temporary folder, where another user of the computer could put
+/// their own program in its place between the check and the install.
+fn work_dir(home: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let work = home.join(".update-work");
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(home).map_err(|e| e.to_string())?;
+    std::fs::create_dir(&work).map_err(|e| format!("the update folder: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+    }
+    Ok(work)
+}
+
 /// Check and put in place release `tag` (its archive at `archive`, which must hash to `want`); then restart into it.
 fn install(node: &Node, tag: &str, archive: &str, want: &str) -> Result<(), String> {
     if let Some(why) = unsupported() {
@@ -199,9 +215,7 @@ fn install(node: &Node, tag: &str, archive: &str, want: &str) -> Result<(), Stri
     }
     let (exe, _) = SELF.get().ok_or("arcaded's own path unknown")?;
     let dir = exe.parent().ok_or("arcaded's folder unknown")?.to_path_buf();
-    let work = std::env::temp_dir().join(format!("arcade-update-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
-    std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+    let work = work_dir(&node.home)?;
     let result = (|| -> Result<(), String> {
         st().lock().unwrap().doing = "checking the release";
         // (named as its kind: Expand-Archive, the Windows fallback, takes only a .zip)
@@ -511,6 +525,22 @@ pub const RESTARTED: &str = "ARCADE_UPDATE_RESTARTED";
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_update_folder_is_private_and_in_the_home() {
+        let home = std::env::temp_dir().join(format!("arcade-uptest-{}", std::process::id()));
+        let w = super::work_dir(&home).unwrap();
+        assert!(w.starts_with(&home));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&w).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        std::fs::write(w.join("left"), b"x").unwrap();
+        let w2 = super::work_dir(&home).unwrap();
+        assert!(!w2.join("left").exists(), "made new each time");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     use super::*;
 
     #[test]

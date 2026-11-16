@@ -9,6 +9,10 @@
 //! - Copycats: a card that looks like an earlier card of a listed app by another creator
 //!   (cards::looks_like) is hidden until the operator clears it; trusted publishers are never flagged.
 //! - Installing keeps (chain, creator, name): it always opens the newest version.
+//! - Cards of a chain whose ledger isn't kept here are the mesh's word: up to three independent holders are
+//!   compared, and each card's creator and JSON checked against its first transaction where it can be read.
+//!   One holder's card is listed with a caution (trust yellow, said again when it opens and on payment
+//!   requests); a card holders disagree on, or its transaction contradicts, is not listed (red).
 
 use crate::node::Node;
 use arcade_chain::params::ChainParams;
@@ -24,6 +28,14 @@ struct Ver {
     height: u64,
     position: u64,
     card: Card,
+    /// How far the row is vouched for: green = this arcade's own ledger, or 2+ arcades sent it alike;
+    /// yellow = one arcade's word (a red row is never listed).
+    trust: crate::vouch::Level,
+    /// Arcades that sent it (0: this arcade's own ledger).
+    holders: usize,
+    /// Its creator and card are known to be the chain's: this arcade's own ledger, or checked against
+    /// the card's first transaction. Only such a creator counts as a trusted publisher.
+    checked: bool,
 }
 
 struct App {
@@ -96,12 +108,19 @@ pub fn card_rows(node: &Node, p: &ChainParams) -> Vec<Value> {
         .collect()
 }
 
-/// Card rows of chains this arcade only borrows, from an arcade on the mesh that keeps their
+/// Card rows of chains this arcade only borrows, from the arcades on the mesh that keep their
 /// ledger: kept here, asked again in the background every 10 minutes (the store never waits).
 static BORROWED_CARDS: std::sync::Mutex<BTreeMap<String, (std::time::Instant, Vec<Value>)>> = std::sync::Mutex::new(BTreeMap::new());
 
+/// Holders asked for a chain's app cards, to compare what they say.
+const CARD_HOLDERS: usize = 3;
+
 /// The app card rows of a chain from the mesh, kept 10 minutes; asked again in the background when older. `kept`: the
 /// chain's ledger is kept here too (catching up), so the question goes to the mesh rather than being answered here.
+///
+/// A row is one arcade's word: up to three independent holders are asked and their rows compared (`holders`: how
+/// many sent the same row; `trust` "red" when they disagree), and each card's creator and JSON are checked against
+/// its first transaction where this arcade can read it (`checked`: true, false, or null when it can't).
 fn mesh_card_rows(node: &Node, p: &'static ChainParams, kept: bool) -> Vec<Value> {
     let (stale, rows) = match BORROWED_CARDS.lock().unwrap().get(p.key) {
         Some((at, rows)) => (at.elapsed().as_secs() > 600, rows.clone()),
@@ -113,18 +132,99 @@ fn mesh_card_rows(node: &Node, p: &'static ChainParams, kept: bool) -> Vec<Value
         let n = node.self_arc();
         std::thread::spawn(move || {
             let q = json!({"chain": p.key});
-            let got = if kept {
-                crate::explorer::mesh_ask(&n, p, "ledger", "explorer.app_cards", &q).map(|(v, _)| v)
-            } else {
-                crate::explorer::handle(&n, "explorer.app_cards", &q)
-            };
-            if let Ok(v) = got {
-                let rows = v["rows"].as_array().cloned().unwrap_or_default();
-                BORROWED_CARDS.lock().unwrap().insert(p.key.to_string(), (std::time::Instant::now(), rows));
+            let mut answers: Vec<(Vec<Value>, String)> = crate::vouch::ask_each(&n, p, "ledger", "explorer.app_cards", &q, CARD_HOLDERS, 20_000)
+                .into_iter()
+                .filter_map(|(v, id)| Some((v["rows"].as_array()?.clone(), id)))
+                .collect();
+            if answers.is_empty() {
+                // Nobody answered this round: one holder, as before (it also asks to be introduced to holders).
+                let got = if kept {
+                    crate::explorer::mesh_ask(&n, p, "ledger", "explorer.app_cards", &q)
+                } else {
+                    crate::explorer::handle(&n, "explorer.app_cards", &q).map(|v| {
+                        let id = v["_mesh"]["node"].as_str().unwrap_or("").to_string();
+                        (v, id)
+                    })
+                };
+                if let Ok((v, id)) = got {
+                    answers.push((v["rows"].as_array().cloned().unwrap_or_default(), id));
+                }
             }
+            if answers.is_empty() {
+                return;
+            }
+            let mut rows = merge_card_rows(&answers);
+            for r in rows.iter_mut().filter(|r| r["trust"] != "red") {
+                r["checked"] = match card_checked(&n, p, r) {
+                    Some(true) => json!(true),
+                    Some(false) => {
+                        r["trust"] = json!(crate::vouch::Level::Red.as_str());
+                        r["why"] = json!("its creator or card is not what its transaction says");
+                        json!(false)
+                    }
+                    None => Value::Null,
+                };
+            }
+            BORROWED_CARDS.lock().unwrap().insert(p.key.to_string(), (std::time::Instant::now(), rows));
         });
     }
     rows
+}
+
+/// Rows from several holders, one per txid: `holders` = how many sent it as it is, and "trust": "red" with `why`
+/// when two holders sent the same card differently (creator, JSON, height, place or number).
+fn merge_card_rows(answers: &[(Vec<Value>, String)]) -> Vec<Value> {
+    let said = |r: &Value| json!([r["creator"], r["json"], r["block_height"], r["position"], r["number"]]);
+    let mut by: BTreeMap<String, Vec<(Option<Value>, String)>> = BTreeMap::new();
+    let mut first: BTreeMap<String, Value> = BTreeMap::new();
+    for (rows, id) in answers {
+        for r in rows {
+            let Some(t) = r["txid"].as_str().map(str::to_lowercase) else { continue };
+            // Only the card's own fields: what this arcade says of it (holders, checked, trust) is never taken from a holder.
+            first.entry(t.clone()).or_insert_with(|| json!({"txid": t, "number": r["number"], "creator": r["creator"], "json": r["json"],
+                                                            "block_height": r["block_height"], "position": r["position"]}));
+            by.entry(t).or_default().push((Some(said(r)), id.clone()));
+        }
+    }
+    let mut out = Vec::new();
+    for (t, said) in by {
+        let groups = crate::vouch::tally(&said);
+        let mut r = first.remove(&t).unwrap_or(Value::Null);
+        if groups.len() > 1 {
+            r["trust"] = json!(crate::vouch::Level::Red.as_str());
+            r["why"] = json!(format!("arcades on the mesh sent this card differently ({})", groups.iter().map(|g| g.1.iter().map(|w| crate::vouch::who(w)).collect::<Vec<_>>().join(", ")).collect::<Vec<_>>().join(" / ")));
+            r["holders"] = json!(0);
+        } else {
+            // The row as most of them sent it (all of them, here), and how many did.
+            r = groups.first().map(|g| {
+                let mut x = r.clone();
+                x["holders"] = json!(g.1.len());
+                x
+            }).unwrap_or(r);
+        }
+        out.push(r);
+    }
+    out
+}
+
+/// Each card checked once: (chain, txid, creator, JSON) -> whether its first transaction says so.
+static CARD_CHECKS: std::sync::Mutex<BTreeMap<String, bool>> = std::sync::Mutex::new(BTreeMap::new());
+
+/// Whether a mesh card row is what its first transaction says (creator and JSON); None when that transaction
+/// can't be read here.
+fn card_checked(node: &Node, p: &'static ChainParams, r: &Value) -> Option<bool> {
+    let (txid, creator, j) = (r["txid"].as_str()?, r["creator"].as_str()?, r["json"].as_str()?);
+    let key = format!("{}|{txid}|{creator}|{j}", p.key);
+    if let Some(b) = CARD_CHECKS.lock().unwrap().get(&key) {
+        return Some(*b);
+    }
+    let ok = crate::pagechain::card_matches(node, p, txid, creator, j).ok()?;
+    let mut g = CARD_CHECKS.lock().unwrap();
+    if g.len() > 20_000 {
+        g.clear();
+    }
+    g.insert(key, ok);
+    Some(ok)
 }
 
 fn borrowed_card_rows(node: &Node, kept: &[&'static ChainParams]) -> Vec<(&'static ChainParams, Vec<Value>)> {
@@ -161,6 +261,13 @@ fn gather(node: &Node) -> Vec<App> {
         for v in rows {
             let j = v["json"].as_str().unwrap_or("");
             let Some(card) = cards::parse(j) else { continue };
+            let Some((trust, holders, checked)) = vouched(&v) else {
+                // Arcades disagree on it, or it isn't what its transaction says: not offered.
+                let txid = v["txid"].as_str().unwrap_or("");
+                crate::vouch::alert_once(node, &format!("card:{}:{txid}", p.key), "apps", &format!(
+                    "An app card on {} ({}, {txid}) is not listed: {}", p.name, card.name, v["why"].as_str().unwrap_or("arcades disagree on it")));
+                continue;
+            };
             let creator = v["creator"].as_str().unwrap_or("").to_string();
             by.entry((creator.clone(), card.key())).or_default().push(Ver {
                 txid: v["txid"].as_str().unwrap_or("").to_string(),
@@ -169,6 +276,9 @@ fn gather(node: &Node) -> Vec<App> {
                 height: v["block_height"].as_u64().unwrap_or(0),
                 position: v["position"].as_u64().unwrap_or(0),
                 card,
+                trust,
+                holders,
+                checked,
             });
         }
         for (_, mut vs) in by {
@@ -180,6 +290,30 @@ fn gather(node: &Node) -> Vec<App> {
         }
     }
     apps
+}
+
+/// A card row's (trust, holders, checked): this arcade's own rows carry no `holders` (green, checked); a
+/// mesh row's trust is how many arcades sent it alike. None for a red row (not offered).
+fn vouched(v: &Value) -> Option<(crate::vouch::Level, usize, bool)> {
+    if v["trust"] == "red" || v["checked"] == false {
+        return None;
+    }
+    match v["holders"].as_u64() {
+        None => Some((crate::vouch::Level::Green, 0, true)),
+        Some(n) => Some((crate::vouch::Level::of_sources(n as usize), n as usize, v["checked"] == true)),
+    }
+}
+
+/// What the store says of a card's trust: {level, holders, checked, note}.
+fn trust_json(v: &Ver) -> Value {
+    let note = match (v.holders, v.checked) {
+        (0, _) => "From this arcade's own ledger.".to_string(),
+        (1, true) => "One arcade on the mesh listed this version; its publisher and card were checked against its transaction here, its place among the versions was not.".to_string(),
+        (1, false) => "One arcade on the mesh listed this version, and its transaction couldn't be read here to check it. Double-check the publisher before trusting it.".to_string(),
+        (n, true) => format!("{n} arcades on the mesh listed this version alike; its publisher and card were checked against its transaction here."),
+        (n, false) => format!("{n} arcades on the mesh listed this version alike; its transaction couldn't be read here to check it."),
+    };
+    json!({"level": v.trust.as_str(), "holders": v.holders, "checked": v.checked, "note": note})
 }
 
 fn block_time(node: &Node, c: u16, h: u64) -> u64 {
@@ -208,7 +342,9 @@ fn flags(node: &Node, apps: &[App]) -> BTreeMap<String, String> {
             out.insert(n.txid.clone(), v.to_string());
             continue;
         }
-        if trusted.contains(&n.creator) {
+        // A trusted publisher is never held back, but only when the card is known to be theirs: a card another arcade
+        // names them on, unchecked, is compared like any other.
+        if trusted.contains(&n.creator) && n.checked {
             continue;
         }
         let earlier = all.iter().find(|(o, _)| o.creator != n.creator && (o.height, o.position) < (n.height, n.position) && cards::looks_like(&n.card, &o.card));
@@ -383,7 +519,8 @@ fn entry(node: &Node, a: &App, acts: &[Value], fx: &Fixes, me: &str, flag: Optio
     json!({
         "id": id, "chain": a.chain.key, "chain_name": a.chain.name, "txid": n.txid, "number": n.number,
         "creator": n.creator, "creator_tag": tag, "height": n.height, "time": time, "card": n.card.to_json(),
-        "opens": opens, "versions": a.versions.iter().map(|v| json!({"txid": v.txid, "version": v.card.version, "height": v.height})).collect::<Vec<_>>(),
+        "opens": opens, "versions": a.versions.iter().map(|v| json!({"txid": v.txid, "version": v.card.version, "height": v.height, "trust": v.trust.as_str()})).collect::<Vec<_>>(),
+        "trust": trust_json(n),
         "removed": a.removed, "flag": flag, "mine": n.creator == me, "installed": installed.contains(&id), "starred": starred.contains(&id),
         "social": s,
     })
@@ -568,7 +705,10 @@ pub fn notify_ids(node: &Node) -> Vec<String> {
 pub fn of_page(node: &Node, txid: &str) -> Option<Value> {
     let a = gather(node).into_iter().find(|a| a.versions.iter().any(|v| v.txid == txid))?;
     let first = &a.versions[0];
-    Some(json!({"id": app_id(a.chain.key, &first.creator, &first.card.key()), "name": first.card.name, "chain": a.chain.key, "txid": first.txid}))
+    // The page's own version: one arcade's word for it is said where the app asks for money (walletsvc::page_card).
+    let this = a.versions.iter().find(|v| v.txid == txid).unwrap_or(first);
+    Some(json!({"id": app_id(a.chain.key, &first.creator, &first.card.key()), "name": first.card.name, "chain": a.chain.key, "txid": first.txid,
+                "creator": this.creator, "trust": trust_json(this)}))
 }
 
 /// Operator's verdict on a flagged card: "clear" (show it) or "confirm" (keep it hidden).
@@ -589,16 +729,22 @@ pub fn trust(node: &Node, address: &str, on: bool) -> Result<Value, String> {
     Ok(json!({"trusted": t}))
 }
 
-/// What the app window needs: the page to run (served sandboxed by this arcade) and the card.
+/// What the app window needs: the page to run (served sandboxed by this arcade, with its pass for the page API: the
+/// address carries the page's key, crate::http::page_key) and the card.
 pub fn launch(node: &Node, chain: &str, txid: &str) -> Result<Value, String> {
     let e = card(node, chain, txid)?;
     if e["removed"] == true {
         return Err("its publisher removed this app".into());
     }
     let port = node.http_port.get().copied().unwrap_or(8420);
+    let opens = e["opens"].as_str().unwrap_or("").to_ascii_lowercase();
+    let key = crate::chains::find(chain).map(|cp| crate::http::page_key(node, cp.key, &opens)).unwrap_or_default();
+    // One arcade's word for the version that opens: it still opens, with a caution the app window shows.
+    let caution = (e["trust"]["level"] == "yellow").then(|| e["trust"]["note"].clone());
     Ok(json!({
+        "caution": caution,
         "id": e["id"], "title": format!("{}{}", e["card"]["name"].as_str().unwrap_or("App"), e["card"]["version"].as_str().filter(|v| !v.is_empty()).map(|v| format!(" {v}")).unwrap_or_default()),
-        "frame": format!("http://127.0.0.1:{port}/app/{chain}/{}", e["opens"].as_str().unwrap_or("")),
+        "frame": format!("http://127.0.0.1:{port}/app/{chain}/{opens}?pass={key}"),
         "card": e["card"], "permissions": e["permissions"], "creator": e["creator"], "chain": chain,
     }))
 }
@@ -815,5 +961,62 @@ mod rating_tests {
         let c = comments_on(&acts, &fx, &all);
         assert!(c.len() > 20 && c.iter().any(|x| x["stars"].is_u64()), "{}", c.len());
         assert!(fx.edits.len() > 10 && fx.deletes.len() > 10);
+    }
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+    use crate::vouch::Level;
+
+    fn row(txid: &str, creator: &str, h: u64) -> Value {
+        json!({"txid": txid, "number": 1, "creator": creator, "json": r#"{"app":{"name":"Frogger"}}"#, "block_height": h, "position": 0})
+    }
+
+    #[test]
+    fn mesh_cards_carry_how_many_holders_vouch() {
+        // Two holders send the same card, one adds a card only it knows, and one sends a card another sent with a
+        // different creator and a higher height (a "newest version" under someone else's name).
+        let a = vec![row("aa", "Dreal", 10), row("bb", "Dreal", 20)];
+        let b = vec![row("aa", "Dreal", 10), row("cc", "Dreal", 30)];
+        let c = vec![row("bb", "Dfake", 99)];
+        let m = merge_card_rows(&[(a, "n1".into()), (b, "n2".into()), (c, "n3".into())]);
+        let by = |t: &str| m.iter().find(|r| r["txid"] == t).unwrap().clone();
+        assert_eq!(m.len(), 3);
+        assert_eq!(vouched(&by("aa")), Some((Level::Green, 2, false)));
+        assert_eq!(vouched(&by("cc")), Some((Level::Yellow, 1, false)));
+        // Disagreement: red, not offered.
+        assert_eq!(by("bb")["trust"], "red");
+        assert!(by("bb")["why"].as_str().unwrap().contains("differently"));
+        assert_eq!(vouched(&by("bb")), None);
+        // Checked against its transaction: still one holder's word for its place, but its creator is the chain's.
+        let mut cc = by("cc");
+        cc["checked"] = json!(true);
+        assert_eq!(vouched(&cc), Some((Level::Yellow, 1, true)));
+        // A card its transaction contradicts is not offered either.
+        cc["checked"] = json!(false);
+        assert_eq!(vouched(&cc), None);
+        // This arcade's own ledger rows carry no holders: green, checked.
+        assert_eq!(vouched(&row("dd", "Dreal", 1)), Some((Level::Green, 0, true)));
+    }
+
+    #[test]
+    fn one_holders_version_says_so() {
+        let v = |holders: usize, checked: bool| Ver {
+            txid: "aa".into(),
+            number: 1,
+            creator: "Dreal".into(),
+            height: 1,
+            position: 0,
+            card: cards::parse(r#"{"app":{"name":"Frogger"}}"#).unwrap(),
+            trust: if holders == 0 { Level::Green } else { Level::of_sources(holders) },
+            holders,
+            checked,
+        };
+        let t = trust_json(&v(1, false));
+        assert_eq!((t["level"].as_str(), t["checked"].as_bool()), (Some("yellow"), Some(false)));
+        assert!(t["note"].as_str().unwrap().contains("Double-check"));
+        assert_eq!(trust_json(&v(2, true))["level"], "green");
+        assert_eq!(trust_json(&v(0, true))["note"], "From this arcade's own ledger.");
     }
 }

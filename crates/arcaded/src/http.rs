@@ -7,7 +7,7 @@
 //!   GET /inscription/<txid|number>   its details (JSON)
 //!   GET /<file>                      the operator's website (--site DIR), if any
 //! Only from this computer (asked for by its loopback name, and never through a proxy, which adds
-//! X-Forwarded-For; with --behind-proxy, nothing over TCP counts as this computer):
+//! X-Forwarded-For, Forwarded, Via or the like; with --behind-proxy, nothing over TCP counts as this computer):
 //!   POST /rpc                        JSON-RPC 2.0 for sidecar apps; Basic auth with the cookie
 //!                                    file (<home>/.cookie: "__cookie__:<secret>"), every command
 //!   GET|POST /api/v1/<group>/<name>  the web API: public reads need nothing; the rest an API key
@@ -16,13 +16,15 @@
 //!   GET /ui/                         the desktop app's window in a browser (crate::webui); its
 //!                                    calls go to /rpc with the cookie (`arcade web` gives the link)
 //!   GET|POST /r/...                  the page API for app pages: each request carries its page's
-//!                                    pass (X-Arcade-Page), given to the page when /app/ serves it
+//!                                    pass (X-Arcade-Page), given to the page when /app/ serves it to
+//!                                    the arcade's app window (which asks with the page's key)
 //! Content is from strangers: served with a sandbox CSP and nosniff so it can't reach the API.
 
 use crate::node::Node;
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -36,6 +38,10 @@ const MAX_OPEN_BODY: usize = 64 << 10;
 const MAX_DOOR_BODY: usize = 256 << 10;
 /// Connections served at once; more wait for one to close.
 const MAX_CONNS: usize = 128;
+/// Connections served at once from one address, so one client can't take every place; one more is answered 503
+/// at once. Loopback isn't counted per address: it is this computer, or a proxy in front that carries everyone's
+/// requests (and wss:// peers' mesh links), which limits its own clients.
+const MAX_CONNS_PER_IP: usize = 16;
 /// One header line, and the whole head (request line and headers).
 const MAX_LINE: usize = 8 << 10;
 const MAX_HEAD: usize = 32 << 10;
@@ -58,12 +64,59 @@ struct Conf {
     behind_proxy: bool,
 }
 
-/// One connection being served (counted while it lives).
-struct Served(Arc<AtomicUsize>);
+/// The connections being served: in all, and per address.
+#[derive(Default)]
+struct Slots {
+    open: AtomicUsize,
+    per_ip: std::sync::Mutex<HashMap<IpAddr, usize>>,
+}
+
+/// One connection being served (counted while it lives; the address it is counted under).
+struct Served(Arc<Slots>, Option<IpAddr>);
 
 impl Drop for Served {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        if let Some(ip) = self.1 {
+            let mut m = self.0.per_ip.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(n) = m.get_mut(&ip) {
+                *n -= 1;
+                if *n == 0 {
+                    m.remove(&ip);
+                }
+            }
+        }
+        self.0.open.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl Slots {
+    /// A place for a connection from `ip`, or None while that address has MAX_CONNS_PER_IP open. An IPv6 address
+    /// counts as its /64 (one network: its host may pick any address in it).
+    fn take(self: &Arc<Self>, ip: IpAddr) -> Option<Served> {
+        let ip = match ip {
+            IpAddr::V6(v) => match v.to_ipv4_mapped() {
+                Some(v4) => IpAddr::V4(v4),
+                None if v.is_loopback() => ip,
+                None => {
+                    let s = v.segments();
+                    IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+                }
+            },
+            v4 => v4,
+        };
+        let counted = if ip.is_loopback() {
+            None
+        } else {
+            let mut m = self.per_ip.lock().unwrap_or_else(|e| e.into_inner());
+            let n = m.entry(ip).or_insert(0);
+            if *n >= MAX_CONNS_PER_IP {
+                return None;
+            }
+            *n += 1;
+            Some(ip)
+        };
+        self.open.fetch_add(1, Ordering::SeqCst);
+        Some(Served(self.clone(), counted))
     }
 }
 
@@ -76,14 +129,20 @@ pub fn serve(node: Arc<Node>, o: Opts) {
         }
     };
     let conf = Arc::new(Conf { site: o.site, behind_proxy: o.behind_proxy });
-    let open = Arc::new(AtomicUsize::new(0));
-    for s in l.incoming().flatten() {
+    let slots = Arc::new(Slots::default());
+    for mut s in l.incoming().flatten() {
         // At most MAX_CONNS at once: the next connection waits until one closes.
-        while open.load(Ordering::SeqCst) >= MAX_CONNS {
+        while slots.open.load(Ordering::SeqCst) >= MAX_CONNS {
             std::thread::sleep(Duration::from_millis(20));
         }
-        open.fetch_add(1, Ordering::SeqCst);
-        let (node, conf, served) = (node.clone(), conf.clone(), Served(open.clone()));
+        let Ok(peer) = s.peer_addr() else { continue };
+        // At most MAX_CONNS_PER_IP from one address: one more is told so at once, not queued behind the rest.
+        let Some(served) = slots.take(peer.ip()) else {
+            let _ = s.set_write_timeout(Some(Duration::from_secs(1)));
+            respond(&mut s, status_line(503), "text/plain", &[("Retry-After", "10".into())], b"too many connections from this address\n");
+            continue;
+        };
+        let (node, conf) = (node.clone(), conf.clone());
         std::thread::spawn(move || {
             let _served = served;
             handle(&node, s, &conf)
@@ -228,6 +287,7 @@ fn status_line(code: u16) -> &'static str {
         403 => "403 Forbidden",
         404 => "404 Not Found",
         413 => "413 Payload Too Large",
+        502 => "502 Bad Gateway",
         503 => "503 Service Unavailable",
         _ => "500 Internal Server Error",
     }
@@ -260,11 +320,21 @@ fn local(node: &Node, s: &TcpStream, r: &Req, behind_proxy: bool) -> bool {
         std::net::IpAddr::V4(v) => v.is_loopback(),
         std::net::IpAddr::V6(v) => v.is_loopback() || v.to_ipv4_mapped().is_some_and(|m| m.is_loopback()),
     }).unwrap_or(false);
-    ip_local
-        && loopback_host(r.headers.get("host").and_then(|v| v.as_str()), port(node))
-        && !r.headers.contains_key("x-forwarded-for")
-        && !r.headers.contains_key("forwarded")
-        && !r.headers.contains_key("x-real-ip")
+    ip_local && loopback_host(r.headers.get("host").and_then(|v| v.as_str()), port(node)) && !proxied(r)
+}
+
+/// A request a proxy, tunnel or CDN passed on: one of the headers they add to say whom they carry it for (any
+/// case, with - or _). A browser or a program on this computer sends none of them. (A proxy that adds none can't
+/// be told apart: that one needs --behind-proxy.)
+fn proxied(r: &Req) -> bool {
+    r.headers.keys().any(|k| {
+        let k = k.to_ascii_lowercase().replace('_', "-");
+        k.starts_with("x-forwarded")
+            || matches!(
+                k.as_str(),
+                "forwarded" | "via" | "x-real-ip" | "cf-connecting-ip" | "true-client-ip" | "x-client-ip" | "x-cluster-client-ip" | "fastly-client-ip" | "x-original-forwarded-for" | "cdn-loop"
+            )
+    })
 }
 
 /// A Host header naming this computer and this port: 127.0.0.1, localhost or [::1].
@@ -310,6 +380,23 @@ pub(crate) fn page_pass(node: &Node, chain: &str, txid: &str) -> String {
     format!("{chain}:{txid}:{}", page_mac(node, chain, txid))
 }
 
+/// The key the arcade's app window asks /app/<chain>/<txid> with (`?pass=<key>`) to be served the page with its
+/// pass: the mac in the pass. It comes only from apps.launch (the socket, or /rpc with the cookie), so a bare GET for
+/// the page, by a program here or through a proxy, gets the page without a pass.
+pub(crate) fn page_key(node: &Node, chain: &str, txid: &str) -> String {
+    page_mac(node, chain, txid)
+}
+
+/// Two macs alike, compared in the same time wherever they differ.
+fn same_mac(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
+}
+
+/// The request asks for its page with the page's key (see page_key).
+fn asks_with_key(node: &Node, r: &Req, chain: &str, txid: &str) -> bool {
+    r.query.split('&').filter_map(|kv| kv.strip_prefix("pass=")).any(|k| same_mac(k, &page_mac(node, chain, txid)))
+}
+
 fn page_mac(node: &Node, chain: &str, txid: &str) -> String {
     use sha2::{Digest, Sha256};
     // HMAC-SHA256 under a key of its own, made from the identity key.
@@ -334,9 +421,7 @@ fn page_of(node: &Node, r: &Req) -> Option<(&'static arcade_chain::params::Chain
     if !crate::udpsvc::is_hex(txid, 64) || txid.bytes().any(|b| b.is_ascii_uppercase()) {
         return None;
     }
-    let want = page_mac(node, chain, txid);
-    let same = want.len() == mac.len() && want.bytes().zip(mac.bytes()).fold(0u8, |d, (a, b)| d | (a ^ b)) == 0;
-    same.then(|| (cp, txid.to_string()))
+    same_mac(&page_mac(node, chain, txid), mac).then(|| (cp, txid.to_string()))
 }
 
 /// The pass as the first thing in an app's HTML page (after its doctype, so the page keeps its
@@ -535,12 +620,15 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
         let csp = format!("sandbox allow-scripts allow-pointer-lock; default-src 'self' {me} data: blob:; script-src 'self' {me} 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'self' {me} 'unsafe-inline' data:; img-src 'self' {me} data: blob:; media-src 'self' {me} data: blob:; font-src 'self' {me} data:; connect-src 'self' {me} data: blob:; frame-src 'self' {me}; object-src 'none'; base-uri 'none'; form-action 'none'; {}", frame_ancestors(node));
         // From this arcade's ledger of that chain, or (a chain it only borrows) from an arcade on
         // the mesh that keeps it. Not readable by other websites (no CORS): an HTML page carries
-        // its pass for the page API, asked for again each time (the pass is this arcade's).
+        // its pass for the page API when the app window asks with the page's key (page_key), asked
+        // for again each time (the pass is this arcade's); asked for without it, the page has none.
         return match crate::pagechain::content(node, cp, id) {
             Ok(c) => {
                 let html = c.0.trim_start().to_ascii_lowercase().starts_with("text/html") && crate::udpsvc::is_hex(id, 64);
-                let with = if html { with_pass(&c.2, &page_pass(node, cp.key, &id.to_ascii_lowercase())) } else { Vec::new() };
-                let body: &[u8] = if html { &with } else { &c.2 };
+                let txid = id.to_ascii_lowercase();
+                let pass = html && asks_with_key(node, &r, cp.key, &txid);
+                let with = if pass { with_pass(&c.2, &page_pass(node, cp.key, &txid)) } else { Vec::new() };
+                let body: &[u8] = if pass { &with } else { &c.2 };
                 respond(
                     &mut s,
                     "200 OK",
@@ -613,7 +701,9 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
         if origin.is_some_and(|o| o != "null" && !own_origins(node).iter().any(|x| x == o)) {
             return respond(&mut s, "403 Forbidden", "application/json", &cors, br#"{"error":"this arcade's page API answers only its own pages"}"#);
         }
-        let page = page_of(node, &r);
+        // A pass counts only as an app frame sends it: its fetches carry an Origin ("null", sandboxed), which a
+        // browser always adds and its pages can't remove. A request with a pass and no Origin isn't from the page.
+        let page = page_of(node, &r).filter(|_| origin.is_some());
         // A program on this computer (a website's server, a payout service) reads with the RPC
         // cookie as Basic auth, as /rpc and the Core RPC take it: the home chain's reads only.
         // Every write (/r/send, the market's) still needs an app page's pass.
@@ -629,7 +719,8 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
         // The ARCADE chain's git repositories (/r/git/..., arcgit::page_read): public data, with or without a pass, so an
         // app can show them as a code host does.
         if matches!(r.method.as_str(), "GET" | "HEAD") {
-            if let Some(a) = crate::arcgit::page_read(node, &path, &query_fields(&r.query)) {
+            let q = query_fields(&r.query);
+            if let Some(a) = crate::arcgit::lent(node, &path, &q).or_else(|| crate::arcgit::page_read(node, &path, &q)) {
                 let mut extra = cors.clone();
                 if a.gzip {
                     extra.push(("Content-Encoding", "gzip".into()));
@@ -749,9 +840,9 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
     // A git repository from ARCADE blobs (§15 step 6), in git's "dumb" HTTP protocol, so any git client clones it:
     // /git/<manifest blob>/{HEAD, info/refs, objects/info/packs, objects/pack/pack-<name>.pack|.idx}.
     if path.starts_with("/git/") {
-        let (status, body) = crate::arcgit::serve(node, &path["/git/".len()..]);
-        let ctype = if status.starts_with("200") { "application/octet-stream" } else { "text/plain" };
-        return respond(&mut s, status, ctype, &[("Cache-Control", "no-store".into())], if r.method == "HEAD" { &[] } else { &body });
+        // An arcade only borrowing the ARCADE chain asks an arcade that lends it (arcgit::lent).
+        let a = crate::arcgit::lent(node, &path, &Default::default()).unwrap_or_else(|| crate::arcgit::here(node, &path, &Default::default()).unwrap());
+        return respond(&mut s, status_line(a.code), a.ctype, &[("Cache-Control", "no-store".into())], if r.method == "HEAD" { &[] } else { &a.body });
     }
     // A blob of the ARCADE chain by its id (§15 step 5: apps and games load their parts from here), when the chain holds a
     // blob of that id: fetched from linked arcades if it isn't here, and kept in the viewer cache.
@@ -790,15 +881,19 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
         // An ord inscription by its id (the pictures and pages a site names; the arcade ledger's
         // own content is asked by txid or number below).
         ["content", id] if arcade_ledger::sites::is_inscription_id(&id.to_lowercase()) => match crate::namesites::content(node, id, is_local) {
-            Some((ctype, bytes)) => respond(
+            Some((ctype, bytes, vouched)) => respond(
                 &mut s,
                 "200 OK",
                 if ctype.is_empty() { "application/octet-stream" } else { &ctype },
                 &[
-                    ("Cache-Control", "public, max-age=31536000, immutable".into()),
+                    // The chain's bytes never change; bytes only arcades on the mesh vouch for are not kept by the browser.
+                    ("Cache-Control", if vouched == crate::namesites::Vouched::Chain { "public, max-age=31536000, immutable".into() } else { "no-store".into() }),
                     // As main's ord route: recursive inscriptions load their parts from here.
                     ("Content-Security-Policy", ord_csp(node)),
                     ("Access-Control-Allow-Origin", "*".into()),
+                    ("Access-Control-Expose-Headers", "X-Arcade-Trust".into()),
+                    // green: the chain's (or 2+ arcades agree); yellow: one arcade's word, not checked here.
+                    ("X-Arcade-Trust", vouched.level().as_str().into()),
                 ],
                 if r.method == "HEAD" { &[] } else { &bytes },
             ),
@@ -1352,9 +1447,13 @@ pub(crate) mod tests {
         // A pass made up, or another page's: refused.
         let a = ask(&t.node, &conf(), &send(&format!("X-Arcade-Page: {}:{other}:{}\r\n", t.p.key, "0".repeat(32))));
         assert_eq!(status(&a), "403", "{a}");
-        // The page's pass: filed as that page, whatever the Referer says.
+        // The page's pass, but not sent by a page (no Origin, as a program sends it): refused.
         let pass = page_pass(&t.node, t.p.key, &mine);
-        let a = ask(&t.node, &conf(), &send(&format!("X-Arcade-Page: {pass}\r\nReferer: http://127.0.0.1:8420/app/{}/{other}\r\n", t.p.key)));
+        let a = ask(&t.node, &conf(), &send(&format!("X-Arcade-Page: {pass}\r\n")));
+        assert_eq!(status(&a), "403", "{a}");
+        assert_eq!(crate::walletsvc::requests(&t.node, None).as_array().unwrap().len(), 0, "nothing filed");
+        // The page's pass from its frame (Origin "null"): filed as that page, whatever the Referer says.
+        let a = ask(&t.node, &conf(), &send(&format!("Origin: null\r\nX-Arcade-Page: {pass}\r\nReferer: http://127.0.0.1:8420/app/{}/{other}\r\n", t.p.key)));
         assert_eq!(status(&a), "202", "{a}");
         assert_eq!(crate::walletsvc::requests(&t.node, Some(&mine)).as_array().unwrap().len(), 1);
         assert_eq!(crate::walletsvc::requests(&t.node, Some(&other)).as_array().unwrap().len(), 0);
@@ -1387,6 +1486,70 @@ pub(crate) mod tests {
         let out = with_pass(b"\xEF\xBB\xBF <!doctype html><p>", pass);
         assert!(out.starts_with(b"\xEF\xBB\xBF <!doctype html><script>"));
         assert!(!include_str!("shims/page.js").contains("</script"));
+    }
+
+    #[test]
+    fn an_app_page_has_its_pass_only_for_its_window() {
+        let (_one, t) = node();
+        // A page on a chain this arcade doesn't keep (as an arcade on the mesh sent it).
+        let doge = crate::chains::find("doge").unwrap();
+        let tx = "e7".repeat(32);
+        crate::pagechain::keep_for_test(doge, &tx, "text/html", b"<!doctype html><p>app</p>");
+        let (pass, key) = (page_pass(&t.node, doge.key, &tx), page_key(&t.node, doge.key, &tx));
+        assert!(pass.ends_with(&format!(":{key}")));
+        // Asked for bare, with no key, or another page's: the page without its pass (a program here, or anyone
+        // through a proxy, harvests nothing).
+        let others = ["".to_string(), "?pass=1".into(), format!("?pass={}", "0".repeat(32)), format!("?pass={}", page_key(&t.node, doge.key, &"e8".repeat(32))),
+                      format!("?pass={}", key.to_uppercase()), format!("?x={key}")];
+        for q in &others {
+            let a = ask(&t.node, &conf(), &get(&format!("/app/doge/{tx}{q}"), "Origin: null\r\nSec-Fetch-Dest: iframe\r\n"));
+            assert_eq!(status(&a), "200", "{q}: {a}");
+            assert!(a.contains("<p>app</p>") && !a.contains(&pass) && !a.contains("X-Arcade-Page"), "{q}: {a}");
+        }
+        // The app window asks with the key apps.launch gave it: the page with its pass first.
+        let a = ask(&t.node, &conf(), &get(&format!("/app/doge/{tx}?pass={key}"), ""));
+        assert_eq!(status(&a), "200", "{a}");
+        assert!(a.contains(&format!("'{pass}'")) && a.contains("<p>app</p>"), "{a}");
+    }
+
+    #[test]
+    fn a_proxied_request_is_not_this_computers() {
+        let (_one, t) = node();
+        // Whatever a proxy, tunnel or CDN adds to say whom it carries the request for, in any spelling.
+        for h in ["X-Forwarded-For: 1.2.3.4", "x-forwarded-proto: https", "X-Forwarded-Host: site.example", "X_Forwarded_For: 1.2.3.4", "Forwarded: for=1.2.3.4",
+                  "Via: 1.1 proxy", "VIA: 1.1 proxy", "X-Real-IP: 1.2.3.4", "CF-Connecting-IP: 1.2.3.4", "True-Client-IP: 1.2.3.4", "CDN-Loop: cloudflare"] {
+            for p in ["/api/v1/routes", "/r/blockheight", "/ui/"] {
+                assert_eq!(status(&ask(&t.node, &conf(), &get(p, &format!("{h}\r\n")))), "403", "{p} with {h}");
+            }
+        }
+        // A program or browser here sends none of them.
+        assert_eq!(status(&ask(&t.node, &conf(), &get("/api/v1/routes", "User-Agent: curl/8.5\r\nAccept: */*\r\n"))), "200");
+        assert_eq!(status(&ask(&t.node, &conf(), &get("/r/blockheight", "Origin: null\r\nSec-Fetch-Site: cross-site\r\n"))), "200");
+    }
+
+    #[test]
+    fn one_address_holds_at_most_its_share_of_places() {
+        let slots = Arc::new(Slots::default());
+        let a: IpAddr = "203.0.113.5".parse().unwrap();
+        let mut held: Vec<_> = (0..MAX_CONNS_PER_IP).map(|_| slots.take(a).expect("a place")).collect();
+        assert!(slots.take(a).is_none(), "one more from the same address");
+        assert!(slots.take("::ffff:203.0.113.5".parse().unwrap()).is_none(), "the same address over IPv6");
+        let other = slots.take("203.0.113.6".parse().unwrap()).expect("another address");
+        // An IPv6 network counts as one address, whichever of its addresses it uses.
+        let net: Vec<_> = (0..MAX_CONNS_PER_IP).map(|i| slots.take(format!("2001:db8:1:2::{:x}", i + 1).parse().unwrap()).expect("a place")).collect();
+        assert!(slots.take("2001:db8:1:2:ffff::9".parse().unwrap()).is_none(), "the same /64");
+        let net2 = slots.take("2001:db8:1:3::1".parse().unwrap()).expect("another /64");
+        // This computer, or a proxy in front carrying everyone's requests: not counted per address.
+        let here: Vec<_> = (0..MAX_CONNS_PER_IP * 2)
+            .map(|i| slots.take(if i % 2 == 0 { IpAddr::from([127, 0, 0, 1]) } else { "::1".parse().unwrap() }).expect("loopback"))
+            .collect();
+        assert_eq!(slots.open.load(Ordering::SeqCst), MAX_CONNS_PER_IP * 4 + 2);
+        // One closes: one more may come.
+        held.pop();
+        held.push(slots.take(a).expect("a freed place"));
+        drop((held, other, here, net, net2));
+        assert_eq!(slots.open.load(Ordering::SeqCst), 0);
+        assert!(slots.per_ip.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1492,7 +1655,7 @@ fn openai_err(s: &mut TcpStream, status: &str, msg: &str) {
     respond(s, status, "application/json", &[], v.to_string().as_bytes());
 }
 
-/// `/openai/v1/models` and `/openai/v1/chat/completions` (crate::llmsvc): a shared model, paid from this wallet's
+/// `/openai/v1/models`, `/openai/v1/chat/completions` and `/openai/v1/audio/speech` (crate::llmsvc): a shared model, paid from this wallet's
 /// credit at its seller, as OpenAI programs ask for it.
 fn openai_door(node: &Node, s: &mut TcpStream, r: &Req, rest: &str) {
     let key = r.headers.get("authorization").and_then(|v| v.as_str()).and_then(|v| v.strip_prefix("Bearer ")).map(str::trim).unwrap_or("");
@@ -1598,6 +1761,39 @@ fn openai_door(node: &Node, s: &mut TcpStream, r: &Req, rest: &str) {
                 Err(e) => openai_err(s, "502 Bad Gateway", &e),
             }
         }
-        _ => openai_err(s, "404 Not Found", "this door has GET models and POST chat/completions"),
+        ("POST", "audio/speech") => {
+            let Ok(body) = serde_json::from_slice::<Value>(&r.body) else { return openai_err(s, "400 Bad Request", "the body isn't JSON") };
+            let asked = body["model"].as_str().unwrap_or("").to_string();
+            let (seller, model) = match crate::llmsvc::pick(node, &asked) {
+                Ok(x) => x,
+                Err(e) => return openai_err(s, "404 Not Found", &e),
+            };
+            let mut b = body.clone();
+            b["model"] = json!(model);
+            // The head goes out with the first audio, so an error before it is a proper error answer.
+            let mut out = s.try_clone().ok();
+            let mut started = false;
+            let r = crate::llmsvc::speak(node, &seller, &b, &mut |ct, bytes| {
+                let Some(o) = out.as_mut() else { return Err("closed".into()) };
+                if !started {
+                    let head = format!("HTTP/1.1 200 OK\r\nContent-Type: {}\r\nCache-Control: no-store\r\nConnection: close\r\nTransfer-Encoding: chunked\r\nX-Content-Type-Options: nosniff\r\n\r\n", ct.unwrap_or("application/octet-stream"));
+                    o.write_all(head.as_bytes()).map_err(|_| "the program hung up".to_string())?;
+                    started = true;
+                }
+                if bytes.is_empty() {
+                    return Ok(());
+                }
+                o.write_all(format!("{:x}\r\n", bytes.len()).as_bytes()).and_then(|_| o.write_all(bytes)).and_then(|_| o.write_all(b"\r\n")).map_err(|_| "the program hung up".to_string())
+            });
+            match r {
+                Ok(_) if started => {
+                    let _ = s.write_all(b"0\r\n\r\n");
+                }
+                Ok(_) => openai_err(s, "502 Bad Gateway", "the seller sent no audio"),
+                Err(e) if !started => openai_err(s, if e.starts_with("not enough credit") { "402 Payment Required" } else { "502 Bad Gateway" }, &e),
+                Err(_) => {} // cut off: the program sees the audio end early
+            }
+        }
+        _ => openai_err(s, "404 Not Found", "this door has GET models, POST chat/completions and POST audio/speech"),
     }
 }

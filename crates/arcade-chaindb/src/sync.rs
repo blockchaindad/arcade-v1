@@ -515,7 +515,7 @@ mod tests {
     use super::*;
     use arcade_chain::encode::write_varint;
     use arcade_chain::hash::merkle_root;
-    use arcade_chain::params::{DIGIBYTE_MAIN, KOTIA_MAIN, LITECOIN_MAIN, PEPECOIN_TEST};
+    use arcade_chain::params::{DIGIBYTE_MAIN, KOTIA_MAIN, LITECOIN_MAIN, PEPECOIN_TEST, WOJAKCOIN_MAIN};
     use arcade_chain::pow::{try_pow_hash, PowRule};
     use arcade_chain::{Format, Header, Tx};
 
@@ -751,6 +751,86 @@ mod tests {
         let sha = extend(&g, 0, n + 1, 0x0202, EASY, 2, Some(PowAlgo::Sha256d));
         sync(&s, &mut Src::new(&[&sha])).unwrap();
         assert_eq!(db.tip(p.chain_no).unwrap().unwrap().hash, sha.last().unwrap().hash());
+    }
+
+    /// Harder than the test powLimit (EASY): about 256 hashes a block, work 256 against EASY's 2.
+    const HARD: u32 = 0x2000ffff;
+
+    /// On DigiByte and Wojakcoin, blocks whose work isn't checked (groestl) or that sit at the
+    /// minimum difficulty extend the tip but confirm nothing for money; a payment counts
+    /// confirmations only by the checked work above it, as the chain's real blocks carry it.
+    #[test]
+    fn money_depth_counts_only_checked_work() {
+        let g = genesis();
+        let sha = Some(PowAlgo::Sha256d);
+        for (p, v_sha, v_free) in [
+            (params(&DIGIBYTE_MAIN, &g, |_| {}), 0x0202, 0x0402),
+            (params(&WOJAKCOIN_MAIN, &g, |_| {}), 1, 1),
+        ] {
+            let (_d, db) = open();
+            let s = Syncer::new(&db, p);
+            let honest = extend(&g, 0, 30, v_sha, HARD, 1, sha);
+            sync(&s, &mut Src::new(&[&[g.clone()], &honest])).unwrap();
+            let m = db.money_depth_with(p, 20, 10).unwrap();
+            assert!(m.confirms());
+            for h in [1, 20, 30] {
+                assert_eq!(m.at(h), 31 - h, "{}: real blocks confirm one each", p.name);
+            }
+            assert_eq!(m.at(31), 0);
+
+            // Made-up blocks on the tip: unchecked ones (DigiByte groestl; on Wojakcoin, sha256d at
+            // the minimum difficulty), then checked sha256d ones at the minimum difficulty.
+            let unchecked = extend(&honest[29], 30, 6, v_free, if p.key == "dgb" { HARD } else { EASY }, 2, if p.key == "dgb" { None } else { sha });
+            let cheap = extend(&unchecked[5], 36, 6, v_sha, EASY, 3, sha);
+            sync(&s, &mut Src::new(&[&unchecked, &cheap])).unwrap();
+            assert_eq!(db.tip(p.chain_no).unwrap().unwrap().height, 42, "{}: they extend the tip", p.name);
+            let m = db.money_depth_with(p, 20, 10).unwrap();
+            for h in 31..=42 {
+                assert_eq!(m.at(h), 0, "{}: a payment at {h} is not confirmed", p.name);
+            }
+            // The last real block has only its own work above it (worth PROVEN_SHARE blocks).
+            assert_eq!(m.at(30), crate::proven::PROVEN_SHARE as u32, "{}", p.name);
+            // The default reference (all of a chain this short) leaves the free blocks at 0 too.
+            assert_eq!(db.money_depth(p).unwrap().at(31), 0, "{}", p.name);
+
+            // One real block on top: what lies under it is buried under real work again.
+            let real = extend(&cheap[5], 42, 1, v_sha, HARD, 4, sha);
+            sync(&s, &mut Src::new(&[&real])).unwrap();
+            let m = db.money_depth_with(p, 20, 10).unwrap();
+            assert_eq!(m.at(43), 1);
+            assert_eq!(m.at(31), crate::proven::PROVEN_SHARE as u32, "{}", p.name);
+        }
+    }
+
+    /// A chain of staked blocks (Kotia after its last PoW height) confirms nothing for money.
+    #[test]
+    fn staked_chain_confirms_nothing() {
+        let g = genesis();
+        let p = params(&KOTIA_MAIN, &g, |p| p.pow = PowRule::PowThenStake { algo: PowAlgo::Scrypt, last_pow_height: 0 });
+        let (_d, db) = open();
+        let s = Syncer::new(&db, p);
+        let staked = extend(&g, 0, 20, 1, HARD, 1, None);
+        sync(&s, &mut Src::new(&[&[g.clone()], &staked])).unwrap();
+        assert_eq!(db.tip(p.chain_no).unwrap().unwrap().height, 20);
+        let m = db.money_depth(p).unwrap();
+        assert!(!m.confirms());
+        assert!((0..=20).all(|h| m.at(h) == 0));
+    }
+
+    /// Where every header's work is checked and bounded, money confirmations are the depth.
+    #[test]
+    fn money_depth_is_plain_where_work_is_bounded() {
+        let g = genesis();
+        let p = checked_params(&g, |_| {});
+        assert!(!p.confirms_by_proven_work());
+        let (_d, db) = open();
+        let s = Syncer::new(&db, p);
+        let blocks = extend(&g, 0, 8, 1, EASY, 1, Some(PowAlgo::Sha256d));
+        sync(&s, &mut Src::new(&[&[g.clone()], &blocks])).unwrap();
+        let m = db.money_depth(p).unwrap();
+        assert!(m.confirms());
+        assert!((0..=8).all(|h| m.at(h) == 9 - h));
+        assert_eq!(m.at(9), 0);
     }
 
     fn checked_params(g: &Block, tweak: impl FnOnce(&mut ChainParams)) -> &'static ChainParams {

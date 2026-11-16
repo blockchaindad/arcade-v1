@@ -574,8 +574,48 @@ pub fn listen(node: Arc<Node>, port: u16) {
     accept(node, l);
 }
 
+/// Inbound links once their handshake is done: at most this many in all and from one IP, so links that prove a
+/// free identity can't use up the process's open files.
+const MAX_INBOUND_LINKS: usize = 256;
+const MAX_INBOUND_LINKS_PER_IP: usize = 8;
+
+/// An established inbound link's place, given back when dropped (see MAX_INBOUND_LINKS).
+struct LinkSlot(std::net::IpAddr);
+
+impl LinkSlot {
+    fn take(ip: std::net::IpAddr) -> Option<LinkSlot> {
+        let mut h = inbound_links();
+        let n = h.by_ip.get(&ip).copied().unwrap_or(0);
+        if h.all >= MAX_INBOUND_LINKS || n >= MAX_INBOUND_LINKS_PER_IP {
+            return None;
+        }
+        h.all += 1;
+        h.by_ip.insert(ip, n + 1);
+        Some(LinkSlot(ip))
+    }
+}
+
+impl Drop for LinkSlot {
+    fn drop(&mut self) {
+        inbound_links().give(self.0);
+    }
+}
+
+fn inbound_links() -> std::sync::MutexGuard<'static, Handshakes> {
+    static H: std::sync::OnceLock<std::sync::Mutex<Handshakes>> = std::sync::OnceLock::new();
+    H.get_or_init(Default::default).lock().unwrap()
+}
+
 fn accept(node: Arc<Node>, l: std::net::TcpListener) {
-    for s in l.incoming().flatten() {
+    for s in l.incoming() {
+        // Out of open files or another accept error: wait a moment rather than spin on it.
+        let s = match s {
+            Ok(s) => s,
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+        };
         let Ok(ip) = s.peer_addr().map(|a| a.ip()) else { continue };
         // Too many handshakes under way (from this IP or in all): close it unread.
         let Some(slot) = Slot::take(ip) else { continue };
@@ -596,6 +636,7 @@ fn accept(node: Arc<Node>, l: std::net::TcpListener) {
             done.store(true, std::sync::atomic::Ordering::Relaxed);
             drop(slot);
             let Ok(mut link) = r else { return };
+            let Some(_held) = LinkSlot::take(ip) else { return };
             let addr = format!("{peer_ip}:{}", link.peer_listen.unwrap_or(0));
             let key = crate::node::link_add(&node.links, &addr, &link.peer_id, now());
             let _ = serve(&node, &mut link, &addr);
@@ -630,6 +671,7 @@ pub fn accept_ws(node: Arc<Node>, s: std::net::TcpStream, ip: std::net::IpAddr, 
         done.store(true, std::sync::atomic::Ordering::Relaxed);
         drop(slot);
         let Ok(mut link) = r else { return };
+        let Some(_held) = LinkSlot::take(ip) else { return };
         let addr = format!("{ip}:{}", link.peer_listen.unwrap_or(0));
         let k = crate::node::link_add(&node.links, &addr, &link.peer_id, now());
         let _ = serve(&node, &mut link, &addr);
@@ -640,6 +682,9 @@ pub fn accept_ws(node: Arc<Node>, s: std::net::TcpStream, ip: std::net::IpAddr, 
 fn our_tip(node: &Node) -> u64 {
     node.chain.tip(node.params.chain_no).ok().flatten().map(|t| t.height as u64).unwrap_or(0)
 }
+
+/// A link that has heard nothing for this long has ended (pings go both ways every 15 s).
+const LINK_SILENT: Duration = Duration::from_secs(120);
 
 pub fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> {
     link.set_read_timeout(Duration::from_secs(5))?;
@@ -687,8 +732,8 @@ pub fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> 
     let mut last_me = std::time::Instant::now();
     let mut last_offer = crate::coreshare::offer(node).map(|o| o.head["nets"].clone()).unwrap_or(Value::Null);
     // Core-style calls over this link (coreshare) are answered for this peer: the addresses
-    // it watches are its own.
-    let r = crate::rpc::as_caller(&peer, || {
+    // it watches are its own (and counted with those of other node ids on its host).
+    let r = crate::rpc::as_caller(&peer, &crate::refill::host_group(addr), || {
         serve_loop(node, link, addr, &peer, conn, &mut cr_reqs, &mut last_ping, &mut sent_outbox, &mut last_sz, &mut last_hold, &mut last_me, &mut last_offer)
     });
     crate::crvia::down(&peer);
@@ -715,6 +760,10 @@ fn serve_loop(
 ) -> Result<(), LinkError> {
     let cr_reqs = &mut *cr_reqs;
     crate::arcsvc::new_link(&link.peer_id);
+    // Last frame heard. Both ends ping every 15 s and answer pings, so a link that has heard nothing for LINK_SILENT
+    // is dead (a relayed link whose far end is gone, a socket the network dropped without a reset): it ends, so the two
+    // arcades can link again, instead of staying "linked" with nothing going through (seen 2026-11-16, ARCADE #19).
+    let mut heard = std::time::Instant::now();
     loop {
         // Queued frames: every link sends every frame once (those still in the ring).
         let pending: Vec<Value> = {
@@ -774,6 +823,10 @@ fn serve_loop(
         // fast lane is busy).
         let wait = if crate::realtime::fast::busy() { 2 } else { 50 };
         if !link.ready(Duration::from_millis(wait))? {
+            // Checked only with nothing waiting to be read, so a long turn of this loop isn't taken for silence.
+            if heard.elapsed() > LINK_SILENT {
+                return Err(LinkError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, format!("nothing heard for {} s", LINK_SILENT.as_secs()))));
+            }
             continue;
         }
         let f = match link.recv() {
@@ -781,6 +834,7 @@ fn serve_loop(
             Err(LinkError::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
             Err(e) => return Err(e),
         };
+        heard = std::time::Instant::now();
         match f.kind() {
             "ping" => link.send(&Frame::pong(&f))?,
             #[cfg(feature = "oldimport")]
@@ -875,10 +929,30 @@ fn refresh_bk(node: &Node, addr: &str, height: u64) {
     }
 }
 
+/// Arcades' offers kept at most. Each comes over a link of the arcade's own, but node ids cost
+/// nothing to make: past it, offers older than OFFER_AGE (no longer used) go, then the oldest of
+/// an arcade not linked now.
+const OFFERS_MAX: usize = 512;
+const OFFER_AGE: u64 = 3 * 3600;
+
+/// Make room for one more offer (`linked`: the node ids linked now, never pushed out first).
+fn room_for_offer(all: &mut std::collections::BTreeMap<String, crate::node::Offer>, linked: &[String], now: u64) {
+    all.retain(|_, o| o.at.saturating_add(OFFER_AGE) >= now);
+    while all.len() >= OFFERS_MAX {
+        let oldest = |only_unlinked: bool| all.iter().filter(|(id, _)| !only_unlinked || !linked.contains(id)).min_by_key(|(_, o)| o.at).map(|(id, _)| id.clone());
+        let Some(id) = oldest(true).or_else(|| oldest(false)) else { break };
+        all.remove(&id);
+    }
+}
+
 /// Remember which chains an arcade offers (and where to dial it).
 fn note_offer(node: &Node, id: &str, addr: &str, kind: &str, nets: &Value) {
     let Some(nets) = nets.as_object() else { return };
+    let linked = crate::shares::linked_ids(node);
     let mut all = node.offers.lock().unwrap();
+    if !all.contains_key(id) && all.len() >= OFFERS_MAX {
+        room_for_offer(&mut all, &linked, now());
+    }
     let o = all.entry(id.to_string()).or_default();
     o.at = now();
     if !addr.ends_with(":0") {
@@ -1130,7 +1204,8 @@ mod tests {
         let socks: Vec<std::net::TcpStream> = (0..MAX_HANDSHAKES_PER_IP + 3).map(|_| std::net::TcpStream::connect(to).unwrap()).collect();
         let mut open = 0;
         for mut s in socks {
-            s.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+            // Generous: a closed one reads 0 at once, and a waiting one gets our hello late on a loaded machine.
+            s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
             let mut b = [0u8; 4096];
             if s.read(&mut b).is_ok_and(|n| n > 0) {
                 open += 1;
@@ -1142,7 +1217,8 @@ mod tests {
 
 #[cfg(test)]
 mod bk_tests {
-    use super::refresh_bk;
+    use super::{note_offer, refresh_bk, room_for_offer, OFFERS_MAX, OFFER_AGE};
+    use serde_json::json;
     use crate::sitesvc::tests::setup;
 
     #[test]
@@ -1157,5 +1233,44 @@ mod bk_tests {
         assert_eq!(bk["203.0.113.5:8421"], 25, "the same host, its own announced port");
         assert_eq!(bk["wss://relay.example/mesh"], 30);
         assert_eq!(bk["198.51.100.7:8421"], 10, "another arcade's untouched");
+    }
+
+    #[test]
+    fn offers_are_bounded_and_linked_arcades_stay() {
+        let mut all: std::collections::BTreeMap<String, crate::node::Offer> = Default::default();
+        let now = 1_000_000;
+        let offer = |at: u64| crate::node::Offer { at, addr: "198.51.100.7:8421".into(), ..Default::default() };
+        all.insert("linked".into(), offer(now - 100));
+        all.insert("stale".into(), offer(now - OFFER_AGE - 1));
+        for i in 0..OFFERS_MAX as u64 {
+            all.insert(format!("x{i}"), offer(now - 50 + i % 10));
+        }
+        room_for_offer(&mut all, &["linked".to_string()], now);
+        assert_eq!(all.len(), OFFERS_MAX - 1);
+        assert!(all.contains_key("linked"), "the oldest, but linked now");
+        assert!(!all.contains_key("stale"));
+        // Through note_offer: a flood of new ids keeps the map at OFFERS_MAX.
+        let t = crate::sitesvc::tests::setup();
+        let net = t.p.net;
+        for i in 0..(OFFERS_MAX + 50) {
+            note_offer(&t.node, &format!("{i:064x}"), "198.51.100.7:8421", "bk", &json!({net: {"h": 5}}));
+        }
+        assert_eq!(t.node.offers.lock().unwrap().len(), OFFERS_MAX);
+    }
+}
+
+#[cfg(test)]
+mod link_cap_tests {
+    use super::*;
+
+    /// Established inbound links are capped per IP and in all; a place is given back when the link ends.
+    #[test]
+    fn inbound_links_are_capped() {
+        let ip: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        let held: Vec<LinkSlot> = (0..MAX_INBOUND_LINKS_PER_IP).map(|_| LinkSlot::take(ip).expect("under the cap")).collect();
+        assert!(LinkSlot::take(ip).is_none(), "one IP holds at most MAX_INBOUND_LINKS_PER_IP");
+        drop(held);
+        let again = LinkSlot::take(ip);
+        assert!(again.is_some(), "places come back when links end");
     }
 }

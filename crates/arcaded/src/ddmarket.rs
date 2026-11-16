@@ -21,8 +21,14 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-/// How long a maker holds its coins for a fill it laid out and the taker has not signed.
+/// How long a maker holds its coins for a fill it laid out and the taker has not signed. An arcade asking again for
+/// the same order replaces its fill without holding it much longer (SIGN_SECS at most past this), and one whose fill
+/// ran out unsigned waits as long again before it may hold that order again.
 const FILL_LIFE: u64 = 600;
+/// What a fill laid out again for the same arcade keeps at least, for its signatures (they follow the ask at once).
+const SIGN_SECS: u64 = 120;
+/// Fills one asking arcade may have laid out here at once (one per order).
+const FILLS_PER_PEER: usize = 3;
 const LEAST: i64 = arcade_wallet::dd::LEAST_OUTPUT;
 
 fn key(id: &str) -> Vec<u8> {
@@ -103,6 +109,8 @@ pub fn place(node: &Node, chain: &str, side: &str, cents: i64, dgb: u64, expires
     if dgb < arcade_wallet::dd::DUST {
         return Err("that price is under the dust line".into());
     }
+    // The account placing it: the daemon fills it from that account's coins whichever account is active later.
+    let account = node.app.active_account();
     let (_, held, coins, _, _) = crate::ddsvc::trade_coins(node, p)?;
     if side == "sell" {
         let have: i64 = held.iter().map(|h| h.cents).sum();
@@ -114,7 +122,7 @@ pub fn place(node: &Node, chain: &str, side: &str, cents: i64, dgb: u64, expires
     }
     let id = arcade_mesh::random::hex(8);
     let o = json!({"id": id, "chain": p.key, "side": side, "cents": cents, "left": cents, "dgb": dgb, "status": "open",
-                   "created": arcade_app::now(), "expires": expires, "fills": [], "node": node.id_hex()});
+                   "created": arcade_app::now(), "expires": expires, "fills": [], "node": node.id_hex(), "account": account});
     put(node, &o);
     let _ = node.app.event("wallet", &format!("a DigiDollar order: {} ${:.2} for {} DGB", side, cents as f64 / 100.0, dgb as f64 / 1e8));
     Ok(o)
@@ -131,9 +139,13 @@ pub fn cancel(node: &Node, id: &str) -> Result<Value, String> {
 
 struct Pending {
     order: String,
-    /// The taker's DigiDollar output (hex): a new ask from the same taker for the same order replaces the
-    /// fill laid out before (the card's preview, then its Approve).
-    taker: String,
+    /// The arcade that asked (the link's node id): a new ask from it for the same order replaces the fill laid out
+    /// before (the card's preview, then its Approve).
+    peer: String,
+    /// When that arcade's run of fills of this order began (a replaced fill's `since` carries over).
+    since: u64,
+    /// The key of the order's account, which the maker's side is laid out with and signs with.
+    maker_key: arcade_wallet::SecretKey,
     cents: i64,
     price: u64,
     unsigned: Unsigned,
@@ -149,12 +161,39 @@ fn pending() -> std::sync::MutexGuard<'static, HashMap<String, Pending>> {
     P.get_or_init(Default::default).lock().unwrap()
 }
 
-/// Coins a laid-out fill holds now (so two fills never spend the same coin).
-fn held_now() -> Vec<OutPoint> {
-    let now = arcade_app::now();
-    let mut p = pending();
-    p.retain(|_, f| f.until > now);
-    p.values().flat_map(|f| f.maker_mine.iter().map(|u| u.outpoint)).collect()
+/// Arcades whose fill of an order ran out unsigned: (peer, order) -> when that arcade may hold the order again.
+fn resting() -> std::sync::MutexGuard<'static, HashMap<(String, String), u64>> {
+    static R: OnceLock<Mutex<HashMap<(String, String), u64>>> = OnceLock::new();
+    R.get_or_init(Default::default).lock().unwrap()
+}
+
+/// Drop the fills whose time ran out: the arcade that left one unsigned rests from that order for FILL_LIFE.
+fn expire(p: &mut HashMap<String, Pending>, now: u64) {
+    let gone: Vec<String> = p.iter().filter(|(_, f)| f.until <= now).map(|(k, _)| k.clone()).collect();
+    let mut r = resting();
+    r.retain(|_, until| *until > now);
+    for k in gone {
+        if let Some(f) = p.remove(&k) {
+            r.insert((f.peer, f.order), f.until + FILL_LIFE);
+        }
+    }
+}
+
+/// The hold a new fill by one arcade gets at `now`: (since, until). `prev` is that arcade's live fill of the same
+/// order (since, until), which the new one replaces: a run of fills never holds the order past since + FILL_LIFE +
+/// SIGN_SECS. `others`: that arcade's live fills of other orders. `rest`: when it may hold this order again, if its
+/// last fill of it ran out unsigned.
+fn hold_for(prev: Option<(u64, u64)>, others: usize, rest: Option<u64>, now: u64) -> Result<(u64, u64), String> {
+    if let Some(r) = rest.filter(|r| *r > now) {
+        return Err(format!("your last fill of that order ran out unsigned; it is open to others for {} more seconds", r - now));
+    }
+    if others >= FILLS_PER_PEER {
+        return Err(format!("your arcade has {others} fills laid out here already: sign one or let it run out first"));
+    }
+    Ok(match prev {
+        Some((since, until)) => (since, until.max((now + SIGN_SECS).min(since + FILL_LIFE + SIGN_SECS))),
+        None => (now, now + FILL_LIFE),
+    })
 }
 
 fn utxo_json(u: &Utxo) -> Value {
@@ -200,17 +239,18 @@ fn cents_of(node: &Node, p: &ChainParams, op: &OutPoint) -> i64 {
     arcade_ledger::digidollar::read(&tx).map(|d| d.outputs.iter().filter(|o| o.0 == op.vout).map(|o| o.2).sum()).unwrap_or(0)
 }
 
-/// A mesh question about this arcade's DigiDollar orders (shares.rs `mk`).
-pub fn answer(node: &Node, arg: &str) -> Result<Value, String> {
+/// A mesh question about this arcade's DigiDollar orders (shares.rs `mk`) from arcade `peer` (the link's node id;
+/// this arcade's own for its own asks).
+pub fn answer(node: &Node, peer: &str, arg: &str) -> Result<Value, String> {
     let q: Value = serde_json::from_str(arg).map_err(|_| "bad question".to_string())?;
     let chain = q["chain"].as_str().unwrap_or("");
     let p = dd_chain(chain).ok_or("not a DigiDollar chain")?;
     if q["op"].as_str().is_some_and(|o| o.starts_with('s')) {
-        return crate::swaps::answer(node, &q); // any leg for any leg (swaps.rs)
+        return crate::swaps::answer(node, peer, &q); // any leg for any leg (swaps.rs)
     }
     match q["op"].as_str().unwrap_or("") {
         "book" => Ok(json!({"node": node.id_hex(), "orders": orders(node, Some(p.key), false).iter().map(public).collect::<Vec<_>>()})),
-        "fill" => lay_out(node, p, &q),
+        "fill" => lay_out(node, p, peer, &q),
         "sign" => finish(node, p, &q),
         _ => Err("unknown market question".into()),
     }
@@ -222,20 +262,40 @@ pub fn public(o: &Value) -> Value {
            "expires": o["expires"], "node": o["node"], "min": LEAST})
 }
 
-fn lay_out(node: &Node, p: &'static ChainParams, q: &Value) -> Result<Value, String> {
+fn lay_out(node: &Node, p: &'static ChainParams, peer: &str, q: &Value) -> Result<Value, String> {
     let id = q["order"].as_str().unwrap_or("");
     let o = get(node, id).filter(|o| o["status"] == "open" && o["chain"] == p.key).ok_or("that order is not open here")?;
     let cents = q["cents"].as_i64().ok_or("give cents")?;
-    let taker_key = q["taker"]["dd_script"].as_str().unwrap_or("").to_string();
-    pending().retain(|_, f| !(f.order == id && f.taker == taker_key));
-    // What other fills already laid out hold of it.
-    let laid: i64 = pending().values().filter(|f| f.order == id && f.until > arcade_app::now()).map(|f| f.cents).sum();
+    if peer.is_empty() {
+        return Err("a fill is laid out for an arcade on a link".into());
+    }
+    // "hold": false (a card's preview): laid out to be shown, nothing held for it (an Approve asks again and signs).
+    let holds = q["hold"] != false;
+    let now = arcade_app::now();
+    // Fills are held per asking arcade: its earlier fill of this order is replaced, it has a few at most, and one whose
+    // fill ran out unsigned rests from that order a while (hold_for).
+    let (since, until, laid, busy) = {
+        let mut pend = pending();
+        expire(&mut pend, now);
+        let prev = pend.values().find(|f| f.order == id && f.peer == peer).map(|f| (f.since, f.until));
+        let others = pend.values().filter(|f| f.peer == peer && f.order != id).count();
+        let rest = resting().get(&(peer.to_string(), id.to_string())).copied();
+        let (since, until) = if holds { hold_for(prev, others, rest, now)? } else { (now, now) };
+        if holds {
+            pend.retain(|_, f| !(f.order == id && f.peer == peer));
+        }
+        // What other fills already laid out hold of it, and every coin they spend (either side's).
+        let laid: i64 = pend.values().filter(|f| f.order == id && !(f.peer == peer)).map(|f| f.cents).sum();
+        let busy: Vec<OutPoint> = pend.values().filter(|f| !(f.order == id && f.peer == peer)).flat_map(|f| f.unsigned.utxos.iter().map(|u| u.outpoint)).collect();
+        (since, until, laid, busy)
+    };
     let mut free = o.clone();
     free["left"] = json!(o["left"].as_i64().unwrap_or(0) - laid);
     fill_ok(&free, cents)?;
     let price = fill_price(&o, cents);
-    let (_, held, dgb, dd_script, change) = crate::ddsvc::trade_coins(node, p)?;
-    let busy = held_now();
+    // The order's account's coins and key, whichever account is active now.
+    let maker_key = crate::swaps::account_key(node, p, &crate::swaps::order_account(node, &o))?.0;
+    let (_, held, dgb, dd_script, change) = crate::ddsvc::trade_coins_for(node, p, Some(&maker_key))?;
     let held: Vec<Held> = held.into_iter().filter(|h| !busy.contains(&h.coin.outpoint)).collect();
     let dgb: Vec<Utxo> = dgb.into_iter().filter(|u| !busy.contains(&u.outpoint)).collect();
     let t = &q["taker"];
@@ -245,14 +305,24 @@ fn lay_out(node: &Node, p: &'static ChainParams, q: &Value) -> Result<Value, Str
     if t_dd_script.len() != 34 || t_dd_script[0] != 0x51 {
         return Err("the taker's DigiDollar output is not a Taproot one".into());
     }
+    // The taker's DGB is real: each coin unspent on this arcade's copy as the question says, none in another fill.
+    // A hold is then backed by coins that could pay for it, never by coins made up in the question.
+    for u in &t_dgb {
+        let real = node.chain.coin(p, &u.outpoint).ok().flatten().is_some_and(|c| c.value == u.value && c.script == u.script);
+        if !real || node.chain.mempool_spender(p.chain_no, &u.outpoint).ok().flatten().is_some() || busy.contains(&u.outpoint) {
+            return Err("the taker's DGB coins are not all unspent here (or another fill holds them)".into());
+        }
+    }
     let maker_sells = o["side"] == "sell";
     let (seller, buyer, deal, maker_role) = if maker_sells {
         (Side { dd: held, dgb: vec![], dgb_change: change.clone() },
          Side { dd: vec![], dgb: t_dgb, dgb_change: t_change },
          Deal { cents, price, dollars_to: t_dd_script, seller_dd: dd_script.clone(), price_to: change.clone() }, Role::Seller)
     } else {
-        // The taker sells dollars: its coins' dollars are read here, never taken from the question.
-        let t_dd: Vec<Held> = t["dd"].as_array().map(|a| a.iter().filter_map(utxo_of).map(|u| { let c = cents_of(node, p, &u.outpoint); Held { coin: u, cents: c } }).filter(|h| h.cents > 0).collect()).unwrap_or_default();
+        // The taker sells dollars: its coins' dollars are read here, never taken from the question; only its coins
+        // unspent on this arcade's copy, none in another fill.
+        let unspent: Vec<OutPoint> = node.chain.coins_for_script(p, &t_dd_script).map_err(|e| e.to_string())?.into_iter().map(|c| c.0).collect();
+        let t_dd: Vec<Held> = t["dd"].as_array().map(|a| a.iter().filter_map(utxo_of).filter(|u| unspent.contains(&u.outpoint) && !busy.contains(&u.outpoint)).map(|u| { let c = cents_of(node, p, &u.outpoint); Held { coin: u, cents: c } }).filter(|h| h.cents > 0).collect()).unwrap_or_default();
         (Side { dd: t_dd, dgb: t_dgb.clone(), dgb_change: t_change.clone() },
          Side { dd: vec![], dgb, dgb_change: change.clone() },
          Deal { cents, price, dollars_to: dd_script.clone(), seller_dd: t_dd_script, price_to: t_change }, Role::Buyer)
@@ -267,13 +337,19 @@ fn lay_out(node: &Node, p: &'static ChainParams, q: &Value) -> Result<Value, Str
     let out = json!({"fill": fill, "order": id, "cents": cents, "price": price, "unsigned": unsigned_json(&u),
                      "deal": {"dollars_to": hex::encode(&deal.dollars_to), "seller_dd": hex::encode(&deal.seller_dd), "price_to": hex::encode(&deal.price_to)},
                      "maker_side": o["side"], "fee_by": if fee_by == Role::Buyer { "buyer" } else { "seller" }});
-    pending().insert(fill, Pending { order: id.into(), taker: taker_key, cents, price, unsigned: u, deal, maker_role, maker_mine, maker_change: change, until: arcade_app::now() + FILL_LIFE });
+    if holds {
+        pending().insert(fill, Pending { order: id.into(), peer: peer.into(), since, maker_key, cents, price, unsigned: u, deal, maker_role, maker_mine, maker_change: change, until });
+    }
     Ok(out)
 }
 
 fn finish(node: &Node, p: &'static ChainParams, q: &Value) -> Result<Value, String> {
     let fid = q["fill"].as_str().unwrap_or("");
-    let f = pending().remove(fid).filter(|f| f.until > arcade_app::now()).ok_or("that fill timed out; ask again")?;
+    let f = {
+        let mut pend = pending();
+        expire(&mut pend, arcade_app::now());
+        pend.remove(fid).ok_or("that fill timed out; ask again")?
+    };
     let theirs = part_of(&q["part"]).ok_or("bad signatures")?;
     // Signed last, after the whole transaction is checked again as this side's.
     let fee_by = if f.maker_role == Role::Seller { Role::Buyer } else { Role::Seller };
@@ -281,8 +357,8 @@ fn finish(node: &Node, p: &'static ChainParams, q: &Value) -> Result<Value, Stri
     if theirs.iter().any(|(i, _, _)| f.maker_mine.iter().any(|m| f.unsigned.utxos.get(*i).is_some_and(|x| x.outpoint == m.outpoint))) {
         return Err("those signatures name this arcade's own coins".into());
     }
-    let (sk, ..) = crate::ddsvc::trade_coins(node, p)?;
-    let mine = ddtrade::sign_mine(p, &f.unsigned, &sk)?;
+    // Signed with the key the fill was laid out with: the order's account's, whichever account is active now.
+    let mine = ddtrade::sign_mine(p, &f.unsigned, &f.maker_key)?;
     let tx = ddtrade::assemble(p, &f.unsigned, &[&theirs, &mine])?;
     let mut o = get(node, &f.order).ok_or("the order is gone")?;
     let left = o["left"].as_i64().unwrap_or(0);
@@ -363,13 +439,14 @@ pub fn book(node: &Node, chain: &str) -> Result<Vec<Value>, String> {
 /// Ask the maker to lay out a fill of `cents` of its order, with this wallet's coins as the taker's side,
 /// and check the answer as this side's own: (the answer, the checked transaction, the deal, this key).
 /// `price`: the DGB this side agreed to (the card's): a buyer of dollars pays no more, a seller gets no less.
-pub fn ask_fill(node: &Node, chain: &str, maker: &str, order: &str, cents: i64, price: u64) -> Result<(Value, Unsigned, Deal, Role, Vec<Utxo>, Vec<u8>), String> {
+/// `hold`: whether the maker holds its coins for this fill (an Approve, signed next); a card's preview holds nothing.
+pub fn ask_fill(node: &Node, chain: &str, maker: &str, order: &str, cents: i64, price: u64, hold: bool) -> Result<(Value, Unsigned, Deal, Role, Vec<Utxo>, Vec<u8>), String> {
     let p = dd_chain(chain).ok_or("DigiDollar trades on dgb or dgbtest")?;
     let (_, held, dgb, dd_script, change) = crate::ddsvc::trade_coins(node, p)?;
     let taker = json!({"dgb": dgb.iter().map(utxo_json).collect::<Vec<_>>(), "dgb_change": hex::encode(&change),
                        "dd_script": hex::encode(&dd_script), "dd": held.iter().map(|h| utxo_json(&h.coin)).collect::<Vec<_>>()});
-    let q = json!({"op": "fill", "chain": p.key, "order": order, "cents": cents, "taker": taker});
-    let a = if maker == node.id_hex() { answer(node, &q.to_string())? } else {
+    let q = json!({"op": "fill", "chain": p.key, "order": order, "cents": cents, "taker": taker, "hold": hold});
+    let a = if maker == node.id_hex() { answer(node, maker, &q.to_string())? } else {
         crate::shares::ask_linked(maker, json!({"what": "mk", "net": p.net, "arg": q.to_string()}))?
     };
     let u = unsigned_of(&a["unsigned"]).ok_or("the maker's answer doesn't read")?;
@@ -407,11 +484,11 @@ pub fn ask_fill(node: &Node, chain: &str, maker: &str, order: &str, cents: i64, 
 /// The taker signs its inputs and hands them to the maker, who signs last and broadcasts: the sent tx.
 pub fn take(node: &Node, chain: &str, maker: &str, order: &str, cents: i64, price: u64) -> Result<(Tx, u64), String> {
     let p = dd_chain(chain).ok_or("DigiDollar trades on dgb or dgbtest")?;
-    let (a, u, ..) = ask_fill(node, chain, maker, order, cents, price)?;
+    let (a, u, ..) = ask_fill(node, chain, maker, order, cents, price, true)?;
     let (sk, ..) = crate::ddsvc::trade_coins(node, p)?;
     let part = ddtrade::sign_mine(p, &u, &sk)?;
     let q = json!({"op": "sign", "chain": p.key, "fill": a["fill"], "part": part_json(&part)});
-    let done = if maker == node.id_hex() { answer(node, &q.to_string())? } else {
+    let done = if maker == node.id_hex() { answer(node, maker, &q.to_string())? } else {
         crate::shares::ask_linked(maker, json!({"what": "mk", "net": p.net, "arg": q.to_string()}))?
     };
     let tx = Tx::parse_with(&hex::decode(done["hex"].as_str().unwrap_or("")).map_err(|e| e.to_string())?, &p.format).map_err(|e| e.to_string())?;
@@ -448,5 +525,42 @@ mod tests {
         let buy = json!({"side": "buy", "cents": 300, "dgb": 1000});
         assert_eq!(fill_price(&sell, 100), 334); // a taker buying dollars pays the rounding
         assert_eq!(fill_price(&buy, 100), 333); // a taker selling dollars gets it rounded down
+    }
+}
+
+#[cfg(test)]
+mod hold_tests {
+    use super::*;
+
+    /// A fill holds for FILL_LIFE; the same arcade asking again replaces it without holding much longer (SIGN_SECS
+    /// for its signatures, never past since + FILL_LIFE + SIGN_SECS); a few per arcade; a rest after one ran out.
+    #[test]
+    fn fill_holds_are_bounded_per_arcade_and_in_time() {
+        assert_eq!(hold_for(None, 0, None, 1000), Ok((1000, 1000 + FILL_LIFE)));
+        assert_eq!(hold_for(Some((1000, 1600)), 0, None, 1100), Ok((1000, 1600)), "asking again holds no longer");
+        assert_eq!(hold_for(Some((1000, 1600)), 0, None, 1590), Ok((1000, 1710)), "time to sign an Approve");
+        assert_eq!(hold_for(Some((1000, 1710)), 0, None, 1700), Ok((1000, 1720)), "never past since + FILL_LIFE + SIGN_SECS");
+        assert_eq!(hold_for(Some((1000, 1720)), 0, None, 1719), Ok((1000, 1720)));
+        assert!(hold_for(None, FILLS_PER_PEER, None, 1000).unwrap_err().contains("fills laid out"));
+        assert!(hold_for(None, 0, Some(1500), 1000).unwrap_err().contains("ran out unsigned"));
+        assert!(hold_for(None, 0, Some(1000), 1000).is_ok(), "the rest is over");
+    }
+
+    /// A fill that ran out unsigned is dropped and its arcade rests from that order for FILL_LIFE.
+    #[test]
+    fn a_fill_left_unsigned_rests_its_arcade() {
+        let f = |peer: &str, until: u64| Pending {
+            order: "o1".into(), peer: peer.into(), since: until - FILL_LIFE, maker_key: arcade_wallet::SecretKey::from_slice(&[1; 32]).unwrap(),
+            cents: 100, price: 1, unsigned: Unsigned { utxos: vec![], outs: vec![], fee: 0 },
+            deal: Deal { cents: 100, price: 1, dollars_to: vec![], seller_dd: vec![], price_to: vec![] }, maker_role: Role::Seller,
+            maker_mine: vec![], maker_change: vec![], until,
+        };
+        let mut p = HashMap::new();
+        p.insert("f1".to_string(), f("hold-test-a", 5000));
+        p.insert("f2".to_string(), f("hold-test-b", 9000));
+        expire(&mut p, 5000);
+        assert!(!p.contains_key("f1") && p.contains_key("f2"));
+        assert_eq!(resting().get(&("hold-test-a".to_string(), "o1".to_string())).copied(), Some(5000 + FILL_LIFE));
+        assert!(!resting().contains_key(&("hold-test-b".to_string(), "o1".to_string())));
     }
 }
