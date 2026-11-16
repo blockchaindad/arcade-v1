@@ -106,6 +106,10 @@ pub fn allow(node: &Node, key: Option<&str>, req: &Value) -> Result<(), (u16, St
         Perm::Local => return Err((403, format!("{cmd} is only available on this computer's own socket or the cookie RPC"))),
         _ => {}
     }
+    // One check at a time: the key's record (its day's spending) is read, checked and written back as one step,
+    // so requests in parallel can't each pass on the same total.
+    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
     let key = key.ok_or((401, format!("{cmd} needs an API key with \"{}\" (Authorization: Bearer ak_...)", need.name())))?;
     let (id, secret) = key.strip_prefix("ak_").and_then(|k| k.split_once('_')).ok_or((401, "malformed API key".to_string()))?;
     let mut rec: Value = node
@@ -178,6 +182,20 @@ mod tests {
         assert!(act(k, json!({"cmd": "dogefeed.act", "op": "tip", "target": "x", "amount": 0.5, "send": true})).is_ok(), "exactly 3");
         assert_eq!(doge_koinu(&json!("0.00000001")), Some(1));
         assert_eq!(doge_koinu(&json!("x")), None);
+    }
+
+    /// Tips from many threads at once never pass the day's limit together.
+    #[test]
+    fn parallel_tips_keep_to_the_limit() {
+        let (_one, t) = crate::http::tests::node();
+        let k = create(&t.node, "site", &["tip".into()], 1000).unwrap();
+        let key = k["key"].as_str().unwrap().to_string();
+        let node = &t.node;
+        let ok = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..16).map(|_| s.spawn(|| allow(node, Some(&key), &json!({"cmd": "feed.act", "kind": "tip", "amount": 100})).is_ok())).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).filter(|x| *x).count()
+        });
+        assert_eq!(ok, 10, "1000 a day at 100 each: ten pass, whatever the order");
     }
 
     /// A file path is read from this computer's disk: never over an API key, whatever its permissions.
