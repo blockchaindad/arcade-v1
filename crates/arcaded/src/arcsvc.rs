@@ -785,6 +785,92 @@ const WROTE_KEEP: usize = 1_000;
 /// restart, a parent it wrote on gets that same block offered again (never a second one), so a block lost before it
 /// reached anyone doesn't close its parent for good. All the writers of a test net stopped so, each having written on
 /// the tip, and none ever wrote again (2026-11-15).
+/// The tip this arcade's own proof of time is running for (the writer's draw), if one is.
+static OWN_PROOF: Mutex<Option<Hash256>> = Mutex::new(None);
+
+/// The ARCADE chain's tip here, if it runs.
+pub fn tip_id() -> Option<Hash256> {
+    svc().map(|s| s.st.lock().unwrap().chain.tip().id)
+}
+
+/// Whether this arcade is in the middle of its own proof for the block after the tip: an update waits for the next
+/// block before it restarts (crate::updater), so the work isn't thrown away.
+pub fn proving_for_tip() -> bool {
+    let Some(at) = *OWN_PROOF.lock().unwrap() else { return false };
+    svc().is_some_and(|s| s.st.lock().unwrap().chain.tip().id == at)
+}
+
+/// Steps in a piece of this arcade's own proof of time (about 5 minutes on the GX10): a longer proof is made a piece at
+/// a time, each saved as it finishes, so a restart in the middle (an update) carries on from the last piece instead of
+/// starting over (testnet block 679, 2026-11-16: 19 minutes, 5 of them thrown away by an update).
+const POT_PIECE: u64 = 30_000_000;
+
+/// This arcade's proof of `steps` steps from `challenge`, in at most `most` runs (the rules' cap at that height), the
+/// finished pieces kept in `dir` until it is done. Saved pieces are checked before they are used: a piece that doesn't
+/// verify is thrown away and made again, so nothing on disk can put a bad proof in a block.
+fn prove_in_pieces(dir: &std::path::Path, challenge: &arcade_arc::merkle::Hash, steps: u64, most: usize) -> Option<TimeProof> {
+    prove_in_pieces_of(dir, challenge, steps, most, POT_PIECE)
+}
+
+fn prove_in_pieces_of(dir: &std::path::Path, challenge: &arcade_arc::merkle::Hash, steps: u64, most: usize, piece: u64) -> Option<TimeProof> {
+    use arcade_arc::time::{join, Segment, SEGMENT_BYTES};
+    if most <= 1 || steps <= piece {
+        return ChiaVdf.prove(challenge, steps);
+    }
+    let _ = std::fs::create_dir_all(dir);
+    let name = format!("{}-{steps}", hex::encode(challenge));
+    // Pieces of other proofs are done with (their tip has moved on).
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            if e.file_name().to_str().is_some_and(|n| !n.starts_with(&name)) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    let file = dir.join(&name);
+    // As many pieces as the cap allows, but never smaller than `piece`.
+    let piece = piece.max(steps.div_ceil(most as u64));
+    let mut runs: Vec<Segment> = std::fs::read(&file)
+        .ok()
+        .filter(|b| !b.is_empty() && b.len() % SEGMENT_BYTES == 0)
+        .map(|b| {
+            b.chunks_exact(SEGMENT_BYTES)
+                .map(|c| Segment { steps: u64::from_le_bytes(c[..8].try_into().expect("8 bytes")), output: c[8..108].to_vec(), proof: c[108..].to_vec() })
+                .collect()
+        })
+        .unwrap_or_default();
+    let done: u64 = runs.iter().map(|r| r.steps).sum();
+    let fits = !runs.is_empty() && runs.len() < most && done < steps && runs.iter().all(|r| r.steps > 0);
+    if !runs.is_empty() && !(fits && ChiaVdf.verify_pot(challenge, done, &join(&runs), most)) {
+        eprintln!("arc: saved pieces of the proof of time don't check: starting it over");
+        runs.clear();
+    } else if !runs.is_empty() {
+        eprintln!("arc: carrying on the proof of time from {done} of {steps} steps ({} pieces saved)", runs.len());
+    }
+    let mut done: u64 = runs.iter().map(|r| r.steps).sum();
+    while done < steps {
+        // The last piece the cap allows takes all that is left.
+        let n = if runs.len() + 1 >= most { steps - done } else { (steps - done).min(piece) };
+        let from = runs.last().map(|r| r.output.clone()).unwrap_or_else(|| ChiaVdf::start().to_vec());
+        runs.push(ChiaVdf.run(challenge, &from, n)?);
+        done += n;
+        if done < steps {
+            let mut raw = Vec::with_capacity(runs.len() * SEGMENT_BYTES);
+            for r in &runs {
+                raw.extend_from_slice(&r.steps.to_le_bytes());
+                raw.extend_from_slice(&r.output);
+                raw.extend_from_slice(&r.proof);
+            }
+            let tmp = dir.join(format!("{name}.new"));
+            if std::fs::write(&tmp, &raw).is_ok() {
+                let _ = std::fs::rename(&tmp, &file);
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&file);
+    Some(join(&runs))
+}
+
 fn wrote_blocks_dir(node: &Node, svc: &Svc) -> std::path::PathBuf {
     node.home.join("arc").join(svc.net.key).join("wrote-blocks")
 }
@@ -896,6 +982,8 @@ fn run_writer_on(node: Arc<Node>, svc: Arc<Svc>, wrote: &mut VecDeque<Hash256>, 
                                 continue;
                             }
                             let (job, challenge, steps, running, likely) = (proving.clone(), t.challenge, t.steps, running.clone(), *likely);
+                            let (pot_dir, most) = (node.home.join("arc").join(svc.net.key).join("proof-pieces"), params::pot_runs(&svc.net, st.chain.tip().height + 1));
+                            *OWN_PROOF.lock().unwrap() = Some(tip);
                             let _ = std::thread::Builder::new().name("arc proof of time".into()).spawn(move || {
                                 let me = crate::rulecheck::thread_id();
                                 // A draw that can't be the height's best still runs at normal priority while it is for the
@@ -904,8 +992,14 @@ fn run_writer_on(node: Arc<Node>, svc: Arc<Svc>, wrote: &mut VecDeque<Hash256>, 
                                 // tips that moved on are pushed down (above), as before.
                                 let _ = likely;
                                 running.lock().unwrap().push(me);
-                                let proof = Clock::Vdf.prove(&challenge, steps);
+                                let proof = prove_in_pieces(&pot_dir, &challenge, steps, most);
                                 running.lock().unwrap().retain(|t| *t != me);
+                                {
+                                    let mut own = OWN_PROOF.lock().unwrap();
+                                    if *own == Some(tip) {
+                                        *own = None;
+                                    }
+                                }
                                 let mut j = job.lock().unwrap();
                                 if j.as_ref().is_some_and(|x| x.0 == tip) {
                                     *j = proof.map(|pr| (tip, Some(pr)));
@@ -1906,6 +2000,8 @@ pub fn status(node: &Node) -> Result<Value, String> {
             (v != (0, 0) || h.1 > 0).then(|| json!({"owner": hex::encode(owner), "served": v.0, "not_served": v.1, "held": h.0, "held_times": h.1}))
         }).collect::<Vec<_>>(),
         "accrued": st.chain.storage().accrued_of(&arcade_arc::registry::Earner::Owner(me)),
+        // This arcade's turn, next payout and why pay waits (docs/EARN.md).
+        "pay": crate::arcearn::pay(&svc.net, st.chain.storage(), &me, t.height),
     }))
 }
 
@@ -1924,7 +2020,6 @@ pub fn params_for(key: &str) -> Option<&'static ChainParams> {
 pub fn defined() -> Option<&'static ChainParams> {
     DEF.get().map(|d| d.params)
 }
-
 /// The (id, seed) of block `h` on the running ARCADE chain's best branch.
 pub fn block_at(h: u64) -> Option<(Hash256, arcade_arc::merkle::Hash)> {
     svc()?.st.lock().unwrap().chain.storage().block_at(h)
@@ -1987,6 +2082,11 @@ fn alone_streak<T: arcade_arc::time::TimeProofs, S: arcade_arc::chain::Storage>(
 /// Whether transaction `txid` waits in the ARCADE chain's pool.
 pub fn pooled(txid: &Hash256) -> bool {
     svc().is_some_and(|s| s.st.lock().unwrap().pool.iter().any(|w| w.tx.txid == *txid))
+}
+
+/// Whether the chain runs here and is as far as the arcades it is linked to (its pool takes what it should).
+pub fn ready() -> bool {
+    svc().is_some_and(|s| s.caught_up())
 }
 
 pub fn send_raw(raw: &[u8]) -> Result<(Hash256, u64), String> {
@@ -2424,12 +2524,16 @@ pub fn sealing(node: &Node, req: &Value) -> Result<Value, String> {
 
 /// `arc.earn {chain, on?}`: the coin's Earn ARCADE switch (docs/ARCADECHAIN.md §14.17) and where
 /// it stands. `on: true` installs the ARCADE chain here first when it isn't (the switch is the
-/// only step an operator takes); the coin must be kept in full.
+/// only step an operator takes); the coin must be kept in full and listed on the network (§2.3).
 pub fn earn(node: &Node, req: &Value) -> Result<Value, String> {
     let key = req["chain"].as_str().ok_or("give a chain")?;
     let p = node.chain_params(key).ok_or_else(|| format!("{key} isn't installed here"))?;
+    let paid = paid_here(p);
     if let Some(on) = req["on"].as_bool() {
         if on {
+            if !paid {
+                return Err(format!("{} is not paid on this network: the ARCADE chain doesn't list it", p.name));
+            }
             if node.mode_of(key).as_deref() != Some("full") {
                 return Err(format!("Earn ARCADE needs {} kept in full (its whole database is sealed)", p.name));
             }
@@ -2441,28 +2545,77 @@ pub fn earn(node: &Node, req: &Value) -> Result<Value, String> {
         crate::arcseg::set_earn(node, key, on)?;
         let _ = node.app.event("chains", &format!("Earn ARCADE {} for {}", if on { "on" } else { "off" }, p.name));
     }
-    // On by default for a coin kept in full; a coin kept otherwise can't be sealed, so it shows off.
-    let on = crate::arcseg::earn_on(node, key) && node.mode_of(key).as_deref() == Some("full");
-    let Some(svc) = svc() else { return Ok(json!({"chain": key, "on": on, "running": false})) };
-    let (sealed, of) = crate::arcseg::earn_progress(node, &svc.net, p);
+    earn_view(node, p)
+}
+
+/// Whether a coin's data can earn on the ARCADE network this arcade knows: one of its listed chains (params.rs
+/// `listed`; adding one is a rules version).
+fn paid_here(p: &ChainParams) -> bool {
+    svc().map(|s| s.net).or_else(|| defined_net().map(|d| d.0)).is_none_or(|n| n.listed.contains(&p.key))
+}
+
+/// `explorer.earn {chain?}` (/r/explorer/earn): what arc.earn shows, read only, for the Explorer and apps; without a
+/// chain, this arcade's pay and all its sealed replicas waiting to register.
+pub fn earn_read(node: &Node, req: &Value) -> Result<Value, String> {
+    if let Some(key) = req["chain"].as_str() {
+        let p = node.chain_params(key).ok_or_else(|| format!("{key} isn't installed here"))?;
+        return earn_view(node, p);
+    }
+    let Some(svc) = svc() else { return Ok(json!({"running": false})) };
     let me = node.identity.verifying_key().to_bytes();
-    let (weight, total, pot, height) = {
-        let st = svc.st.lock().unwrap();
-        let reg = st.chain.storage();
-        (reg.pay_weight(&me), reg.all_replicas().iter().map(|r| r.3).sum::<u64>() + genesis_total(), reg.pot(), st.chain.tip().height)
-    };
-    let sealing = crate::arcseal::sealing().map(|(_, d, o)| json!({"done": d, "of": o}));
-    // The indexes journaled here, sealed after the blocks.
-    let indexes: Vec<Value> = crate::arcseg::families(node, p)
+    let sealed = crate::arcseal::replicas(node, &svc.net);
+    let st = svc.st.lock().unwrap();
+    let (reg, tip) = (st.chain.storage(), st.chain.tip().height);
+    Ok(json!({"running": true, "net": svc.net.key, "height": tip, "pot": reg.pot(), "pay": crate::arcearn::pay(&svc.net, reg, &me, tip),
+              "registration": crate::arcearn::unregistered(&svc.net, reg, &me, tip, &sealed, None)}))
+}
+
+/// Where Earn ARCADE stands for a coin kept here: sealing, the catalog, registration and pay.
+fn earn_view(node: &Node, p: &'static ChainParams) -> Result<Value, String> {
+    let key = p.key;
+    let paid = paid_here(p);
+    // On by default for a coin kept in full; a coin kept otherwise can't be sealed, and one the network doesn't list
+    // isn't paid: both show off.
+    let on = paid && crate::arcseg::earn_on(node, key) && node.mode_of(key).as_deref() == Some("full");
+    // The indexes kept here that are never sealed: no journal family (addresses, collections, dogefeed), or journals
+    // that don't run from the index's start (an index taken in as a copy).
+    let fams = crate::arcseg::families(node, p);
+    let unpaid: Vec<Value> = crate::chains::indexes_of(node, p)
         .into_iter()
-        .filter(|f| *f != arcade_arc::segment::FAMILY_BLOCKS)
-        .map(|f| {
-            let (to, of) = crate::arcseg::family_progress(node, &svc.net, p, f);
-            json!({"family": f, "name": crate::arcseg::family_name(f), "sealed_to": to, "of": of})
+        .filter_map(|ix| match crate::arcseg::index_family(&ix) {
+            None => Some(json!({"index": ix, "why": "not paid on this network: it has no journal family to seal"})),
+            Some(f) if paid && !fams.contains(&f) => Some(json!({"index": ix, "why": "not sealed: its journals don't run here from the index's start (an index taken in as a copy)"})),
+            _ => None,
         })
         .collect();
-    Ok(json!({"chain": key, "on": on, "running": true, "sealed_to": sealed, "of": of, "indexes": indexes, "sealing": sealing, "weight": weight, "total_weight": total,
-              "pot": pot, "height": height, "note": update_needed().unwrap_or_else(crate::arcseg::seal_note)}))
+    let not_paid = (!paid).then(|| format!("not paid on this network: the ARCADE chain doesn't list {}", p.name));
+    let Some(svc) = svc().filter(|_| paid) else {
+        return Ok(json!({"chain": key, "on": on, "paid": paid, "not_paid": not_paid, "unpaid_indexes": unpaid, "running": svc().is_some()}));
+    };
+    let (sealed, of) = crate::arcseg::earn_progress(node, &svc.net, p);
+    let me = node.identity.verifying_key().to_bytes();
+    let replicas = crate::arcseal::replicas(node, &svc.net);
+    let sealing = crate::arcseal::sealing().map(|(_, d, o)| json!({"done": d, "of": o}));
+    let st = svc.st.lock().unwrap();
+    let reg = st.chain.storage();
+    let height = st.chain.tip().height;
+    let (weight, total, pot) = (reg.pay_weight(&me), reg.all_replicas().iter().map(|r| r.3).sum::<u64>() + genesis_total(), reg.pot());
+    // The indexes journaled here, sealed after the blocks, and how each stands in the catalog.
+    let indexes: Vec<Value> = fams
+        .iter()
+        .filter(|f| **f != arcade_arc::segment::FAMILY_BLOCKS)
+        .map(|&f| {
+            let (to, of) = crate::arcseg::family_progress(node, &svc.net, p, f);
+            json!({"family": f, "name": crate::arcseg::family_name(f), "sealed_to": to, "of": of, "catalog": crate::arcearn::listing(&svc.net, reg, key, f, height)})
+        })
+        .collect();
+    Ok(json!({"chain": key, "on": on, "paid": true, "running": true, "sealed_to": sealed, "of": of, "indexes": indexes, "unpaid_indexes": unpaid,
+              "catalog": crate::arcearn::listing(&svc.net, reg, key, arcade_arc::segment::FAMILY_BLOCKS, height),
+              "sealing": sealing, "weight": weight, "total_weight": total, "pot": pot, "height": height,
+              // This arcade's turn, next payout and why pay waits; its sealed replicas of this coin not registered yet.
+              "pay": crate::arcearn::pay(&svc.net, reg, &me, height),
+              "registration": crate::arcearn::unregistered(&svc.net, reg, &me, height, &replicas, Some(key)),
+              "note": update_needed().unwrap_or_else(crate::arcseg::seal_note)}))
 }
 
 /// The genesis holders' weight together.
@@ -2939,5 +3092,51 @@ mod tests {
         let p2 = store::chain_params(&NET, &new.id_at(0).unwrap());
         reconcile(&db, p2, &new).unwrap();
         stored_matches(&db, p2, &new);
+    }
+
+    /// A proof of time made in pieces is the one a single run gives, carries on from saved pieces after a restart, and
+    /// makes again any saved piece that doesn't check.
+    #[test]
+    fn a_proof_in_pieces_carries_on_after_a_restart() {
+        use arcade_arc::time::{join, SEGMENT_BYTES};
+        let dir = tempfile::tempdir().unwrap();
+        let c = [7u8; 32];
+        let (steps, piece, most) = (5_000u64, 2_000u64, 8usize);
+        let whole = ChiaVdf.prove(&c, steps).unwrap();
+        let cut = prove_in_pieces_of(dir.path(), &c, steps, most, piece).unwrap();
+        assert_eq!(cut.output, whole.output, "the same squaring however it is cut");
+        assert!(ChiaVdf.verify_pot(&c, steps, &cut, most) && !ChiaVdf.verify_pot(&c, steps, &cut, 1));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "nothing left once it is done");
+        // A restart after the first piece: it is saved, and the proof carries on from it.
+        let first = ChiaVdf.run(&c, &ChiaVdf::start(), piece).unwrap();
+        let save = |runs: &[&arcade_arc::time::Segment]| {
+            let mut raw = Vec::new();
+            for r in runs {
+                raw.extend_from_slice(&r.steps.to_le_bytes());
+                raw.extend_from_slice(&r.output);
+                raw.extend_from_slice(&r.proof);
+            }
+            assert_eq!(raw.len(), runs.len() * SEGMENT_BYTES);
+            std::fs::write(dir.path().join(format!("{}-{steps}", hex::encode(c))), raw).unwrap();
+        };
+        save(&[&first]);
+        let resumed = prove_in_pieces_of(dir.path(), &c, steps, most, piece).unwrap();
+        assert!(ChiaVdf.verify_pot(&c, steps, &resumed, most));
+        assert_eq!(resumed.output, whole.output);
+        // Its first run is the saved piece, as it was.
+        assert_eq!(resumed.proof[..SEGMENT_BYTES], join(&[first.clone(), first.clone()]).proof[..SEGMENT_BYTES]);
+        // A saved piece that doesn't check is thrown away: the proof is made again and still holds.
+        let mut bad = first.clone();
+        bad.output[5] ^= 1;
+        save(&[&bad]);
+        let again = prove_in_pieces_of(dir.path(), &c, steps, most, piece).unwrap();
+        assert!(ChiaVdf.verify_pot(&c, steps, &again, most));
+        // Pieces of another proof (a tip that moved on) go.
+        std::fs::write(dir.path().join("old-1"), b"x").unwrap();
+        prove_in_pieces_of(dir.path(), &c, steps, most, piece).unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        // With a cap of 2 runs, a long proof is cut in no more than 2.
+        let two = prove_in_pieces_of(dir.path(), &c, steps, 2, piece).unwrap();
+        assert!(ChiaVdf.verify_pot(&c, steps, &two, 2));
     }
 }

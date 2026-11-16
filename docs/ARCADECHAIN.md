@@ -1,6 +1,6 @@
 # ARCADE: a coin paid for keeping the mesh's chains and indexes — DESIGN
 
-Status: **draft for Martin's review.** Written 2026-11-10 on the GX10; revised 2026-11-11 after an independent review (fixes are marked *(review finding n)*). Built so far (`crates/arcade-arc`, 77 tests): the sealing code, the block format, the writer draw, the script and coin rules, the chain's own rules (fork choice, difficulty, draw seeds, moving between branches) running on stand-ins for the proof of time and the storage records, the block log that keeps a chain across a restart, and the pool of waiting transactions. In the arcade (`crates/arcaded/src/arcsvc.rs`): a **local test chain** that only a hidden start option turns on, with a writer, blocks and transactions carried over mesh links, fees paid to the writer, the best branch copied into the chain store, and its own entries in the wallet, the Explorer and Chains & Coins (§14.9 to §14.11). §14 writes down the rules as built.
+Status: **draft for Martin's review.** Written 2026-11-10 on the GX10; revised 2026-11-11 after an independent review (fixes are marked *(review finding n)*). Built so far (`crates/arcade-arc`, 77 tests): the sealing code, the block format, the writer draw, the script and coin rules, the chain's own rules (fork choice, difficulty, draw seeds, moving between branches) running on stand-ins for the proof of time and the storage records, the block log that keeps a chain across a restart, and the pool of waiting transactions. In the arcade (`crates/arcaded/src/arcsvc.rs`): a **local test chain** that only a hidden start option turns on, with a writer, blocks and transactions carried over mesh links, fees paid to the writer, the best branch copied into the chain store, and its own entries in the wallet, the Explorer and Chains & Coins (§14.9 to §14.11). §14 writes down the rules as built. *(Since then the public testnet runs the real proof of time, registration, audits and serving checks; §14 and §15 say what is built. For node operators, when and how pay comes: [EARN.md](EARN.md).)*
 
 ARCADE is a new blockchain, built into Arcade V1.0. Its coins are earned by **keeping and sharing data**: the blocks of the chains the mesh follows and the indexes built from them. An arcade's chance of writing a block and its share of the reward both follow its share of the network's **verified** storage.
 
@@ -44,7 +44,8 @@ Everything below is my proposal for how to do that; numbers marked *(proposed)* 
         │
         ├──► WRITER DRAW + PROOF OF TIME: the next block's writer, weighted by
         │    verified bytes; a block is valid only after a set amount of real time
-        └──► REWARDS: each 100-block epoch, 5,000 ARCADE split by verified bytes
+        └──► REWARDS: each 100-block epoch the pot is shared by verified bytes;
+             each arcade is paid at its own turn, once audits release it (§7)
 ```
 
 A block has two parts:
@@ -72,7 +73,14 @@ Index tables themselves (state) aren't paid: they change every block, so they ca
 
 ### 2.3 Which chains
 
-**Listed chains** are written in the chain rules: at genesis, every chain V1.0 follows (Pepecoin, Pepecoin testnet, Dogecoin, DigiByte, Flopcoin, Wojakcoin, Kotia, Litecoin) plus **Bitcoin**. Adding a chain or family later is a rule upgrade (a new version all arcades take, activated at a set ARCADE height).
+**Listed chains** are written in the chain rules (`params.rs`, `Net::listed`, by V1.0's keys). Adding a chain or family later is a rule upgrade (a new version all arcades take, activated at a set ARCADE height).
+
+| Network | Listed |
+|---|---|
+| Mainnet `arc` | `arc`, `pep`, `peptest`, `doge`, `dgb`, `flop`, `wjk`, `kot`, `ltc`, `btc` |
+| Testnet `arctest` | `arctest`, `pep`, `peptest`, `doge`, `dgb`, `dgbtest`, `flop`, `wjk`, `kot`, `ltc`, `ltctest`, `btc` |
+
+That is the ARCADE chain itself, Pepecoin, Pepecoin testnet, Dogecoin, DigiByte, Flopcoin, Wojakcoin, Kotia, Litecoin and **Bitcoin**; the testnet adds the DigiByte and Litecoin test chains. Chains Coins & Chains offers beyond these (Shibacoin `shic`, Bellscoin `bel`, Luckycoin `lky`, Junkcoin `jkc`) are not listed: their data can't be in the catalog, and the Earn ARCADE line says "not paid on this network" for them. Listing them is a rules version, and each listed chain adds its headers to every ARCADE node (§2.4).
 
 Bitcoin needs work V1.0 doesn't have yet:
 - Keeping Bitcoin at all: about 650 GB of blocks; the chain parameters exist (`btc`), but nothing syncs it fully today.
@@ -252,14 +260,16 @@ Storage decides **who**, a proof of time decides **when**. The structure follows
 
 ## 7. Rewards
 
-- **Epoch = 100 blocks** (about 4 hours 10 minutes). **Epoch pot** = 50 × 100 = 5,000 ARCADE, plus anything forfeited or left over.
+*As built (§14.19, §14.20, §14.26; for operators [EARN.md](EARN.md)):* the pot is shared every epoch but **accrued**, and each earner is **paid at its own turn**, one block in each audit period, released by its audits. The first draft's "one coinbase at each epoch's start pays everyone" is not what runs on the testnet or will run on the mainnet.
+
+- **Epoch = 100 blocks** (about 4 hours 10 minutes). **Epoch pot** = 49 × 100 = 4,900 ARCADE (50 a block, less the writer's 1 from rules version 2, §14.26), plus every fee and anything forfeited or left over.
 - **Every copy earns; each piece's share is split among its holders.** In each block, a segment of `B` bytes held by `n` registered replicas gives each of them the weight `B / n`. The pot is split in proportion to weight.
   - Every held segment gets the same pay per byte, however many arcades hold it.
   - A holder of data that few others keep gets a large part of that segment's pay; a holder of data everyone keeps gets a small part. That is what pulls disks toward data the network lacks.
   - Registering the same segment under several keys takes a separately sealed copy for each, so it buys a larger part only with real disk.
-- **Accrued, then released in slices.** An epoch's share is first **accrued** to the replica. Each audit covers the slice accrued since the replica's previous pick: passed, the slice is released (about 2 days after it was earned, on average); not passed, it is forfeited to the next pot (§5.3). The serving rule can hold a slice back (§5.4).
-- **Paid** in the coinbase of the first block of each epoch: one output per payout address for everything released since the last payout, in address order. Amounts under 0.01 ARCADE wait in an owed balance.
-- **The writer** gets no extra part of the 50, and since §14.18 no fees either: they join the pot.
+- **Accrued, then released by audits.** An epoch's share is **accrued** to its earner: a genesis holder's payout address, or an owner (an arcade's key, for all its replicas together). An owner's audits run from one of its turns to the next (§14.20): all passed, what it accrued is paid at the turn; one not passed, it goes back to the pot (§5.3); no audit yet (registered after its last turn), it waits for a period an audit covers. The serving rule can hold it back (§5.4).
+- **Paid at each earner's turn**, `H(earner) mod 1,152` (`registry::turn`): the coinbase of that block of every audit period pays it, in one output, everything released. Genesis earners need no audit. Amounts under 0.01 ARCADE wait for a later turn.
+- **The writer** gets 1 ARCADE of the 50 from rules version 2 (§14.26; the testnet from block 0 since its 2026-11-15 restart, the mainnet from block 0); fees join the pot (§14.18).
 - **Coinbase maturity:** 100 blocks.
 
 ## 8. Coins, addresses and fees
@@ -383,7 +393,7 @@ answers where he gave them, otherwise the defaults of §15.1 (each can still cha
 
 ## 14. The rules as built
 
-What the code in `crates/arcade-arc` does today, to the byte. Where this section and the code disagree, that is a bug in one of them. Parts not built yet (reveal demands and fraud proofs, sealing in the arcade, registration, audits, serving checks, the real proof of time) have no entry.
+What the code in `crates/arcade-arc` does today, to the byte. Where this section and the code disagree, that is a bug in one of them. The subsections were written as each part was built, so a later one can replace an earlier one: registration (§14.15, §14.19), pay at each earner's turn (§14.19), audits (§14.20), serving checks (§14.18, §14.19), the writer's share (§14.26) and the real proof of time (§14.22 item 4, §14.23) all run on the public testnet. [EARN.md](EARN.md) puts the pay rules together for operators.
 
 ### 14.1 Hashes, keys and networks
 
@@ -442,17 +452,17 @@ Every arcade gets the same answer whichever block reached it first. An arcade do
 - A transaction is Dogecoin's legacy format, version 1, at most 100,000 bytes, written the one way its fields can be written.
 - Every spendable output holds at least **0.001 ARCADE** (a chain rule, not a relay habit). An output starting with `OP_RETURN` burns what it holds.
 - A coinbase's one input carries the height (8 bytes), the id of the block before (32) and up to 60 free bytes, so no two coinbases share an id on any chain or fork. Its outputs are spendable 100 blocks on.
-- **A coinbase starts with exactly the payouts owed**, in order; the writer pays itself nothing (a zero `OP_RETURN` may follow). The block's fees join the pot (§14.18).
+- **A coinbase starts with exactly the payouts owed**, in order, then (from rules version 2) the writer's 1 ARCADE (§14.26); a zero `OP_RETURN` may follow. The block's fees join the pot (§14.18).
 - A lock time is a block height. At most 8,000 signature checks per block.
 - **Script** is a strict part of Bitcoin's, enough for what V1.0 signs: pay to a key hash, pay to a script hash, the exchange's pre-signed trades, the prize pool, bare multisig, a hash lock and a height lock. An opcode outside the list makes a script invalid even in a branch that isn't run; pushes are written the shortest way; signatures are strict DER with low S; hash types are ALL, ALL|ANYONECANPAY and SINGLE|ANYONECANPAY; a signature covers the whole locking (or redeem) script. New opcodes come by upgrade.
-- **Epoch payouts** (stand-in today, §7 when audits are built): the first coinbase of an epoch pays the pot, one output per payout address in address order; a share under 0.01 ARCADE stays in the pot.
+- **Payouts** (§7, §14.19): at each epoch's end (heights that are multiples of 100) the pot is shared by weight and accrued; a block's coinbase pays every earner whose turn that block is (`H(earner) mod 1,152`), one output per payout address in address order, when its audits released it (§14.20) and it is at least 0.01 ARCADE. *(Until registration was built, the first coinbase of an epoch paid the whole pot; that is gone.)*
 
-### 14.8 Stand-ins
+### 14.8 Stand-ins (local test chains only)
 
-Two parts of the chain are stand-ins so the rest can be built and tested, and **no public network runs on either**:
+Two parts of the chain began as stand-ins so the rest could be built and tested. **Neither runs on the public testnet or the mainnet any more:**
 
-- **Proof of time:** one hash, made in no time. The code refuses to start a mainnet chain on it. The real one is a calculation in a class group checked with a Wesolowski proof, as Chia's.
-- **Storage records:** a list of holders fixed at block 0; what they hold is never checked. The catalog is the real one already (§14.13), counted with these fixed weights. A block with any other storage item is refused.
+- **Proof of time:** the stand-in is one hash, made in no time. It is left only for quick local test chains (`--arc-local` settings without `"time": "vdf"`), and the code refuses to start a mainnet chain on it. The public testnet runs the real one (`"time": "vdf"` in `arctest.json`): Chia's class-group VDF with a Wesolowski proof (§14.22 item 4), served by time keepers (§14.23).
+- **Storage records:** the fixed list of holders at block 0 was replaced by registration (§14.15, §14.19), audits (§14.20) and serving checks. What stays fixed at block 0 is the genesis earners' weight (the testnet's two genesis writers, 1 GiB each; on the mainnet the audited genesis list, §14.24).
 
 ### 14.9 In the arcade
 
@@ -527,11 +537,12 @@ Everything here follows from the source chain alone, so every arcade that keeps 
 
 Which segments exist, as every arcade agrees on them. Kept by the blocks: catalog items are in a block's storage section (at most 64 per block), and a branch change takes them back block by block.
 
-- **Listed chains.** Mainnet: `pep`, `peptest`, `doge`, `dgb`, `flop`, `wjk`, `kot`, `ltc`, `btc`. The testnet lists the same and the two other test chains V1.0 follows, `dgbtest` and `ltctest`, so the testnet has small chains to work on. Only the blocks family (0) exists.
+- **Listed chains** (`params.rs`, as §2.3). Mainnet: `arc`, `pep`, `peptest`, `doge`, `dgb`, `flop`, `wjk`, `kot`, `ltc`, `btc`. Testnet: `arctest` and the same coins, plus the two other test chains V1.0 follows, `dgbtest` and `ltctest`, so the testnet has small chains to work on. `shic`, `bel`, `lky` and `jkc` are not listed on either.
+- **Families** (`segment::FAMILIES`): blocks (0); the index journals ord (1), ledger (2), profiles (3), messages (4), names (5), tokens (6), maps (7), tags (8); the coins each block spends (9); the ARCADE chain's blobs (10). An arcade cuts and offers an index family only when its journals run from the index's start (`arcseg::families`). Indexes without a journal family (addresses, collections, dogefeed) are never listed or paid.
 - **Rows of spans.** For each family of each listed chain the catalog holds a row of spans from height 0 on, each starting where the one before ended. A span holds one confirmed segment, or nothing where its segment was proved wrong and removed.
 - **An entry** is `{chain, family, first, last, bytes, manifest, root, poster, signature}`. Its **segment id** is the tagged hash of `chain, family, first, last, bytes, root`. An entry is taken into a block only if, in this order: its chain is listed; its family exists; `first..=last` are whole ranges; `bytes` is at least the table plus a full segment; its signature is its poster's; its poster has draw weight; its id was never removed; it isn't waiting already; its span is open (the one after the row's last, or a removed entry's with the same first and last); and its poster doesn't stand behind another entry for the same first height.
 - **Offering is attesting.** An **attestation** `{segment id, attester, signature}` is taken if the entry waits, the signature is the attester's, the attester has draw weight, and it stands behind no entry for that first height yet. A key stands behind one entry per first height at a time.
-- **Confirmed** in the block that brings the weight behind an entry over **half of all draw weight** (twice the weight behind it is more than the total), counted with the weights of that block. It is checked when an item touches the entry, not when weights change by themselves. The other entries offered for its span are dropped with their attestations.
+- **Confirmed** in the block that brings the weight behind an entry over **half of all draw weight** (twice the weight behind it is more than the total), counted with the weights of that block. It is checked when an item touches the entry, not when weights change by themselves. From rules version 3, a blocks or coins entry is confirmed with more than a tenth, and replicas of it register only after its 100-block challenge window (§15.4, step 11). The other entries offered for its span are dropped with their attestations.
 - **Removed** entries (step 2c) leave their span open for another entry with the same first and last. A removed id is never taken again.
 - **The manifest id is a hint for fetching, not a rule.** It isn't in the segment id, and attesters don't vouch for it: compressed pieces can differ between versions of the compression library while the raw bytes are the same. The first poster's manifest stands. *(This narrows §2.1's "the manifest id is the same everywhere": the root is.)*
 - **What the catalog can't check** is whether a root is the right one. That is what the attesters say, and what reveal demands and fraud proofs settle when they lie (step 2c).
@@ -576,7 +587,7 @@ Built for the live testnet. Martin's decisions: the test coin is in main for eve
 
 ### 14.16 The testnet in V1.0
 
-`crates/arcaded/arctest.json` is the ARCADE testnet every arcade knows: block 0 `c4d9433f69c20b0cb74f4dac8fe4f70e1c93fce468a42d70fb9006c5a290c757` (time 2026-11-12 01:51 UTC; restarted from the first testnet, block 0 `849a30bf…`, with 16 MiB segments so small chains such as Pepecoin testnet take part, and the rules of §14.17 and §14.18; the lists and beacons are placeholders until the genesis list of §10 exists), the genesis writers (the GX10 and the JB20B, 1 GiB each), 2.5-minute blocks. `--arc-local <settings>` replaces it with a local test chain for closed test networks. Still stand-ins: the proof of time (§14.8) and storage audits (§5.2); serving checks run per epoch in place of an audit period (§14.18).
+`crates/arcaded/arctest.json` is the ARCADE testnet every arcade knows: block 0 `c4d9433f69c20b0cb74f4dac8fe4f70e1c93fce468a42d70fb9006c5a290c757` (time 2026-11-12 01:51 UTC; restarted from the first testnet, block 0 `849a30bf…`, with 16 MiB segments so small chains such as Pepecoin testnet take part, and the rules of §14.17 and §14.18; the lists and beacons are placeholders until the genesis list of §10 exists), the genesis writers (the GX10 and the JB20B, 1 GiB each), 2.5-minute blocks. `--arc-local <settings>` replaces it with a local test chain for closed test networks. *(Out of date since: the testnet was restarted again on 2026-11-15 (§15.5, rules version 3 from block 0) and runs the real proof of time (`"time": "vdf"`), registration, storage audits (§14.20) and serving checks per owner and audit period (§14.19). No stand-in runs on it.)*
 
 ### 14.17 Earn ARCADE: one switch per coin (Martin 2026-11-11, to build)
 
@@ -661,7 +672,13 @@ block.
   genesis holder's address, or an owner) has a **turn**, `H(earner) mod 1,152`; the coinbase of a block pays
   everyone whose turn it is, in one output each. An owner's serving checks count from one turn to the next: with 5
   or more verdicts, most "not served", its pay is held at the turn (forfeited the third turn in a row). What is under
-  0.01 waits for the next turn. Until audits are built, a turn releases without one.
+  0.01 waits for the next turn. An owner's turn releases its pay only after a period whose audits all passed (§14.20);
+  a genesis earner's needs none. This is what runs on the testnet and is the mainnet's rule; the per-epoch coinbase of
+  §7's first draft and §14.7's stand-in is gone.
+- **Registration and the turn together:** a batch proved at block `R` has weight from `R`. The owner's first turn
+  after `R` finds no audit (its pay waits) and draws the first audits; the turn after pays, if they passed. So the
+  first payout is 1,152 to 2,303 blocks after `R`, and a replica sealed after a batch waits up to 1,152 blocks for the
+  next one. Worked example: [EARN.md](EARN.md).
 - **Limits:** the storage section is 4 MB and a block up to about 5 MB, so the mesh's block answers hold up to
   8 MiB; 1,000 verdicts a block.
 
@@ -685,8 +702,10 @@ Until now a replica counted from its registration proof alone: seal, register, d
   last turn) is not paid until a period an audit covers: seal, register and delete earns nothing.
 - **The arcade** answers its own audits on the 5-second loop (`arcaudit.rs`); `arc.status` shows its picks and what
   it answered, and every owner's weight and accrued pay.
-- **Not yet:** a re-audit at once after a miss (§5.3, item 3: the replica waits for its next turn instead), and the
-  200-block wait before a replica counts for the writer draw (§4). Pay and the draw still use one weight.
+- **Built since (§14.22 items 2 and 3):** a re-audit at once after a miss (`Reaudit`: the replica counts again when it
+  passes, the period's pay stays forfeited), and the 200-block wait before a replica counts for the writer draw
+  (`DRAW_WEIGHT_WAIT`). Pay and the draw now use two weights: pay weight from the registration proof, draw weight 200
+  blocks after the first passed audit.
 
 ### 14.21 Rules versions, not app versions (Martin 2026-11-12: a version check so only current arcades are followed)
 
@@ -896,7 +915,7 @@ history, the vendored dependencies so it rebuilds with no internet, and the preb
 
 ### 14.26 The writer's share (Martin 2026-11-14, rules version 2)
 
-From rules version 2 (testnet block 2,200; mainnet from block 0) a block's coinbase pays, after what is owed, **1 ARCADE
+From rules version 2 (testnet block 2,200 on the chain before its 2026-11-15 restart, from block 0 since; mainnet from block 0) a block's coinbase pays, after what is owed, **1 ARCADE
 to its writer** (`params::WRITER_REWARD`) at its payout address: the one its registration names, or its genesis entry's.
 The pot takes the other 49 and the fees (`Applied::writer_paid`). Fees stay in the pot, so a block with large fees is no
 prize to fight over (no fee sniping); the writer's share is fixed. Why: both reviews pointed out that a writer paid

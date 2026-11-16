@@ -211,13 +211,42 @@ pub(crate) fn figures(confirmed: u64, pooled: &[Tx], mine: impl Fn(&[u8]) -> boo
 /// that leaves the pool without a block gives its coins back at once.
 pub(crate) fn wallet_figures(node: &Node, p: &'static ChainParams, scripts: &[Vec<u8>]) -> Option<Figures> {
     let mine = |s: &[u8]| scripts.iter().any(|x| x.as_slice() == s);
-    if crate::borrow::is_borrowed(p.key) {
+    let mut f = if crate::borrow::is_borrowed(p.key) {
         let confirmed = scripts.iter().map(|s| crate::borrow::balance(node, p, s)).sum::<Option<u64>>()?;
-        return Some(figures(confirmed, &crate::borrow::pool_txs(p), mine, |op| crate::borrow::unspent_coin(node, p, op)));
+        figures(confirmed, &crate::borrow::pool_txs(p), mine, |op| crate::borrow::unspent_coin(node, p, op))
+    } else {
+        let confirmed = scripts.iter().map(|s| node.chain.balance_for_script(p.chain_no, s).ok()).sum::<Option<u64>>()?;
+        let pooled: Vec<Tx> = pool(node, p).into_iter().map(|(_, t)| t).collect();
+        figures(confirmed, &pooled, mine, |op| node.chain.coin(p, op).ok().flatten().map(|c| (c.script, c.value)))
+    };
+    if f.free > 0 {
+        f.free = free_coins(node, p, scripts).iter().map(|u| u.value).sum();
     }
-    let confirmed = scripts.iter().map(|s| node.chain.balance_for_script(p.chain_no, s).ok()).sum::<Option<u64>>()?;
-    let pooled: Vec<Tx> = pool(node, p).into_iter().map(|(_, t)| t).collect();
-    Some(figures(confirmed, &pooled, mine, |op| node.chain.coin(p, op).ok().flatten().map(|c| (c.script, c.value))))
+    Some(f)
+}
+
+/// The confirmed coins a wallet can spend now, as tx.coins lists them: not spent by a waiting
+/// transaction, not a mining reward too young, and not carrying an inscription (crate::ordsafe).
+pub(crate) fn free_coins(node: &Node, p: &'static ChainParams, scripts: &[Vec<u8>]) -> Vec<Utxo> {
+    let mut coins = Vec::new();
+    if crate::borrow::is_borrowed(p.key) {
+        // (spendable() adds waiting outputs: only the confirmed ones here.)
+        for s in scripts {
+            coins.extend(crate::borrow::spendable(node, p, s).into_iter().filter(|u| crate::borrow::unspent_coin(node, p, &u.outpoint).is_some()));
+        }
+    } else {
+        let spent_in_pool: HashSet<OutPoint> = pool(node, p).iter().flat_map(|(_, t)| t.inputs.iter().map(|i| i.prevout)).collect();
+        let tip = tip_height(node, p);
+        for s in scripts {
+            for (op, value, _) in node.chain.coins_for_script(p, s).unwrap_or_default() {
+                if spent_in_pool.contains(&op) || node.chain.coin(p, &op).ok().flatten().is_some_and(|c| crate::mempoolshare::immature(p, c.coinbase, c.height, tip)) {
+                    continue;
+                }
+                coins.push(Utxo { outpoint: op, value, script: s.clone() });
+            }
+        }
+    }
+    crate::ordsafe::keep_free(node, p, coins)
 }
 
 pub fn coins(node: &Node, req: &Value) -> R {
@@ -489,6 +518,7 @@ fn send_raw(node: &Node, req: &Value, checked: bool) -> R {
     if p.chain_no == node.params.chain_no {
         crate::resend::send(node, p, &tx);
     } else {
+        crate::ownwait::note(node, p, &tx);
         // An installed chain: straight to a few of its own P2P peers.
         let peers: Vec<String> = node.coin_candidates(p).into_iter().take(4).collect();
         std::thread::spawn(move || {
@@ -719,6 +749,26 @@ pub(crate) mod tests {
         let coin2 = |op: &OutPoint| if *op == paid { Some((p2pkh(1), 7_000_000)) } else { coin(op) };
         let f = figures(B + 7_000_000, &[t], mine, coin2);
         assert_eq!((f.balance, f.arriving), (B + 7_000_000, 0));
+    }
+
+    /// free leaves out what tx.coins leaves out: a mining reward too young, and a coin that may
+    /// carry an inscription; balance and confirmed still count them (they are the wallet's).
+    #[test]
+    fn free_leaves_out_young_rewards_and_inscribed_coins() {
+        let t = setup();
+        // Address 3's block 2 reward: too young.
+        let f = wallet_figures(&t.node, t.p, &[p2pkh(3)]).unwrap();
+        assert_eq!((f.confirmed, f.balance, f.free), (5000, 5000, 0));
+        // Address 1's 1900: free on a chain without inscriptions...
+        assert_eq!(wallet_figures(&t.node, t.p, &[p2pkh(1)]).unwrap().free, 1900);
+        // ...held back where inscriptions began before it and no ord index says it carries none.
+        let mut q = t.p.clone();
+        q.net = "wjk";
+        let q: &'static ChainParams = Box::leak(Box::new(q));
+        t.node.app.store.write(|w| w.put(arcade_app::META, b"home_indexes", br#"["addresses","messages"]"#)).unwrap();
+        let f = wallet_figures(&t.node, q, &[p2pkh(1)]).unwrap();
+        assert_eq!((f.confirmed, f.balance, f.free), (1900, 1900, 0));
+        assert_eq!(free_coins(&t.node, q, &[p2pkh(1)]).len(), 0);
     }
 
     /// Two waiting spends of the same coin (a replacement) take it once.

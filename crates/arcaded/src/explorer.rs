@@ -138,7 +138,7 @@ pub const PAGE_READS: &[&str] = &[
     "explorer.name", "explorer.maps", "explorer.map", "explorer.mempool", "explorer.ledger", "explorer.ledger_tokens",
     "explorer.ledger_token", "explorer.ledger_inscriptions", "explorer.ledger_inscription", "explorer.tag",
     "explorer.search", "explorer.dogefeed", "explorer.dogefeed_tx", "explorer.dogefeed_inscription",
-    "explorer.dogefeed_address", "explorer.dogefeed_keys",
+    "explorer.dogefeed_address", "explorer.dogefeed_keys", "explorer.earn",
 ];
 
 /// GET /r/explorer/<name>?args=<json>: the public read explorer.<name> (/r/explorer/chains: chains.list),
@@ -1305,6 +1305,11 @@ fn addr(x: &Ctx, a: &str, req: &Value) -> R {
             json!({"height": h, "time": block_time(x, u64::from(*h)), "txid": txid.map(|t| t.to_hex()), "received": recv, "sent": sent})
         }).collect();
         v["balance"] = json!(x.node.chain.balance_for_script(c, &script).map_err(e)?);
+        // With the pool taken in, as the Wallet counts it (ARCADE #15): shown when the pool touches the address.
+        if let Some(f) = crate::sitesvc::wallet_figures(x.node, x.p, std::slice::from_ref(&script)).filter(|f| f.leaving > 0 || f.arriving > 0) {
+            v["pending"] = json!({"balance": f.balance, "arriving": f.arriving, "leaving": f.leaving,
+                                  "waiting": f.waiting.iter().map(|(id, r, s)| json!({"txid": id.to_hex(), "received": r, "spent": s})).collect::<Vec<_>>()});
+        }
         v["tx_count"] = json!(hist.len());
         v["history"] = json!(rows);
         if x.node.chain.addresses_pending(c).unwrap_or(false) {
@@ -1617,6 +1622,25 @@ fn ledger_questions_go_to_arcades_keeping_the_ledger() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// explorer.address: the balance with the mempool taken in, beside the blocks' figure, as the Wallet shows it.
+    #[test]
+    fn an_address_shows_its_pending_balance() {
+        use crate::sitesvc::tests::{addr as address_of, p2pkh, setup, tx};
+        let t = setup();
+        t.node.app.store.write(|w| w.put(arcade_app::META, b"home_indexes", br#"["addresses","messages"]"#)).unwrap();
+        let a = address_of(&t, 1);
+        let get = || handle_here(&t.node, "explorer.address", &json!({"address": a}), false).unwrap();
+        assert_eq!(get()["balance"], 1900);
+        assert!(get().get("pending").is_none(), "nothing waiting");
+        let spend = tx(&[(t.spend.txid, 1)], &[(600, p2pkh(4)), (1200, p2pkh(1))], 5);
+        assert!(crate::mempoolshare::add(&t.node, t.p, &spend));
+        let v = get();
+        assert_eq!(v["balance"], 1900);
+        assert_eq!(v["pending"]["balance"], 1200);
+        assert_eq!((v["pending"]["arriving"].as_u64(), v["pending"]["leaving"].as_u64()), (Some(1200), Some(1900)));
+        assert_eq!(v["pending"]["waiting"][0]["txid"], spend.txid.to_hex());
+    }
 
     /// explorer.held: every inscription an address holds, by number, a page at a time, no content.
     #[test]

@@ -46,10 +46,14 @@ prebuilt() {
   curl -fsSL "$url" -o "$CACHE/$name.tar.gz" || { echo "No prebuilt download for this PC yet."; return 1; }
   curl -fsSL "$url.sha256" -o "$CACHE/$name.tar.gz.sha256" || { echo "The download has no checksum."; return 1; }
   (cd "$CACHE" && sha256sum -c --quiet "$name.tar.gz.sha256") || { echo "The download is damaged (checksum)." >&2; return 4; }
-  tar -xzf "$CACHE/$name.tar.gz" -C "$CACHE"
+  tar -xzf "$CACHE/$name.tar.gz" -C "$CACHE" || { echo "The download doesn't unpack." >&2; return 1; }
   dir="$CACHE/$name"
   [ -f "$dir/COMMIT" ] && echo "  version $(cut -c1-12 "$dir/COMMIT")"
-  bash "$dir/scripts/install-linux.sh" --prebuilt "$dir" "$@" <"$TTY"
+  # From here on the download is good: only exit 3 (its programs don't run here) is worth a source build.
+  # Anything else (the service step, say) would stop a source build at the same place: 5.
+  LINUX_CODE=0
+  bash "$dir/scripts/install-linux.sh" --prebuilt "$dir" "$@" <"$TTY" || LINUX_CODE=$?
+  case "$LINUX_CODE" in 0|3) return "$LINUX_CODE" ;; *) return 5 ;; esac
 }
 
 # --- the slow way: build from source --------------------------------------------------------------------------------
@@ -123,7 +127,14 @@ if [ "${ARCADE_BUILD:-0}" != 1 ]; then
     echo "Nothing was installed. Try again later; if it keeps happening, build from source with ARCADE_BUILD=1." >&2
     exit 1
   fi
-  # 3: the prebuilt programs don't run on this Linux. Anything else before installing: no usable download.
+  # 5: the download was fine and the install stopped at a later step (see above). Stop: building the same
+  # version from source takes 10-20 minutes and stops at the same step.
+  if [ "$code" = 5 ]; then
+    echo "The download was fine; the install stopped at a later step (see above), so nothing is built from source." >&2
+    echo "Fix what it says and run this again." >&2
+    exit "$LINUX_CODE"
+  fi
+  # 3: the prebuilt programs don't run on this Linux. 1: no usable download for this PC.
   say "Falling back to building from source."
 fi
 from_source "$@"

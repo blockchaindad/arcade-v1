@@ -327,7 +327,7 @@ async function refreshWallet() {
   state.keys = keys;
   W.list = [
     ...keys.map((k) => ({ id: "own:" + k.index, own: true, index: k.index, address: k.address, legacy: k.legacy, tag: k.tag, balance: k.balance, pending: k.pending || 0,
-      confirmed: k.confirmed, free: k.free, pendingCoins: k.pending_coins || 0, waiting: k.waiting || [],
+      confirmed: k.confirmed, free: k.free, pendingCoins: k.pending_coins || 0, waiting: k.waiting || [], dropped: k.dropped || [],
       label: k.tag ? "@" + k.tag : k.index ? `This arcade's wallet · address ${k.index}` : "This arcade's wallet" })),
     ...imps.filter((w) => w.chain === ch.key).map((w) => ({ id: "imp:" + w.address, own: false, address: w.address, balance: w.balance, name: w.name,
       kind: w.kind, addr_kind: w.addr_kind, spendable: w.addr_kind !== "p2sh-p2wpkh",
@@ -355,7 +355,7 @@ async function refreshWallet() {
   const key = `${ch.key}|${w && w.address}`;
   // Waiting transactions changed: Activity shows them now, and one that left the pool (into a
   // block, or dropped) has its block row read again.
-  const wsig = key + JSON.stringify((w && w.waiting) || []);
+  const wsig = key + JSON.stringify((w && w.waiting) || []) + JSON.stringify((w && w.dropped) || []);
   if (wsig !== W.waitSig) {
     const left = W.waitSig && W.waitSig.startsWith(key + "[") && (W.waitList || []).some((t) => !((w && w.waiting) || []).some((x) => x.txid === t.txid));
     W.waitSig = wsig; W.waitList = (w && w.waiting) || [];
@@ -467,11 +467,15 @@ function drawPane(ch) {
     // This wallet's waiting transactions first (wallet.keys), unconfirmed until a block has them.
     const waiting = ((w && w.own && w.waiting) || []).filter((x) => !by.has(x.txid))
       .map((x) => ({ txid: x.txid, net: (x.received || 0) - (x.spent || 0), waiting: true }));
-    const txs = [...waiting, ...by.values()];
-    pane.replaceChildren(txs.length ? h("div", { class: "wl-rows" }, txs.map((t) => h("div", { class: "wl-row click", onclick: () => openExplorer("tx", t.txid) },
-      h("span", { class: "ic " + (t.net >= 0 ? "in" : "out") }, t.net >= 0 ? "↓" : "↑"),
-      h("div", { class: "mid" }, h("div", {}, t.net >= 0 ? "Received" : "Sent"), h("div", { class: "s" }, `${t.waiting ? "unconfirmed (in the mempool)" : "block " + num(t.height)} · ${t.txid}`)),
-      h("span", { class: "amt " + (t.net >= 0 ? "in" : "") }, (t.net >= 0 ? "+" : "−") + coins(Math.abs(t.net), ch.key)))))
+    // Own ones that left the mempool without a block (ownwait.rs): they didn't go through.
+    const dropped = ((w && w.own && w.dropped) || []).filter((x) => !by.has(x.txid))
+      .map((x) => ({ txid: x.txid, net: (x.received || 0) - (x.spent || 0), dropped: true }));
+    const txs = [...waiting, ...dropped, ...by.values()];
+    const where = (t) => t.waiting ? "unconfirmed (in the mempool)" : t.dropped ? "didn't go through: it left the mempool without a block, and its coins are free again" : "block " + num(t.height);
+    pane.replaceChildren(txs.length ? h("div", { class: "wl-rows" }, txs.map((t) => h("div", { class: "wl-row" + (t.dropped ? "" : " click"), onclick: t.dropped ? null : () => openExplorer("tx", t.txid) },
+      h("span", { class: "ic " + (t.dropped ? "" : t.net >= 0 ? "in" : "out") }, t.dropped ? "×" : t.net >= 0 ? "↓" : "↑"),
+      h("div", { class: "mid" }, h("div", {}, (t.net >= 0 ? "Received" : "Sent") + (t.dropped ? " (didn't go through)" : "")), h("div", { class: "s" }, `${where(t)} · ${t.txid}`)),
+      h("span", { class: "amt " + (t.net >= 0 && !t.dropped ? "in" : "") }, t.dropped ? h("s", {}, (t.net >= 0 ? "+" : "−") + coins(Math.abs(t.net), ch.key)) : (t.net >= 0 ? "+" : "−") + coins(Math.abs(t.net), ch.key)))))
       : h("div", { class: "x-empty" }, v.history ? "No activity yet." : "Activity needs the Addresses index for this chain (Chains & Coins)."));
   } else if (W.tab === "tokens") {
     const list = [];

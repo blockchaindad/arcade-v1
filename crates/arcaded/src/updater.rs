@@ -36,6 +36,9 @@ const FIRST_SECS: u64 = 120;
 const PROGRAMS: &[&str] = &["arcaded", "arcade", "arcade-desktop"];
 
 /// This build's release version (None for a local build).
+/// The longest an installed update waits for the next ARCADE block before it restarts.
+const RESTART_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+
 pub fn version() -> Option<&'static str> {
     option_env!("ARCADE_VERSION")
 }
@@ -246,6 +249,20 @@ fn install(node: &Node, tag: &str, archive: &str, want: &str) -> Result<(), Stri
     let _ = std::fs::remove_dir_all(&work);
     match result {
         Ok(()) => {
+            // Not in the middle of this arcade's own proof of time for the next ARCADE block: wait for that block
+            // (ours or anyone's), at most RESTART_WAIT, so an update doesn't throw the work away. The new program is
+            // in place already, so a crash meanwhile starts it.
+            let since = std::time::Instant::now();
+            // Until the tip moves on (not until no proof runs: a writer alone starts its next proof the moment a block
+            // lands, so it is nearly always proving; v0.1.95 waited the whole RESTART_WAIT so on the GX10).
+            if crate::arcsvc::proving_for_tip() {
+                let at = crate::arcsvc::tip_id();
+                st().lock().unwrap().doing = "waiting for the next block";
+                let _ = node.app.event("update", &format!("{tag} is in place: restarting after the next ARCADE block (this arcade's proof is running)"));
+                while crate::arcsvc::proving_for_tip() && crate::arcsvc::tip_id() == at && since.elapsed() < RESTART_WAIT {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+            }
             let mut s = st().lock().unwrap();
             s.installed = Some(tag.to_string());
             s.doing = "restarting";

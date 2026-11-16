@@ -27,8 +27,76 @@ $("o-cache-set").addEventListener("click", async () => {
   refreshCache();
 });
 
+// Relayed links (mesh.relay): the switch, the month's limit, the meter, and the links passed now.
+async function refreshRelay() {
+  try {
+    const r = await api("mesh.relay");
+    $("o-relay-state").textContent = r.on ? (r.over ? "on, limit reached" : "on") : "off";
+    $("o-relay-month").textContent = `${r.used_gb} of ${r.limit_gb} GB`;
+    $("o-relay-today").textContent = `${r.today_gb} GB`;
+    $("o-relay-links").textContent = `${r.passing.length} of ${r.max_links}`;
+    if (document.activeElement !== $("o-relay-on")) $("o-relay-on").checked = !!r.on;
+    if (document.activeElement !== $("o-relay-gb")) $("o-relay-gb").value = r.limit_gb;
+    if (document.activeElement !== $("o-relay-max")) $("o-relay-max").value = r.max_links;
+    if (document.activeElement !== $("o-relay-price")) $("o-relay-price").value = r.price_per_gb;
+    if (document.activeElement !== $("o-relay-free")) $("o-relay-free").value = r.free_mb;
+    $("o-relay-earned").textContent = `${r.earned} ARCADE` + (r.waiting_payments ? ` (${r.waiting_payments} waiting for a block)` : "");
+    $("o-relay-payto").textContent = r.pay_to || "no address: free until one is set";
+    const list = $("o-relay-list");
+    list.replaceChildren(
+      ...r.passing.map((c) => h("li", {}, `Passing ${c.a} ⇄ ${c.b}: ${c.mb} MB`)),
+      ...r.accounts.map((a) => h("li", {}, `${a.arcade}: sent ${a.used_mb} MB this month, charged ${a.month_charged}, paid ${a.paid}` + (a.owed > 0 ? `, owes ${a.owed}` : "") + " ARCADE")),
+      ...r.through_relays.map((c) => h("li", {}, `This arcade reaches ${c.arcade} through ${c.relay}`)));
+    if (document.activeElement !== $("o-pay-on")) $("o-pay-on").checked = !!r.pay_on;
+    if (document.activeElement !== $("o-pay-cap")) $("o-pay-cap").value = r.pay_cap;
+    $("o-pay-list").replaceChildren(
+      h("li", {}, `Paid this month: ${r.paid_this_month} of ${r.pay_cap} ARCADE`),
+      ...r.bills.map((b) => h("li", {}, `${b.relay}: ${b.price_per_gb} ARCADE a GB, ${b.used_mb} MB sent this month, balance ${b.balance.toFixed(4)} ARCADE`)));
+  } catch (e) {
+    $("o-relay-state").textContent = "—";
+  }
+}
+$("o-relay-on").addEventListener("change", async (e) => {
+  try { await api("mesh.relay_set", { on: e.target.checked }); say("o-relay-msg", e.target.checked ? "Relaying links for other arcades." : "Relay off."); }
+  catch (err) { say("o-relay-msg", err.message, true); }
+  refreshRelay();
+});
+$("o-relay-set").addEventListener("click", async () => {
+  const limit_gb = Math.max(0, Number($("o-relay-gb").value) || 0);
+  const max_links = Math.max(0, Math.floor(Number($("o-relay-max").value) || 0));
+  try { await api("mesh.relay_set", { limit_gb, max_links }); say("o-relay-msg", `Limit set: ${limit_gb} GB a month, ${max_links} links at once.`); }
+  catch (e) { say("o-relay-msg", e.message, true); }
+  refreshRelay();
+});
+
+$("o-relay-fee-set").addEventListener("click", async () => {
+  const price_per_gb = Math.max(0, Number($("o-relay-price").value) || 0);
+  const free_mb = Math.max(0, Math.floor(Number($("o-relay-free").value) || 0));
+  try { await api("mesh.relay_set", { price_per_gb, free_mb }); say("o-relay-msg", price_per_gb ? `Price set: ${price_per_gb} ARCADE a GB, ${free_mb} MB free a month.` : "Relaying is free."); }
+  catch (e) { say("o-relay-msg", e.message, true); }
+  refreshRelay();
+});
+$("o-relay-payto-set").addEventListener("click", async () => {
+  const pay_to = $("o-relay-payto-in").value.trim();
+  try { await api("mesh.relay_set", { pay_to }); say("o-relay-msg", pay_to ? `Paid to ${pay_to}.` : "Paid to this arcade's wallet."); }
+  catch (e) { say("o-relay-msg", e.message, true); }
+  refreshRelay();
+});
+$("o-pay-on").addEventListener("change", async (e) => {
+  try { await api("mesh.relay_set", { pay_on: e.target.checked }); say("o-pay-msg", e.target.checked ? "Paying relays that charge, within the cap." : "Not paying relays."); }
+  catch (err) { say("o-pay-msg", err.message, true); }
+  refreshRelay();
+});
+$("o-pay-set").addEventListener("click", async () => {
+  const pay_cap = Math.max(0, Number($("o-pay-cap").value) || 0);
+  try { await api("mesh.relay_set", { pay_cap }); say("o-pay-msg", `Cap set: ${pay_cap} ARCADE a month.`); }
+  catch (e) { say("o-pay-msg", e.message, true); }
+  refreshRelay();
+});
+
 async function refreshOptions() {
   refreshCache();
+  refreshRelay();
   const u = await api("update.status");
   $("o-ver").textContent = u.version || "local build";
   $("o-new").textContent = u.newest ? (u.newer ? `${u.newest} (newer)` : `${u.newest} (this one)`) : "—";
