@@ -13,6 +13,15 @@
 //! The relay is the operator's choice (off unless turned on, `mesh.relay_set`), with a month's traffic limit and a cap
 //! on links at once; it counts what it passes (`mesh.relay`). One hop only: nothing is relayed over a relayed link.
 //! Of two arcades the lower node id asks, so a pair opens one link.
+//!
+//! **The usage fee** (Martin 2026-11-16, "the relay should earn ARCADE"): the operator may set a price per GB, with a
+//! free allowance per arcade a month. Each arcade pays for the bytes it sends through the relay. The relay sends each
+//! a `bill {price, free_mb, pay_to, used_mb, month_charged, charged, credit}`; an arcade whose operator turned paying
+//! on (with a month's cap) pays ahead in ARCADE to `pay_to`, the payment carrying the memo `arcade-relay <its id>`,
+//! and says `paid {txid}`. The relay credits a payment once it is in a block (never from the pool alone: a waiting
+//! transaction can be replaced), once, and only to the arcade the memo names. An arcade past its free allowance and
+//! what it paid has its relayed links ended. The payer checks each bill against the bytes it sent itself and doesn't
+//! pay a relay that bills more.
 
 use crate::node::Node;
 use arcade_mesh::link::{Frame, Link, LinkError};
@@ -40,6 +49,16 @@ const OPEN_WAIT: Duration = Duration::from_secs(20);
 const ROUND_EVERY: Duration = Duration::from_secs(30);
 /// An arcade a relay couldn't reach is asked for again after this.
 const COOL: u64 = 30 * 60;
+/// Bytes an arcade may send past what it paid for before its relayed links end (time for its payment to confirm).
+const GRACE_BYTES: u64 = 20_000_000;
+/// One payment covers this much traffic (at least MIN_PAY).
+const PAY_BYTES: u64 = 250_000_000;
+/// The smallest payment (0.01 ARCADE).
+const MIN_PAY: u64 = 1_000_000;
+/// A payer's own count may be this much under the relay's bill before it stops paying (pieces counted on the way).
+const BILL_SLACK: f64 = 1.1;
+/// A payment not seen in a block within this is forgotten.
+const CLAIM_WAIT: u64 = 6 * 3600;
 
 fn now_s() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
@@ -66,6 +85,28 @@ fn limit_gb(node: &Node) -> f64 {
 
 fn max_links(node: &Node) -> u64 {
     cfg(node)["max_links"].as_u64().unwrap_or(DEFAULT_MAX_LINKS)
+}
+
+/// The relay's price in ARCADE base units per GB (0: free).
+fn price(node: &Node) -> u64 {
+    cfg(node)["price_per_gb"].as_f64().filter(|p| *p > 0.0).map(|p| (p * arcade_arc::params::COIN as f64).round() as u64).unwrap_or(0)
+}
+
+fn free_mb(node: &Node) -> u64 {
+    cfg(node)["free_mb"].as_u64().unwrap_or(100)
+}
+
+/// Does this arcade pay relays that charge (its operator's choice), and up to how much a month (base units)?
+fn pay_on(node: &Node) -> bool {
+    cfg(node)["pay_on"] == true
+}
+
+fn pay_cap(node: &Node) -> u64 {
+    cfg(node)["pay_cap"].as_f64().filter(|c| *c >= 0.0).map(|c| (c * arcade_arc::params::COIN as f64).round() as u64).unwrap_or(arcade_arc::params::COIN)
+}
+
+fn coins(units: u64) -> f64 {
+    units as f64 / arcade_arc::params::COIN as f64
 }
 
 fn this_month() -> String {
@@ -175,6 +216,50 @@ struct G {
     /// Links that have said "hi" to (peer ids), so it is said once a link.
     said_hi: BTreeSet<String>,
     last_round: Option<Instant>,
+    // The fee, as the relay.
+    fee: Fees,
+    last_bill: HashMap<String, Instant>,
+    // The fee, as a payer: each relay's last bill, the bytes we sent through it this month, and what we paid.
+    bills: HashMap<String, Value>,
+    sent_via: HashMap<String, (String, u64)>,
+    paid: Paid,
+    paying: HashMap<String, Instant>,
+}
+
+/// One arcade's account at a relay.
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
+struct Account {
+    month: String,
+    /// Bytes it sent through the relay this month.
+    used: u64,
+    /// Charged this month, and in all (base units); what it paid in all.
+    month_charged: u64,
+    charged: u64,
+    credit: u64,
+    /// The part of a unit not charged yet (bytes × price left over).
+    rem: u64,
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct Fees {
+    accounts: BTreeMap<String, Account>,
+    /// Payments credited (txids), so none counts twice.
+    claimed: BTreeSet<String>,
+    /// Payments said but not in a block yet: (payer, txid, when).
+    claims: Vec<(String, String, u64)>,
+    #[serde(skip)]
+    loaded: bool,
+    #[serde(skip)]
+    dirty: bool,
+}
+
+/// What this arcade paid relays this month.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct Paid {
+    month: String,
+    units: u64,
+    #[serde(skip)]
+    loaded: bool,
 }
 
 fn g() -> &'static Mutex<G> {
@@ -253,7 +338,15 @@ pub fn tick(node: &Node, link: &mut Link) -> Result<(), LinkError> {
         let ids: Vec<String> = if on { st.capable.iter().filter(|i| **i != peer).cloned().collect() } else { Vec::new() };
         if st.offered.get(&peer).is_none_or(|o| o.0 != on || o.1 != ids) && (on || st.offered.contains_key(&peer)) {
             st.offered.insert(peer.clone(), (on, ids.clone()));
-            out.push(rl(json!({"op": "offer", "on": on, "ids": ids})));
+            out.push(rl(json!({"op": "offer", "on": on, "ids": ids, "price": price(node), "free_mb": free_mb(node)})));
+        }
+        // A bill, a minute apart, to an arcade with an account here while there is a price.
+        if on && price(node) > 0 && st.last_bill.get(&peer).is_none_or(|t| t.elapsed() > Duration::from_secs(60)) {
+            load_fees(node, &mut st.fee);
+            if let Some(b) = bill(node, &mut st.fee, &peer) {
+                st.last_bill.insert(peer.clone(), Instant::now());
+                out.push(rl(b));
+            }
         }
         if let Some(q) = st.to.get_mut(&peer) {
             out.extend(q.drain(..));
@@ -275,13 +368,24 @@ pub fn tick(node: &Node, link: &mut Link) -> Result<(), LinkError> {
         }
         let ends: Vec<Arc<End>> = st.ends.values().filter(|e| e.relay == peer).cloned().collect();
         drop(st);
+        let mut sent = 0u64;
         for e in ends {
             let mut p = e.p.lock().unwrap();
             while let Some(b) = p.out.pop_front() {
                 p.out_bytes -= b.len();
+                sent += b.len() as u64;
                 out.push(Frame { head: json!({"t": "rl", "op": "d", "ch": e.ch}), blob: b });
             }
             e.cv.notify_all();
+        }
+        if sent > 0 {
+            let mut st = g().lock().unwrap();
+            let m = this_month();
+            let v = st.sent_via.entry(peer.clone()).or_default();
+            if v.0 != m {
+                *v = (m, 0);
+            }
+            v.1 += sent;
         }
     }
     for f in out {
@@ -323,6 +427,17 @@ pub fn on_frame(node: &Node, link: &mut Link, f: &Frame) -> Result<(), LinkError
             }
         }
         "d" => pass(node, &from, ch, &f.blob),
+        "paid" => {
+            let txid = h["txid"].as_str().filter(|t| t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit())).map(str::to_lowercase);
+            let mut st = g().lock().unwrap();
+            if let Some(txid) = txid.filter(|_| relay_on(node)) {
+                load_fees(node, &mut st.fee);
+                if !st.fee.claimed.contains(&txid) && !st.fee.claims.iter().any(|c| c.1 == txid) && st.fee.claims.len() < 1000 {
+                    st.fee.claims.push((from, txid, now_s()));
+                    st.fee.dirty = true;
+                }
+            }
+        }
         "close" => {
             let mut st = g().lock().unwrap();
             if let Some(c) = st.chans.get(&ch).filter(|c| c.a == from || c.b == from) {
@@ -341,6 +456,12 @@ pub fn on_frame(node: &Node, link: &mut Link, f: &Frame) -> Result<(), LinkError
             }
         }
         "in" => incoming(node, &from, h),
+        "bill" => {
+            let mut st = g().lock().unwrap();
+            if st.relays.contains_key(&from) {
+                st.bills.insert(from, h.clone());
+            }
+        }
         "ok" => {
             let n = h["n"].as_str().unwrap_or("").to_string();
             let Some((relay, target, _)) = g().lock().unwrap().asking.remove(&n) else { return Ok(()) };
@@ -408,6 +529,12 @@ fn open(node: &Node, from: &str, h: &Value) {
     if st.chans.values().any(|c| (c.a == from && c.b == to) || (c.a == to && c.b == from)) {
         return fail(&mut st, "already relayed");
     }
+    if price(node) > 0 {
+        load_fees(node, &mut st.fee);
+        if owes(&mut st.fee, from, price(node)) {
+            return fail(&mut st, "past the free allowance: pay the relay first");
+        }
+    }
     st.next += 1;
     let ch = st.next;
     st.chans.insert(ch, Chan { a: from.to_string(), b: to.clone(), n: Some(n), accepted: false, asked: Instant::now(), since: now_s(), bytes: 0 });
@@ -435,6 +562,16 @@ fn pass(node: &Node, from: &str, ch: u64, bytes: &[u8]) {
         close_chan(&mut st, ch, &other, why);
         st.to.entry(from.to_string()).or_default().push_back(rl(json!({"op": "end", "ch": ch, "why": why})));
         return;
+    }
+    if price(node) > 0 {
+        load_fees(node, &mut st.fee);
+        charge(&mut st.fee, from, bytes.len() as u64, price(node), free_mb(node));
+        if owes(&mut st.fee, from, price(node)) {
+            let why = "past the free allowance and what was paid: pay the relay";
+            close_chan(&mut st, ch, &other, why);
+            st.to.entry(from.to_string()).or_default().push_back(rl(json!({"op": "end", "ch": ch, "why": why})));
+            return;
+        }
     }
     let w = st.waiting.entry((ch, other.clone())).or_default();
     *w += bytes.len();
@@ -573,10 +710,27 @@ pub fn round(node: &Node) {
     if st.meter.saved.is_some_and(|t| t.elapsed() > Duration::from_secs(60)) {
         save_meter(node, &mut st.meter);
     }
+    if !st.fee.claims.is_empty() {
+        settle_claims(node, &mut st.fee);
+    }
+    if st.fee.dirty {
+        save_fees(node, &mut st.fee);
+    }
+    // Payments due to relays we use.
+    let due: Vec<(String, String, u64)> = pay_due(node, &mut st);
+    for (relay, to, amount) in due {
+        st.paying.insert(relay.clone(), Instant::now());
+        let n = node.self_arc();
+        let _ = std::thread::Builder::new().name("relay pay".into()).spawn(move || pay(&n, &relay, &to, amount));
+    }
     let me = node.id_hex();
     let mut room = MAX_OWN.saturating_sub(st.ends.len() + st.asking.len());
     let relays: Vec<(String, Vec<String>)> = st.relays.iter().map(|(r, ids)| (r.clone(), ids.clone())).collect();
     for (relay, ids) in relays {
+        // A relay we owe and won't pay (paying off here): no new links through it.
+        if st.bills.get(&relay).is_some_and(|b| b["price"].as_u64().unwrap_or(0) > 0 && b["charged"].as_u64().unwrap_or(0) > b["credit"].as_u64().unwrap_or(0)) && !pay_on(node) {
+            continue;
+        }
         for id in ids {
             if room == 0 {
                 return;
@@ -589,6 +743,189 @@ pub fn round(node: &Node) {
             st.asking.insert(n.clone(), (relay.clone(), id.clone(), Instant::now()));
             st.ctl.entry(relay.clone()).or_default().push_back(rl(json!({"op": "open", "n": n, "to": id})));
             room -= 1;
+        }
+    }
+}
+
+// ---------------------------------------------------------------- the fee
+
+fn fees_file(node: &Node) -> std::path::PathBuf {
+    node.home.join("relay-accounts.json")
+}
+
+fn load_fees(node: &Node, f: &mut Fees) {
+    if f.loaded {
+        return;
+    }
+    if let Some(saved) = std::fs::read_to_string(fees_file(node)).ok().and_then(|t| serde_json::from_str::<Fees>(&t).ok()) {
+        *f = saved;
+    }
+    f.loaded = true;
+}
+
+fn save_fees(node: &Node, f: &mut Fees) {
+    if let Ok(t) = serde_json::to_string(f) {
+        let tmp = node.home.join("relay-accounts.json.new");
+        if std::fs::write(&tmp, t).is_ok() {
+            let _ = std::fs::rename(&tmp, fees_file(node));
+        }
+    }
+    f.dirty = false;
+}
+
+fn account<'a>(f: &'a mut Fees, who: &str) -> &'a mut Account {
+    let m = this_month();
+    let a = f.accounts.entry(who.to_string()).or_default();
+    if a.month != m {
+        a.month = m;
+        a.used = 0;
+        a.month_charged = 0;
+    }
+    a
+}
+
+/// `bytes` more sent by `who`: what is past the month's free allowance is charged at `price` (base units per GB).
+fn charge(f: &mut Fees, who: &str, bytes: u64, price: u64, free_mb: u64) {
+    let a = account(f, who);
+    let free = free_mb.saturating_mul(1_000_000);
+    let before = a.used;
+    a.used += bytes;
+    let billable = a.used.saturating_sub(free.max(before)).min(bytes);
+    if billable > 0 && price > 0 {
+        let x = billable as u128 * price as u128 + a.rem as u128;
+        let units = (x / 1_000_000_000) as u64;
+        a.rem = (x % 1_000_000_000) as u64;
+        a.charged += units;
+        a.month_charged += units;
+    }
+    f.dirty = true;
+}
+
+/// Is `who` past what it paid, by more than GRACE_BYTES at `price` (time for a payment to confirm)?
+fn owes(f: &mut Fees, who: &str, price: u64) -> bool {
+    let a = account(f, who);
+    let grace = (GRACE_BYTES as u128 * price as u128 / 1_000_000_000) as u64;
+    a.charged > a.credit.saturating_add(grace)
+}
+
+/// The bill for `who`, if it has an account here.
+fn bill(node: &Node, f: &mut Fees, who: &str) -> Option<Value> {
+    if !f.accounts.contains_key(who) {
+        return None;
+    }
+    let pay_to = crate::arcledger::own_address(node).ok()?;
+    let a = account(f, who).clone();
+    Some(json!({"op": "bill", "price": price(node), "free_mb": free_mb(node), "pay_to": pay_to, "used_mb": a.used / 1_000_000,
+                "month_charged": a.month_charged, "charged": a.charged, "credit": a.credit}))
+}
+
+/// The memo a payment from `id` carries.
+fn memo_of(id: &str) -> Vec<u8> {
+    format!("arcade-relay {}", &id[..id.len().min(32)]).into_bytes()
+}
+
+/// A transaction in a block on ARCADE (None while it waits, or if there's no such one).
+fn confirmed_tx(node: &Node, txid: &arcade_chain::hash::Hash256) -> Option<arcade_chain::Tx> {
+    let p = crate::arcledger::chain().ok()?;
+    if let Ok(Some((raw, _))) = node.chain.tx_raw(p, txid) {
+        return arcade_chain::Tx::parse_with(&raw, &p.format).ok();
+    }
+    let (b, pos) = node.chain.tx_location(p, txid).ok()??;
+    let (hdr, _, _) = node.chain.block_at(p, b).ok()??;
+    let blk = crate::shares::fetch_blocks(node, p, &[p.block_id(&hdr)]).ok()?.pop()?;
+    blk.txs.get(pos as usize).cloned()
+}
+
+/// Payments said: credited once in a block, to the arcade their memo names, by what they pay this relay's address.
+fn settle_claims(node: &Node, f: &mut Fees) {
+    let Ok(p) = crate::arcledger::chain() else { return };
+    let Some(to) = crate::arcledger::own_address(node).ok().and_then(|a| arcade_ledger::address::script_for_address(p, &a)) else { return };
+    let now = now_s();
+    let claims = std::mem::take(&mut f.claims);
+    for (who, txid, at) in claims {
+        let Ok(id) = arcade_chain::hash::Hash256::from_hex(&txid) else { continue };
+        match confirmed_tx(node, &id) {
+            Some(tx) => {
+                let paid: u64 = tx.outputs.iter().filter(|o| o.script_pubkey == to).map(|o| o.value).sum();
+                let memo = memo_of(&who);
+                if paid > 0 && tx.raw.windows(memo.len()).any(|w| w == memo.as_slice()) && f.claimed.insert(txid.clone()) {
+                    account(f, &who).credit += paid;
+                    eprintln!("relay: {} paid {} ARCADE ({txid})", short(&who), coins(paid));
+                }
+                f.dirty = true;
+            }
+            None if now.saturating_sub(at) < CLAIM_WAIT => f.claims.push((who, txid, at)),
+            None => f.dirty = true,
+        }
+    }
+}
+
+fn paid_file(node: &Node) -> std::path::PathBuf {
+    node.home.join("relay-paid.json")
+}
+
+/// The payments due now: (relay, its address, amount), for relays we have links through whose bill shows little left
+/// of what we paid, while paying is on and under its month's cap, and only when the bill is no more than we sent.
+fn pay_due(node: &Node, st: &mut G) -> Vec<(String, String, u64)> {
+    if !pay_on(node) {
+        return Vec::new();
+    }
+    if !st.paid.loaded {
+        if let Some(p) = std::fs::read_to_string(paid_file(node)).ok().and_then(|t| serde_json::from_str::<Paid>(&t).ok()) {
+            st.paid = p;
+        }
+        st.paid.loaded = true;
+    }
+    let m = this_month();
+    if st.paid.month != m {
+        st.paid.month = m.clone();
+        st.paid.units = 0;
+    }
+    let cap = pay_cap(node);
+    let mut due = Vec::new();
+    for (relay, b) in &st.bills {
+        let price = b["price"].as_u64().unwrap_or(0);
+        if price == 0 || !st.ends.values().any(|e| e.relay == *relay) || st.paying.get(relay).is_some_and(|t| t.elapsed() < Duration::from_secs(600)) {
+            continue;
+        }
+        let (charged, credit, month_charged) = (b["charged"].as_u64().unwrap_or(0), b["credit"].as_u64().unwrap_or(0), b["month_charged"].as_u64().unwrap_or(0));
+        let amount = ((PAY_BYTES as u128 * price as u128 / 1_000_000_000) as u64).max(MIN_PAY);
+        if credit.saturating_sub(charged) > amount / 2 {
+            continue;
+        }
+        // The bill against our own count: what we sent this month past the free allowance, at its price.
+        let sent = st.sent_via.get(relay).filter(|v| v.0 == m).map(|v| v.1).unwrap_or(0);
+        let free = b["free_mb"].as_u64().unwrap_or(0).saturating_mul(1_000_000);
+        let fair = (sent.saturating_sub(free) as f64 * price as f64 / 1e9) * BILL_SLACK + coins(MIN_PAY) * arcade_arc::params::COIN as f64;
+        if month_charged as f64 > fair {
+            eprintln!("relay: {}'s bill ({} ARCADE this month) is more than this arcade sent through it: not paying", short(relay), coins(month_charged));
+            continue;
+        }
+        if st.paid.units + amount > cap {
+            continue;
+        }
+        let Some(to) = b["pay_to"].as_str().filter(|a| a.len() <= 64) else { continue };
+        due.push((relay.clone(), to.to_string(), amount));
+    }
+    due
+}
+
+/// Pay `amount` to relay `relay` at `to`, with our memo, and tell it.
+fn pay(node: &Node, relay: &str, to: &str, amount: u64) {
+    let me = node.id_hex();
+    match crate::arcledger::pay_with_memo(node, to, amount, &memo_of(&me)) {
+        Ok((txid, fee)) => {
+            let mut st = g().lock().unwrap();
+            st.paid.units += amount;
+            if let Ok(t) = serde_json::to_string(&st.paid) {
+                let _ = std::fs::write(paid_file(node), t);
+            }
+            st.ctl.entry(relay.to_string()).or_default().push_back(rl(json!({"op": "paid", "txid": txid})));
+            drop(st);
+            let _ = node.app.event("mesh", &format!("paid relay {} {} ARCADE (fee {}): {txid}", short(relay), coins(amount), coins(fee)));
+        }
+        Err(e) => {
+            let _ = node.app.event("mesh", &format!("couldn't pay relay {}: {e}", short(relay)));
         }
     }
 }
@@ -699,6 +1036,12 @@ pub fn status(node: &Node) -> Value {
     let mut st = g().lock().unwrap();
     load_meter(node, &mut st.meter);
     st.meter.roll();
+    load_fees(node, &mut st.fee);
+    let m = this_month();
+    let tag_of = |id: &str| crate::meshview::tag_of(id).map(|t| format!("@{t}")).unwrap_or_else(|| short(id).to_string());
+    let accounts: Vec<Value> = st.fee.accounts.iter().filter(|(_, a)| a.month == m || a.credit > 0).map(|(id, a)| json!({"arcade": tag_of(id),
+        "used_mb": if a.month == m { a.used / 1_000_000 } else { 0 }, "month_charged": coins(if a.month == m { a.month_charged } else { 0 }),
+        "paid": coins(a.credit), "owed": coins(a.charged.saturating_sub(a.credit))})).collect();
     let gb = |b: u64| (b as f64 / 1e7).round() / 100.0;
     let tag = |id: &str| crate::meshview::tag_of(id).map(|t| format!("@{t}")).unwrap_or_else(|| short(id).to_string());
     json!({
@@ -713,6 +1056,19 @@ pub fn status(node: &Node) -> Value {
         "takers": st.capable.len(),
         "through_relays": st.up.iter().map(|(p, r)| json!({"arcade": tag(p), "relay": tag(r)})).collect::<Vec<_>>(),
         "relays": st.relays.keys().map(|r| tag(r)).collect::<Vec<_>>(),
+        // The fee, as the relay.
+        "price_per_gb": coins(price(node)),
+        "free_mb": free_mb(node),
+        "pay_to": crate::arcledger::own_address(node).ok(),
+        "earned": coins(st.fee.accounts.values().map(|a| a.credit).sum()),
+        "accounts": accounts,
+        "waiting_payments": st.fee.claims.len(),
+        // The fee, as a payer.
+        "pay_on": pay_on(node),
+        "pay_cap": coins(pay_cap(node)),
+        "paid_this_month": coins(if st.paid.month == this_month() { st.paid.units } else { 0 }),
+        "bills": st.bills.iter().map(|(r, b)| json!({"relay": tag(r), "price_per_gb": coins(b["price"].as_u64().unwrap_or(0)), "used_mb": b["used_mb"],
+            "month_charged": coins(b["month_charged"].as_u64().unwrap_or(0)), "balance": coins(b["credit"].as_u64().unwrap_or(0)) - coins(b["charged"].as_u64().unwrap_or(0))})).collect::<Vec<_>>(),
     })
 }
 
@@ -725,6 +1081,18 @@ pub fn set(node: &Node, req: &Value) -> Result<Value, String> {
     if let Some(l) = req.get("limit_gb").filter(|v| !v.is_null()) {
         let l = l.as_f64().filter(|l| *l >= 0.0 && *l <= 100_000.0).ok_or("limit_gb: a number of GB a month, 0 or more")?;
         c["limit_gb"] = json!(l);
+    }
+    for (k, most) in [("price_per_gb", 1_000.0), ("pay_cap", 1_000_000.0)] {
+        if let Some(v) = req.get(k).filter(|v| !v.is_null()) {
+            let v = v.as_f64().filter(|v| *v >= 0.0 && *v <= most).ok_or(format!("{k}: an amount of ARCADE, 0 to {most}"))?;
+            c[k] = json!(v);
+        }
+    }
+    if let Some(v) = req.get("free_mb").filter(|v| !v.is_null()) {
+        c["free_mb"] = json!(v.as_u64().filter(|v| *v <= 10_000_000).ok_or("free_mb: a number of MB, 0 or more")?);
+    }
+    if let Some(on) = req["pay_on"].as_bool() {
+        c["pay_on"] = json!(on);
     }
     if let Some(m) = req.get("max_links").filter(|v| !v.is_null()) {
         let m = m.as_u64().filter(|m| *m <= 1000).ok_or("max_links: a number of links, 0 to 1000")?;
@@ -775,5 +1143,48 @@ mod tests {
         r.e.p.lock().unwrap().closed = Some("gone".into());
         assert_eq!(r.recv().unwrap_err().kind(), io::ErrorKind::ConnectionReset);
         assert_eq!(r.describe(), "relay:rrrrrrrr");
+    }
+    /// Charges start past the month's free allowance, carry parts of a unit, and an arcade owes only past what it
+    /// paid plus the grace.
+    #[test]
+    fn the_fee_charges_past_the_free_allowance_and_counts_payments() {
+        let mut f = Fees::default();
+        let price = arcade_arc::params::COIN; // 1 ARCADE a GB
+        charge(&mut f, "a", 60_000_000, price, 100);
+        assert_eq!(f.accounts["a"].charged, 0, "inside 100 MB free");
+        charge(&mut f, "a", 60_000_000, price, 100);
+        assert_eq!(f.accounts["a"].charged, 2_000_000, "20 MB past the allowance: 0.02 ARCADE");
+        // Many small pieces add up to the same as one big one.
+        for _ in 0..1000 {
+            charge(&mut f, "b", 1_000, price, 0);
+        }
+        charge(&mut f, "c", 1_000_000, price, 0);
+        assert_eq!(f.accounts["b"].charged, f.accounts["c"].charged);
+        // 20 MB of grace: "a" owes once 20 MB past what it paid.
+        assert!(!owes(&mut f, "a", price));
+        charge(&mut f, "a", 1_000_000, price, 100);
+        assert!(owes(&mut f, "a", price));
+        f.accounts.get_mut("a").unwrap().credit = 10_000_000;
+        assert!(!owes(&mut f, "a", price));
+        // Free relay: never owes.
+        charge(&mut f, "d", 5_000_000_000, 0, 0);
+        assert!(!owes(&mut f, "d", 0));
+    }
+
+    /// A payment's memo names the payer and travels whole in the transaction's data, where the relay finds it.
+    #[test]
+    fn a_payment_memo_is_whole_in_the_transaction() {
+        let p = arcade_arc::store::chain_params(&arcade_arc::params::TESTNET, &arcade_chain::hash::Hash256([1; 32]));
+        let sk = arcade_wallet::secp256k1::SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let pk = arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
+        let script = arcade_wallet::keys::p2pkh_script_for(&pk);
+        let coins = vec![arcade_wallet::tx::Utxo { outpoint: arcade_chain::OutPoint { txid: arcade_chain::hash::Hash256([2; 32]), vout: 0 }, value: 100_000_000, script: script.clone() }];
+        let id = "ab".repeat(32);
+        let memo = memo_of(&id);
+        assert_eq!(memo, format!("arcade-relay {}", &id[..32]).into_bytes());
+        let tx = arcade_wallet::tx::build_arcade_with(p, &arcade_wallet::tx::any_data(&memo), vec![arcade_wallet::tx::TxOutSpec { value: 1_000_000, script: vec![0x76, 0xa9, 0x14, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 0x88, 0xac] }],
+            &sk, &coins, 2 * arcade_arc::params::MIN_FEE_PER_KB, arcade_arc::params::DUST, 0, arcade_wallet::tx::ARCADE_CLASS_C_MAX).unwrap();
+        assert!(tx.raw.windows(memo.len()).any(|w| w == memo.as_slice()));
+        assert!(!tx.raw.windows(memo_of(&"cd".repeat(32)).len()).any(|w| w == memo_of(&"cd".repeat(32)).as_slice()));
     }
 }
