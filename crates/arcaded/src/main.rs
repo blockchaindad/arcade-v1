@@ -515,6 +515,7 @@ fn main() {
         for (a, src) in heard {
             meshsvc::dial_heard(&node, a, src);
         }
+        meshsvc::retry_parked(&node);
         // Arcades that announce themselves on chain (MESH records), checked every 10 minutes.
         if !no_seeds {
             let n = node.clone();
