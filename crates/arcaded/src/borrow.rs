@@ -476,6 +476,13 @@ fn r(v: &Value) -> Result<&Value, String> {
     crate::crsource::result(v, "lender:")
 }
 
+/// One call on the best lender of a chain that answers: its result. What crate::arcgit asks of an arcade lending the
+/// ARCADE chain, whose git repositories aren't read here while the chain is only borrowed.
+pub fn ask_lender(node: &Node, p: &ChainParams, method: &str, params: Value) -> Result<Value, String> {
+    let (_, a) = call_any(node, p, json!([[method, params]]))?;
+    r(&a[0]).cloned()
+}
+
 /// The same batch on the best lender that answers (up to three tried).
 fn call_any(node: &Node, p: &ChainParams, calls: Value) -> Result<(String, Vec<Value>), String> {
     let ls = lenders(node, p);

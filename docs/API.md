@@ -408,6 +408,18 @@ pays with the key that holds that tag on ARCADE: one of the wallet's own, or a k
 `scripts/git-publish.py --as @tag` uses it. A text record (an issue, a comment) is two transactions, its text's blob and
 the record, so it waits until the key has a free coin for each.
 
+**Plain `git push` and `git clone`:** `scripts/git-remote-arcade` is a git remote helper (put it on PATH). With the remote
+`arcade::@owner/name`, `git clone`, `git fetch` and `git push` work through this computer's arcade socket: a push packs
+what the repository's manifest doesn't reach yet, publishes it (any size: a pack over 3.5 MB, one big file, goes as
+parts joined by a file manifest blob, `{"arcade": "file", ...}`, which the arcade's git reads join back), then the
+manifest and the push record; a push that isn't a fast-forward needs `--force`, and the first push to a name under
+your own tag creates it. Settings: `ARCADE_SOCK`/`git config arcade.sock`, `ARCADE_AS`/`arcade.as` (sign as a tag).
+
+**Arcades that borrow the ARCADE chain** (it isn't installed, so no ledger or blobs are kept) answer `/r/git/*` and
+`/git/*` by asking an arcade that lends the chain (core RPC method `arcade_git [path, query]` →
+`{code, ctype, gzip, b64}`); packs, indexes and blobs are kept 96 MB deep. The lender's word, like borrowed blocks;
+git checks every object it clones.
+
 **Arcade V1.0's own code** shows as the read-only repository `@arcade/arcade-v1` (`relrepo.rs`): the newest held
 signed release's git bundle, its pack served as is and its index built once beside it, with a tag per release.
 `/r/git/repos` lists it, `/r/git/repo` describes it (`release`, and `log` = the releases), it has no issues, and

@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""git-remote-arcade: plain `git push` and `git clone` for repositories on the ARCADE chain (docs/ARCADECHAIN.md §15).
+
+Put this file on your PATH (executable), then use the remote `arcade::@owner/name`:
+
+  git clone arcade::@strawberry/arcade-v1
+  git remote add arcade arcade::@you/project      # or: git remote set-url --push origin arcade::@you/project
+  git push arcade main
+
+A push packs only the objects the repository on the chain doesn't have yet (git pack-objects, in pieces under 3 MB so
+each fits a block), publishes each piece from this computer's arcade wallet, then a manifest naming every ref and pack,
+and once that is in a block a signed push record points @owner/name at it. Any size works: big pushes are several
+transactions, each paid at the blob price (about 0.01 ARCADE per kB). The first push to a name under your own @tag
+creates the repository; only the owner and its maintainers can push. A push that isn't a fast-forward is refused unless
+forced (`git push --force` / `+ref`), as on any git host.
+
+A fetch reads the manifest's packs over the same socket (git index-pack checks every object). Without this helper,
+any git clones the same repository from an arcade's web address: git clone http://<arcade>/git/@owner/name
+
+Settings (environment, or git config in the repository):
+  ARCADE_SOCK / arcade.sock   the arcade's socket (default: $ARCADE_HOME, /var/lib/arcade, or ~/.local/share/arcade)
+  ARCADE_AS   / arcade.as     sign and pay as this @tag (a key imported with wallet.import); default the wallet's own
+"""
+import glob, json, os, socket, subprocess, sys, tempfile, time
+
+
+def log(*a):
+    print("arcade:", *a, file=sys.stderr, flush=True)
+
+
+def git(*args, inp=None, check=True):
+    r = subprocess.run(["git", *args], input=inp, capture_output=True)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)}: {r.stderr.decode().strip()}")
+    return r
+
+
+def setting(env, key, default=""):
+    if os.environ.get(env):
+        return os.environ[env]
+    r = git("config", "--get", key, check=False)
+    return r.stdout.decode().strip() or default
+
+
+def default_sock():
+    if os.environ.get("ARCADE_HOME"):
+        return os.path.join(os.environ["ARCADE_HOME"], "arcaded.sock")
+    for d in ["/var/lib/arcade", os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "arcade"),
+              os.path.expanduser("~/.local/share/arcade-v1")]:
+        if os.path.exists(os.path.join(d, "arcaded.sock")):
+            return os.path.join(d, "arcaded.sock")
+    return os.path.expanduser("~/.local/share/arcade/arcaded.sock")
+
+
+SOCK = None
+AS = {}
+
+
+def call(req, t=300):
+    s = socket.socket(socket.AF_UNIX); s.settimeout(t); s.connect(SOCK)
+    s.sendall((json.dumps({**req, **AS}) + "\n").encode())
+    r = json.loads(s.makefile().readline())
+    if not r.get("ok"):
+        raise RuntimeError(r.get("error"))
+    return r["result"]
+
+
+def retry(req, why=("not enough",), tries=360, wait=10):
+    """A call the wallet answers once its coins are free again (spent in transactions not in a block yet)."""
+    for i in range(tries):
+        try:
+            return call(req)
+        except RuntimeError as e:
+            if not any(w in str(e) for w in why):
+                raise
+            if i == 0:
+                log(f"waiting for the wallet's coins ({e})")
+            time.sleep(wait)
+    raise RuntimeError("the wallet never had enough ARCADE")
+
+
+def remote_state(name):
+    """(manifest id or None, manifest dict)."""
+    try:
+        mid = call({"cmd": "ledger.repo", "name": name})["manifest"]
+    except RuntimeError as e:
+        if "no repository" not in str(e):
+            raise
+        return None, {"refs": {}, "packs": [], "head": None}
+    m = json.loads(bytes.fromhex(call({"cmd": "arc.blob", "id": mid})["hex"]))
+    return mid, m
+
+
+def have(sha):
+    return git("cat-file", "-e", f"{sha}^{{commit}}", check=False).returncode == 0
+
+
+PART = 3_500_000
+FILE_MANIFEST = "application/vnd.arcade.file+json"
+
+
+def blob(bid):
+    """A blob's bytes; a file manifest's whole file (its parts joined)."""
+    data = bytes.fromhex(call({"cmd": "arc.blob", "id": bid}, 600)["hex"])
+    if data[:1] == b"{":
+        try:
+            m = json.loads(data)
+        except ValueError:
+            return data
+        if isinstance(m, dict) and m.get("arcade") == "file" and isinstance(m.get("parts"), list):
+            out = b"".join(bytes.fromhex(call({"cmd": "arc.blob", "id": pid}, 600)["hex"]) for pid, _ in m["parts"])
+            if len(out) == m.get("size"):
+                return out
+    return data
+
+
+def fetch(name):
+    """Every pack of the repository's manifest this repository lacks, read over the arcade's socket; git index-pack
+    checks each object and writes its own index."""
+    _, m = remote_state(name)
+    gitdir = git("rev-parse", "--git-dir").stdout.decode().strip()
+    packs = m.get("packs") or []
+    for i, p in enumerate(packs, 1):
+        if os.path.exists(os.path.join(gitdir, "objects", "pack", f"pack-{p['name']}.pack")):
+            continue
+        data = blob(p["pack"])
+        log(f"pack {i}/{len(packs)}: {len(data)} bytes")
+        git("index-pack", "--stdin", "--fix-thin", inp=data)
+
+
+def push(name, specs):
+    """specs: [(force, src, dst)]. Returns {dst: None (ok) or the reason it failed}."""
+    mid, m = remote_state(name)
+    refs = dict(m.get("refs") or {})
+    out, new = {}, {}
+    for force, src, dst in specs:
+        if not src:
+            if dst not in refs:
+                out[dst] = "no such ref"
+            else:
+                new[dst] = None
+            continue
+        sha = git("rev-parse", f"{src}^{{commit}}").stdout.decode().strip()
+        old = refs.get(dst)
+        if old and old != sha and not force:
+            if not have(old):
+                out[dst] = "fetch first"; continue
+            if git("merge-base", "--is-ancestor", old, sha, check=False).returncode != 0:
+                out[dst] = "non-fast-forward"; continue
+        new[dst] = sha
+    todo = {d: s for d, s in new.items() if refs.get(d) != s}
+    if not todo:
+        for d in new:
+            out.setdefault(d, None)
+        return out
+    revs = [s for s in todo.values() if s] + [f"^{s}" for s in set(refs.values()) if s and have(s)]
+    packs = []
+    with tempfile.TemporaryDirectory() as tmp:
+        if any(todo.values()):
+            git("pack-objects", "--revs", "--max-pack-size=3m", "-q", os.path.join(tmp, "pack"), inp=("\n".join(revs) + "\n").encode())
+        files = sorted(glob.glob(os.path.join(tmp, "pack-*.pack")))
+        total = sum(os.path.getsize(p) + os.path.getsize(p[:-5] + ".idx") for p in files)
+        if files:
+            log(f"{len(files)} pack(s), {total / 1e6:.2f} MB: about {total / 1000 * 0.01:.2f} ARCADE at the blob price")
+        for i, pack in enumerate(files, 1):
+            pname = os.path.basename(pack)[len("pack-"):-len(".pack")]
+            size = os.path.getsize(pack)
+            if size <= PART:
+                r = retry({"cmd": "arc.blob_publish_many", "send": True, "files": [
+                    {"path": pack, "type": "application/x-git-packed-objects", "class": 0},
+                    {"path": pack[:-5] + ".idx", "type": "application/x-git-packed-objects-toc", "class": 0}]})
+                packs.append({"name": pname, "pack": r["blobs"][0]["blob"], "idx": r["blobs"][1]["blob"]})
+                log(f"pack {i}/{len(files)} sent ({size} bytes, fee {r['fee'] / 1e8} ARCADE)")
+                continue
+            # One object bigger than a blob (a big file): the pack in parts, each a blob of its own (one block each),
+            # and a file manifest joining them, which the arcade reads as one file (crate::arcgit::whole).
+            data = open(pack, "rb").read()
+            parts = []
+            for at in range(0, len(data), PART):
+                pp = os.path.join(tmp, f"part-{at}")
+                open(pp, "wb").write(data[at:at + PART])
+                r = retry({"cmd": "arc.blob_publish_many", "send": True, "files": [{"path": pp, "type": "application/octet-stream", "class": 0}]})
+                parts.append([r["blobs"][0]["blob"], len(data[at:at + PART])])
+                log(f"pack {i}/{len(files)}: part {len(parts)}/{-(-len(data) // PART)} sent (fee {r['fee'] / 1e8} ARCADE)")
+            fm = os.path.join(tmp, f"file-{pname}.json")
+            json.dump({"arcade": "file", "type": "application/x-git-packed-objects", "size": len(data), "parts": parts}, open(fm, "w"), separators=(",", ":"))
+            r = retry({"cmd": "arc.blob_publish_many", "send": True, "files": [
+                {"path": fm, "type": FILE_MANIFEST, "class": 0},
+                {"path": pack[:-5] + ".idx", "type": "application/x-git-packed-objects-toc", "class": 0}]})
+            packs.append({"name": pname, "pack": r["blobs"][0]["blob"], "idx": r["blobs"][1]["blob"]})
+            log(f"pack {i}/{len(files)} sent ({size} bytes in {len(parts)} parts)")
+        for d, s in todo.items():
+            if s:
+                refs[d] = s
+            else:
+                refs.pop(d, None)
+        head = m.get("head") if m.get("head") in refs else ("refs/heads/main" if "refs/heads/main" in refs else (sorted(refs)[0] if refs else None))
+        manifest = {"git": "manifest", "name": name.lstrip("@"), "head": head, "refs": refs, "packs": (m.get("packs") or []) + packs,
+                    "prev": mid, "time": int(time.time())}
+        mp = os.path.join(tmp, "manifest.json")
+        json.dump(manifest, open(mp, "w"), separators=(",", ":"))
+        r = retry({"cmd": "arc.blob_publish_many", "send": True, "files": [{"path": mp, "type": "application/json", "class": 0}]})
+    new_mid = r["blobs"][0]["blob"]
+    log(f"manifest {new_mid[:16]}… sent; waiting for a block (about 2.5 minutes)")
+    for _ in range(720):
+        if call({"cmd": "arc.blob", "id": new_mid})["on_chain"]:
+            break
+        time.sleep(5)
+    else:
+        raise RuntimeError("the manifest never got into a block")
+    p = retry({"cmd": "ledger.repo_push", "name": name, "manifest": new_mid}, why=("not enough", "could not build"))
+    log(f"pushed: {name} -> manifest {new_mid[:16]}… (record {p['txid'][:16]}…); it shows once that is in a block")
+    for d in new:
+        out.setdefault(d, None)
+    return out
+
+
+def main():
+    global SOCK
+    if len(sys.argv) < 3:
+        sys.exit("git-remote-arcade is run by git: use a remote like arcade::@owner/name")
+    name = sys.argv[2]
+    for pre in ("arcade://", "arcade::"):
+        if name.startswith(pre):
+            name = name[len(pre):]
+    name = "@" + name.lstrip("@").removesuffix(".git").strip("/")
+    SOCK = setting("ARCADE_SOCK", "arcade.sock") or default_sock()
+    tag = setting("ARCADE_AS", "arcade.as")
+    if tag:
+        AS["as"] = "@" + tag.lstrip("@")
+    out = sys.stdout
+    batch = []
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            return
+        line = line.rstrip("\n")
+        if line == "capabilities":
+            out.write("fetch\npush\noption\n\n")
+        elif line.startswith("option"):
+            out.write("unsupported\n")
+        elif line.startswith("list"):
+            try:
+                _, m = remote_state(name)
+            except (RuntimeError, OSError) as e:
+                log(f"can't reach the arcade at {SOCK}: {e}")
+                return 1
+            refs = m.get("refs") or {}
+            for r, s in sorted(refs.items()):
+                out.write(f"{s} {r}\n")
+            if m.get("head") in refs:
+                out.write(f"@{m['head']} HEAD\n")
+            out.write("\n")
+        elif line.startswith("fetch "):
+            while line.startswith("fetch "):
+                line = sys.stdin.readline().rstrip("\n")
+            try:
+                fetch(name)
+            except Exception as e:
+                log(f"fetch failed: {e}")
+                return 1
+            out.write("\n")
+        elif line.startswith("push "):
+            while line.startswith("push "):
+                spec = line[5:]
+                force = spec.startswith("+")
+                src, dst = spec.lstrip("+").split(":", 1)
+                batch.append((force, src, dst))
+                line = sys.stdin.readline().rstrip("\n")
+            try:
+                res = push(name, batch)
+            except Exception as e:
+                res = {d: str(e).replace("\n", " ") for _, _, d in batch}
+            for _, _, d in batch:
+                out.write(f"ok {d}\n" if res.get(d) is None else f"error {d} {res[d]}\n")
+            out.write("\n")
+            batch = []
+        elif line == "":
+            return
+        else:
+            log(f"unknown command {line!r}")
+            return 1
+        out.flush()
+
+
+sys.exit(main() or 0)

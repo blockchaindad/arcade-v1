@@ -1022,7 +1022,7 @@ after its block-1,100 retarget.
   kB, so 5,000 objects as blobs would cost more in records than in data; a fork reuses its source's packs, so nothing
   is stored twice where it matters. And the arcade speaks git's **dumb HTTP protocol** (static files from a manifest
   blob), which every git client clones and fetches from with nothing running but the arcade; pushes are
-  `scripts/git-publish.py`, not `git push`. `/git/<manifest>` or `/git/@owner/name`.
+  `git push arcade::@owner/name` through `scripts/git-remote-arcade` (or `scripts/git-publish.py`). `/git/<manifest>` or `/git/@owner/name`.
 - **Ledger on ARCADE (7):** the same engine and records as the home chain, indexed in the same commit as each block;
   claims follow the chain they record; ARCADE's coins come from the chain's own coin set. Records up to 1 kB are one
   OP_RETURN. On the testnet the home chain's ledger runs beside it unchanged.

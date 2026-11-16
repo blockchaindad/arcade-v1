@@ -354,6 +354,15 @@ pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, metho
             page.reverse();
             Ok(json!(page))
         }
+        // A git read of the ARCADE chain's repositories for an arcade that only borrows the chain (crate::arcgit::lent):
+        // [path, query]; path is /r/git/... (page_read) or /git/... (the dumb HTTP files). {code, ctype, gzip, b64}.
+        "arcade_git" if arc => {
+            let path = param(0).as_str().unwrap_or("").to_string();
+            let q = param(1).as_object().cloned().unwrap_or_default();
+            let a = crate::arcgit::here(node, &path, &q).ok_or_else(|| err(-8, "not a git read"))?;
+            use base64::Engine;
+            Ok(json!({"code": a.code, "ctype": a.ctype, "gzip": a.gzip, "b64": base64::engine::general_purpose::STANDARD.encode(&a.body)}))
+        }
         // The headers of the ARCADE chain's best branch from a height on, each as the chain
         // writes it: [from, count]. What a borrowed copy follows the chain by.
         "arcade_headers" if arc => {
