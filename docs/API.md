@@ -400,6 +400,12 @@ ids, which the arcade fills in, and every pack it names must be on the chain or 
 makes the push a pull request's merge (the merge record moves the repository). The work runs in the background:
 records wait for the wallet's coins, a push for its manifest's block, then the push record.
 
+**Signing as another @tag** (socket requests): `"as": "@tag"` on `ledger.*`, `a.*` and `arc.blob_publish*` signs and
+pays with the key that holds that tag on ARCADE: one of the wallet's own, or a key imported for the ARCADE chain with
+`wallet.import {chain: "arctest", secret: <WIF or words>}` (kept encrypted like the wallet). Without `as`, nothing changes.
+`scripts/git-publish.py --as @tag` uses it. A text record (an issue, a comment) is two transactions, its text's blob and
+the record, so it waits until the key has a free coin for each.
+
 **Arcade V1.0's own code** shows as the read-only repository `@arcade/arcade-v1` (`relrepo.rs`): the newest held
 signed release's git bundle, its pack served as is and its index built once beside it, with a tag per release.
 `/r/git/repos` lists it, `/r/git/repo` describes it (`release`, and `log` = the releases), it has no issues, and
