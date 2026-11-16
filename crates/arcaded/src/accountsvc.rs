@@ -45,7 +45,7 @@ pub fn list(node: &Node) -> Value {
         // on the wrong account.
         if a["tag"].is_null() {
             if let Some(addr) = a["address"].as_str() {
-                a["tag"] = json!(arcade_ledger::index::tag_of(&node.chain, node.ledger_home().chain_no, addr).ok().flatten());
+                a["tag"] = json!(crate::hometag::of_address(node, addr));
             }
         }
         a["active"] = json!(a["id"] == active.as_str());

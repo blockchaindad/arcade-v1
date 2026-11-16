@@ -128,11 +128,10 @@ fn verify(node: &Node, peer: &str, head: &Value) -> Option<String> {
     if !arcade_wallet::keys::verifymessage(addr, sig, arcade_wallet::keys::PEPECOIN_MAGIC, &words(peer, tag, net)) {
         return None;
     }
-    // The handle must be held by that address in our own index of that chain (no index of it
-    // here: we can't tell, so it doesn't count).
-    let p = node.chain_params(net)?;
-    let holder = arcade_ledger::index::tag_of(&node.chain, p.chain_no, addr).ok()??;
-    (holder == tag).then(|| tag.to_string())
+    // The handle must be held by that address's key in our own index: on ARCADE, else on that chain (the ledger
+    // home; no index of it here: we can't tell, so it doesn't count). docs/HOMECHAIN.md phase 2.
+    node.chain_params(net)?;
+    crate::hometag::holds(node, tag, addr).then(|| tag.to_string())
 }
 
 /// The proven handle of a linked arcade's operator.

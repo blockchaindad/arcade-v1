@@ -80,7 +80,7 @@ pub fn following_of(node: &Node, address: &str) -> Vec<String> {
 }
 
 fn row(node: &Node, address: &str) -> Value {
-    let tag = arcade_ledger::index::tag_of(&node.chain, node.ledger_home().chain_no, address).ok().flatten();
+    let tag = crate::hometag::of_address(node, address);
     json!({"address": address, "tag": tag})
 }
 

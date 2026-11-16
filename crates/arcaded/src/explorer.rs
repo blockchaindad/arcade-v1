@@ -866,8 +866,8 @@ fn tip(x: &Ctx) -> u32 {
 }
 
 fn tag_of(x: &Ctx, a: &str) -> Option<String> {
-    // @tags live on the home chain.
-    arcade_ledger::index::tag_of(&x.node.chain, x.node.ledger_home().chain_no, a).ok().flatten()
+    // @tags live on ARCADE and the ledger home: the same key on any chain (crate::hometag).
+    crate::hometag::of_address(x.node, a)
 }
 
 fn scan_after(x: &Ctx, table: &str, pre: Vec<u8>, after: Option<String>, n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
