@@ -138,7 +138,7 @@ pub const PAGE_READS: &[&str] = &[
     "explorer.name", "explorer.maps", "explorer.map", "explorer.mempool", "explorer.ledger", "explorer.ledger_tokens",
     "explorer.ledger_token", "explorer.ledger_inscriptions", "explorer.ledger_inscription", "explorer.tag",
     "explorer.search", "explorer.dogefeed", "explorer.dogefeed_tx", "explorer.dogefeed_inscription",
-    "explorer.dogefeed_address", "explorer.dogefeed_keys",
+    "explorer.dogefeed_address", "explorer.dogefeed_keys", "explorer.earn",
 ];
 
 /// GET /r/explorer/<name>?args=<json>: the public read explorer.<name> (/r/explorer/chains: chains.list),

@@ -638,6 +638,8 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
                 }
             }
         }
+        // This arcade's ARCADE pay and Earn progress, read only (arc.earn without the switch).
+        "explorer.earn" => crate::arcsvc::earn_read(node, &req),
         c if c.starts_with("explorer.") => crate::explorer::handle_with(node, c, &req, req["img"] == "links"),
         c @ ("ledger.book" | "ledger.trades" | "ledger.pairs") => crate::marketsvc::handle(node, c, &req),
         // Token sends from this wallet (tokensend.rs): arcade tokens in one transaction; PRC-20 / DRC-20 as a job.

@@ -198,6 +198,21 @@ const JOURNALED: &[(u8, &str)] = {
     &[(ORD, "ord.v1"), (LEDGER, "ledger.v1"), (PROFILES, "profiles.v1"), (MESSAGES, "messages.v1"), (NAMES, "ord.v1"), (TOKENS, "ord.v1"), (MAPS, "ord.v1"), (TAGS, "tags.v1")]
 };
 
+/// The journal family of an index as Chains & Coins names it; None for an index with no journal (addresses,
+/// collections, dogefeed, ...), which is never sealed and earns nothing.
+pub fn index_family(index: &str) -> Option<u8> {
+    use arcade_chaindb::journal::*;
+    Some(match index {
+        "ord" => ORD,
+        "ledger" => LEDGER,
+        "profiles" => PROFILES,
+        "names" => NAMES,
+        "tokens" => TOKENS,
+        "maps" => MAPS,
+        _ => return None,
+    })
+}
+
 /// Of a family's journals on a chain: the index's first height and the last height journaled,
 /// when they run here from the index's start (an index taken in as a copy has no journals for
 /// the heights before; its family isn't offered or sealed).

@@ -199,6 +199,14 @@ pub fn start_home(node: &Node) -> Result<(), String> {
     register_shared(node, node.params, &home_indexes(node), &node.share_of(node.params.key))
 }
 
+/// The indexes a chain keeps here, as configured (none when it isn't installed).
+pub fn indexes_of(node: &Node, p: &ChainParams) -> Vec<String> {
+    if p.chain_no == node.params.chain_no {
+        return home_indexes(node);
+    }
+    node.extra.lock().unwrap().get(p.key).map(|r| r.indexes.clone()).unwrap_or_default()
+}
+
 #[cfg_attr(not(feature = "oldimport"), allow(dead_code))]
 /// Register a chain's indexes again, as configured (after an index was taken out to take a copy in).
 pub fn reregister(node: &Node, p: &'static ChainParams) -> Result<(), String> {

@@ -220,6 +220,7 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | method | route | needs | params | what |
 |---|---|---|---|---|
 | `explorer.summary` | `/api/v1/explorer/summary` | public | chain? | Chain summary for the explorer's front page. |
+| `explorer.earn` | `/api/v1/explorer/earn` | public | chain? | This arcade's ARCADE pay, read only (docs/EARN.md): its turn, next payout, accrued pay, pay and draw weight, why pay waits, and its sealed replicas waiting to register; with a chain, that coin's Earn ARCADE progress too. App pages read it at `/r/explorer/earn`. |
 | `explorer.blocks` | `/api/v1/explorer/blocks` | public | chain?, offset?, limit? | Recent blocks. |
 | `explorer.block` | `/api/v1/explorer/block` | public | chain?, id | One block (height or hash). |
 | `explorer.tx` | `/api/v1/explorer/tx` | public | chain?, txid | One transaction. |
