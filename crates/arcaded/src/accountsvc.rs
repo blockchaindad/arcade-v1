@@ -55,8 +55,14 @@ pub fn list(node: &Node) -> Value {
     json!(out)
 }
 
+/// This arcade's own wallet's @handle, read from its home-chain key record and the chain by its address, as for
+/// added accounts: never by switching to it for a moment (a send running meanwhile would use the wrong account).
 fn own_tag(node: &Node) -> Option<String> {
-    with_account(node, "", || crate::msgsvc::sender_key(node).ok().and_then(|(_, t, _)| t))
+    if node.app.active_account().is_empty() {
+        return crate::msgsvc::sender_key(node).ok().and_then(|(_, t, _)| t);
+    }
+    let k = node.app.own_tag_key(node.params.chain_no, 0).ok().flatten()?;
+    k.tag.or_else(|| crate::hometag::of_address(node, &k.address))
 }
 
 /// Run `f` with account `id` active, then put the previous one back.

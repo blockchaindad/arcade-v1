@@ -401,6 +401,13 @@ impl AppDb {
         Ok((rec, x.key))
     }
 
+    /// The arcade's own wallet's key record for tag slot `index` on chain `chain`, whatever account is in use
+    /// (None until that wallet has used the slot). Read without switching accounts.
+    pub fn own_tag_key(&self, chain: u16, index: u32) -> Result<Option<TagKey>> {
+        let k = KeyBuf::new().u16(chain).u32(index).done();
+        self.store.read(|r| Ok(r.get(TAG_KEYS, &k)?))?.map(|v| dec(TAG_KEYS, &v)).transpose()
+    }
+
     pub fn tag_keys(&self, chain: u16) -> Result<Vec<TagKey>> {
         self.ascan(TAG_KEYS, &KeyBuf::new().u16(chain).done())?.into_iter().map(|(_, v)| dec(TAG_KEYS, &v)).collect()
     }
