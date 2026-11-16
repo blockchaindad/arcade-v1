@@ -89,7 +89,9 @@
     async llm(m) {
       if (m.op === "offers") {
         const list = await api("llm.offers");
-        return { offers: list.map((o) => ({
+        // Chat models only here: voices are for OpenAI programs and the Models tab.
+        const chat = list.map((o) => ({ ...o, models: o.models.filter((x) => x.kind !== "speech") })).filter((o) => o.models.length);
+        return { offers: chat.map((o) => ({
           seller: o.seller, here: o.here, name: o.name || "", tag: o.tag || "", max_out: o.max_out,
           free: o.models.every((x) => x.free), models: o.models.map((x) => ({ id: x.id })),
           prices: o.models.map((x) => ({ leg: "arctest", label: "ARCADE per million tokens", model: x.id, in: x.in, out: x.out })),

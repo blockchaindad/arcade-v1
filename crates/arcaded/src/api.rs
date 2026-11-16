@@ -115,6 +115,7 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         "llm.topup" => crate::llmsvc::topup(node, &req),
         "llm.refund" => crate::llmsvc::ask_refund(node, &req),
         "llm.chat" => crate::llmsvc::chat_cmd(node, &req),
+        "llm.speak" => crate::llmsvc::speak_cmd(node, &req),
         "llm.auto" => crate::llmsvc::auto_set(node, &req),
         "llm.keys" => crate::llmsvc::keys(node),
         "llm.key_new" => crate::llmsvc::key_new(node, &req),
