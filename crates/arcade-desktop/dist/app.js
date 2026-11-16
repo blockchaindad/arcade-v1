@@ -46,7 +46,11 @@ async function drawStart() {
   box.hidden = false;
   const c = st.claim && st.claim.status !== "failed" ? st.claim : null;
   const failed = st.claim && st.claim.status === "failed" ? st.claim : null;
-  const coin = homeTicker();
+  // The chain the @handle is claimed on (ARCADE when it runs here; docs/HOMECHAIN.md phase 3) and its coin.
+  const coin = (st.chain && st.chain.unit) || homeTicker();
+  const chainName = (st.chain && st.chain.name) || HOME.name;
+  const onArcade = !!st.chain && st.chain.key !== HOME.key;
+  const need = onArcade ? "0.01" : "1";
   const walletDone = st.wallet && !START.phrase;
   const coinsHere = st.balance > 0;
   // Redrawn only when something a step shows changes (typing must survive the 4 s refresh);
@@ -54,12 +58,12 @@ async function drawStart() {
   const sig = JSON.stringify([st.wallet, !!START.phrase, START.saved, coinsHere, !!st.faucet, st.faucet && st.faucet.status, c && [c.tag, c.status, c.note], failed && failed.tag, START.checked, START.busy, START.msg]);
   // A fresh install reads the chain first; a coin paid in a recent block shows once it's there.
   const catchUp = () => st.height != null && st.best != null && st.best > st.height + 2
-    ? `Your arcade is still reading the ${HOME.name} chain (block ${num(st.height)} of ${num(st.best)}, ${Math.floor(st.height * 100 / st.best)}%); the coin shows once it gets there.`
+    ? `Your arcade is still reading the ${chainName} chain (block ${num(st.height)} of ${num(st.best)}, ${Math.floor(st.height * 100 / st.best)}%); the coin shows once it gets there.`
     : "";
   const used = !!c && (c.status === "sent" || c.status === "confirmed");
   const askedText = () => !st.wallet ? `It's asked for by itself as soon as your wallet exists.`
     : used ? `Received, and used to publish your @handle.`
-    : coinsHere ? `Here: ${homeCoins(st.balance)}. That pays for publishing your @handle.`
+    : coinsHere ? `Here: ${coinNum(st.balance)} ${coin}. That pays for publishing your @handle.`
     : st.faucet && st.faucet.status === "paid" ? `Another arcade says it sent it${st.faucet.txid ? ` (transaction ${st.faucet.txid.slice(0, 12)}…)` : ""}. ${catchUp() || "It shows here once that payment arrives; if it doesn't, your arcade asks again by itself."}`
     : st.faucet ? `Asked the arcade mesh for it ${ago(st.faucet.at) === "just now" ? "just now" : ago(st.faucet.at) + " ago"}; another arcade sends it, usually within a minute or two. Nothing to do: it's used as soon as it arrives, even before a block confirms it.${catchUp() ? " " + catchUp() : ""}`
     : `It's asked for by itself in a moment.`;
@@ -92,7 +96,7 @@ async function drawStart() {
 
   // 2. One test coin.
   const s2 = [h("div", { class: "hint", id: "h-asked" }, askedText()),
-    !coinsHere && !used ? h("div", { class: "hint" }, `Why: your @handle is published on the ${HOME.name} chain, and publishing pays a small network fee. ${coin} is the test coin of that chain; it has no money value.`) : null];
+    !coinsHere && !used ? h("div", { class: "hint" }, `Why: your @handle is published on the ${chainName} chain, and publishing pays a small network fee. ${coin} is the test coin of that chain; it has no money value.`) : null];
 
   // 3. The @handle, claimed here.
   let s3;
@@ -123,7 +127,7 @@ async function drawStart() {
 
   const steps = [
     { done: walletDone, title: START.phrase ? "Your 12 words" : st.wallet ? "Your wallet" : "Make your wallet, or restore yours", body: s1 },
-    { done: coinsHere || used, title: coinsHere || used ? `1 ${coin} for your @handle` : `Waiting for 1 ${coin}`, body: s2 },
+    { done: coinsHere || used, title: coinsHere || used ? `${need} ${coin} for your @handle` : `Waiting for ${need} ${coin}`, body: s2 },
     { done: false, title: "Claim your @handle", body: s3 },
   ];
   $("h-steps").replaceChildren(...steps.map((x, i) => h("li", { class: x.done ? "done" : "" },
