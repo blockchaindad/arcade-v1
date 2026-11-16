@@ -13,10 +13,16 @@ pub const NET: &str = "arcade-main"; // one mesh for every chain (verified live)
 /// ones (those go in --peer), and each checked to link (wss://pepecoinarcade.com/mesh and
 /// 156.67.28.112 are one arcade under two names; both stay, as either may be the one a
 /// network lets through).
+///
+/// The Ashburn relay is listed under its name too (wss://, TLS on 443, DNS only: no proxy, no tunnel): on a network
+/// that lets a new connection out only to an address it just looked up, the IP is refused while the name gets through
+/// (@sesame_node on @strawberry/arcade-v1 #5: ARCADE testnet from block 0 to 532 within a minute). The IP stays, so
+/// nothing depends on DNS.
 pub const SEEDS: &[&str] = &[
     "wss://pepecoinarcade.com/mesh",
     "156.67.28.112:8421",
     "207.244.232.43:8421",
+    "wss://ashburn.martinseeger.com/mesh",
     "147.124.204.26:8421",
 ];
 
