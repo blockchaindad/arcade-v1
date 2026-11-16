@@ -604,8 +604,8 @@ pub fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> 
     let mut last_me = std::time::Instant::now();
     let mut last_offer = crate::coreshare::offer(node).map(|o| o.head["nets"].clone()).unwrap_or(Value::Null);
     // Core-style calls over this link (coreshare) are answered for this peer: the addresses
-    // it watches are its own.
-    let r = crate::rpc::as_caller(&peer, || {
+    // it watches are its own (and counted with those of other node ids on its host).
+    let r = crate::rpc::as_caller(&peer, &crate::refill::host_group(addr), || {
         serve_loop(node, link, addr, &peer, conn, &mut cr_reqs, &mut last_ping, &mut sent_outbox, &mut last_sz, &mut last_hold, &mut last_me, &mut last_offer)
     });
     crate::crvia::down(&peer);
@@ -785,10 +785,30 @@ fn refresh_bk(node: &Node, addr: &str, height: u64) {
     }
 }
 
+/// Arcades' offers kept at most. Each comes over a link of the arcade's own, but node ids cost
+/// nothing to make: past it, offers older than OFFER_AGE (no longer used) go, then the oldest of
+/// an arcade not linked now.
+const OFFERS_MAX: usize = 512;
+const OFFER_AGE: u64 = 3 * 3600;
+
+/// Make room for one more offer (`linked`: the node ids linked now, never pushed out first).
+fn room_for_offer(all: &mut std::collections::BTreeMap<String, crate::node::Offer>, linked: &[String], now: u64) {
+    all.retain(|_, o| o.at.saturating_add(OFFER_AGE) >= now);
+    while all.len() >= OFFERS_MAX {
+        let oldest = |only_unlinked: bool| all.iter().filter(|(id, _)| !only_unlinked || !linked.contains(id)).min_by_key(|(_, o)| o.at).map(|(id, _)| id.clone());
+        let Some(id) = oldest(true).or_else(|| oldest(false)) else { break };
+        all.remove(&id);
+    }
+}
+
 /// Remember which chains an arcade offers (and where to dial it).
 fn note_offer(node: &Node, id: &str, addr: &str, kind: &str, nets: &Value) {
     let Some(nets) = nets.as_object() else { return };
+    let linked = crate::shares::linked_ids(node);
     let mut all = node.offers.lock().unwrap();
+    if !all.contains_key(id) && all.len() >= OFFERS_MAX {
+        room_for_offer(&mut all, &linked, now());
+    }
     let o = all.entry(id.to_string()).or_default();
     o.at = now();
     if !addr.ends_with(":0") {
@@ -1012,7 +1032,8 @@ mod tests {
 
 #[cfg(test)]
 mod bk_tests {
-    use super::refresh_bk;
+    use super::{note_offer, refresh_bk, room_for_offer, OFFERS_MAX, OFFER_AGE};
+    use serde_json::json;
     use crate::sitesvc::tests::setup;
 
     #[test]
@@ -1027,5 +1048,28 @@ mod bk_tests {
         assert_eq!(bk["203.0.113.5:8421"], 25, "the same host, its own announced port");
         assert_eq!(bk["wss://relay.example/mesh"], 30);
         assert_eq!(bk["198.51.100.7:8421"], 10, "another arcade's untouched");
+    }
+
+    #[test]
+    fn offers_are_bounded_and_linked_arcades_stay() {
+        let mut all: std::collections::BTreeMap<String, crate::node::Offer> = Default::default();
+        let now = 1_000_000;
+        let offer = |at: u64| crate::node::Offer { at, addr: "198.51.100.7:8421".into(), ..Default::default() };
+        all.insert("linked".into(), offer(now - 100));
+        all.insert("stale".into(), offer(now - OFFER_AGE - 1));
+        for i in 0..OFFERS_MAX as u64 {
+            all.insert(format!("x{i}"), offer(now - 50 + i % 10));
+        }
+        room_for_offer(&mut all, &["linked".to_string()], now);
+        assert_eq!(all.len(), OFFERS_MAX - 1);
+        assert!(all.contains_key("linked"), "the oldest, but linked now");
+        assert!(!all.contains_key("stale"));
+        // Through note_offer: a flood of new ids keeps the map at OFFERS_MAX.
+        let t = crate::sitesvc::tests::setup();
+        let net = t.p.net;
+        for i in 0..(OFFERS_MAX + 50) {
+            note_offer(&t.node, &format!("{i:064x}"), "198.51.100.7:8421", "bk", &json!({net: {"h": 5}}));
+        }
+        assert_eq!(t.node.offers.lock().unwrap().len(), OFFERS_MAX);
     }
 }

@@ -46,6 +46,17 @@ const KEEP_RECENT: u32 = 10_000;
 /// The shared history line moves in steps of this many blocks.
 const STEP: u32 = 100_000;
 
+/// Other arcades' holds kept at most, and at most from what one link brought (node ids cost
+/// nothing to make, so neither may grow with them); a hold not renewed within HOLD_AGE is
+/// forgotten (an arcade sends its own every two minutes at most).
+const HOLDS_MAX: usize = 512;
+const HOLDS_PER_LINK: usize = 128;
+const HOLD_AGE: u64 = 3600;
+/// Block ranges kept per chain of a hold, and in all of one hold: an arcade holds its stretch of
+/// the lanes and the recent blocks, a few runs.
+const HOLD_RUNS: usize = 64;
+const HOLD_RUNS_ALL: usize = 256;
+
 /// How many arcades should hold each piece (ARCADE_SHARE_COPIES overrides, for tests).
 /// Seconds between balancing passes (ARCADE_SHARE_EVERY overrides, for tests).
 pub fn every() -> u64 {
@@ -219,14 +230,26 @@ fn signed(c: &Value) -> bool {
     c["_unsigned"] != true
 }
 
+/// The host an arcade's mesh link comes from, or came from (its offer's address, which is only
+/// ever taken from a link of its own), as crate::refill::host_group. None for an arcade only
+/// heard of through others: what it says about itself is all there is.
+pub fn holder_host(node: &Node, id: &str) -> Option<String> {
+    let linked = node.links.lock().unwrap().values().find(|l| l.node_id == id).map(|l| l.addr.clone());
+    let addr = linked.or_else(|| node.offers.lock().unwrap().get(id).map(|o| o.addr.clone()));
+    addr.map(|a| crate::refill::host_group(&a)).filter(|h| !h.is_empty())
+}
+
 /// Other arcades whose signed holds count towards range `r` being held enough elsewhere:
 /// those owning it in the lanes (their own copy is never dropped), or keeping everything (Full).
+/// Counted by host (holder_host), not by node id: ids made up on one machine count once, and a
+/// holder with no known host doesn't count, so they can't make this arcade drop blocks.
 fn counted_holders(node: &Node, chain: &str, r: u32, owners: &[String]) -> usize {
-    let holds = node.holds.lock().unwrap().clone();
-    holders(node, chain, "blocks", r as u64)
-        .into_iter()
-        .filter(|id| holds.get(id).is_some_and(|(_, c)| signed(c) && (owners.contains(id) || c[chain]["mode"] != "shared")))
-        .count()
+    let ids = holders(node, chain, "blocks", r as u64);
+    let ids: Vec<String> = {
+        let holds = node.holds.lock().unwrap();
+        ids.into_iter().filter(|id| holds.get(id).is_some_and(|(_, c)| signed(c) && (owners.contains(id) || c[chain]["mode"] != "shared"))).collect()
+    };
+    ids.iter().filter_map(|id| holder_host(node, id)).collect::<BTreeSet<String>>().len()
 }
 
 /// Other arcades announcing they hold `unit` of `kind` on a chain: their node ids.
@@ -429,8 +452,8 @@ pub fn balance(node: &Node, p: &'static ChainParams) -> Result<String, String> {
         }
         let owners = lane_holders(&pl, r, last_full);
         let mine = owners.contains(&mine_id);
-        // Count only holders that own the range in the lanes or keep everything (Full); a
-        // stale announcement from another sharer, or an unsigned one, doesn't count.
+        // Count only holders that own the range in the lanes or keep everything (Full), one per
+        // host; a stale announcement from another sharer, or an unsigned one, doesn't count.
         let others = counted_holders(node, p.net, r, &owners);
         let (from, to) = (r * RANGE, (r + 1) * RANGE - 1);
         if !mine && !gone.contains(&r) && others >= copies() && to <= walked {
@@ -448,7 +471,7 @@ pub fn balance(node: &Node, p: &'static ChainParams) -> Result<String, String> {
             }
             gone.insert(r);
             set_pruned(node, p.net, &gone);
-            let _ = node.app.event("shares", &format!("{}: blocks {from}-{to} are held by {others} other arcades; dropped them here ({:.1} MB)", p.name, freed as f64 / 1e6));
+            let _ = node.app.event("shares", &format!("{}: blocks {from}-{to} are held by other arcades on {others} hosts; dropped them here ({:.1} MB)", p.name, freed as f64 / 1e6));
             work += 1;
         } else if mine && gone.contains(&r) {
             let mut h = from;
@@ -625,12 +648,6 @@ pub(crate) fn ask_explorer_at(node: &Node, p: &ChainParams, id: &str, cmd: &str,
     Some(r)
 }
 
-/// The host a holder answers from: its link's address when linked, else where it is dialed.
-pub(crate) fn holder_host(node: &Node, id: &str) -> Option<String> {
-    let linked = node.links.lock().unwrap().values().find(|l| l.node_id == id).map(|l| l.addr.clone()).filter(|a| !a.is_empty());
-    linked.or_else(|| addr_of(node, id)).map(|a| crate::refill::host_of(&a))
-}
-
 /// Ask the arcades holding `unit` of `kind` until one answers.
 pub fn ask_holders(node: &Node, p: &ChainParams, kind: &str, unit: u64, what: &str, arg: &str) -> Result<(Value, String), String> {
     ask_holders_with(node, p, kind, unit, what, arg, json!({}))
@@ -693,7 +710,8 @@ pub fn answer(node: &Node, link: &mut Link, h: &Value) -> Result<(), LinkError> 
             // A DigiDollar market question (ddmarket.rs): this arcade's own orders and fills.
             "mk" => crate::ddmarket::answer(node, arg),
             // A login on this arcade's media relay for one of the asker's players (turnsvc.rs).
-            "tu" => crate::turnsvc::answer_tu(&link.peer_id, arg),
+            // Lent per host of the asking link (node ids cost nothing to make).
+            "tu" => crate::turnsvc::answer_tu(&link.peer_id, &holder_host(node, &link.peer_id).unwrap_or_else(|| format!("node {}", link.peer_id)), arg),
             _ => Err("unknown question".to_string()),
         }
     })();
@@ -756,12 +774,17 @@ pub fn on_hold(node: &Node, from: &str, h: &Value) {
             node.mesh_outbox.lock().unwrap().push(h.clone());
         }
     }
-    let from = origin.as_str();
     let mut clean = Map::new();
+    let mut runs_left = HOLD_RUNS_ALL;
     for (k, v) in c.iter().take(32) {
         if arcade_chain::params::by_net(k).is_some() {
             let ix: Vec<Value> = v["ix"].as_array().map(|a| a.iter().take(16).filter(|x| x.as_str().is_some_and(|s| s.len() <= 16)).cloned().collect()).unwrap_or_default();
-            let mut e = json!({"mode": v["mode"], "h": v["h"], "blocks": v["blocks"], "ord": v["ord"], "tok": v["tok"], "lane": v["lane"], "pos": v["pos"], "ix": ix});
+            // Only the fields read here, each in its form and size (anything else is dropped).
+            let mode = v["mode"].as_str().filter(|m| m.len() <= 16);
+            let lane = v["lane"].as_u64().filter(|l| *l < 16);
+            let pos = v["pos"].as_f64().filter(|x| (0.0..1.0).contains(x));
+            let blocks = clean_runs(&v["blocks"], &mut runs_left);
+            let mut e = json!({"mode": mode, "h": v["h"].as_u64(), "blocks": blocks, "ord": clean_groups(&v["ord"]), "tok": clean_groups(&v["tok"]), "lane": lane, "pos": pos, "ix": ix});
             if let Some(rw) = crate::rulecheck::clean_watch(&v["rw"]) {
                 e["rw"] = rw;
             }
@@ -774,7 +797,67 @@ pub fn on_hold(node: &Node, from: &str, h: &Value) {
     if !signed {
         clean.insert("_unsigned".into(), json!(true));
     }
-    node.holds.lock().unwrap().insert(from.to_string(), (arcade_app::now(), Value::Object(clean)));
+    keep_hold(&mut node.holds.lock().unwrap(), &origin, from, Value::Object(clean), arcade_app::now());
+}
+
+/// A hold's block ranges as kept: "all", or up to HOLD_RUNS [from, to] runs (and no more than
+/// `left` in all, which it takes from). Fewer runs only ever make an arcade look to hold less.
+fn clean_runs(v: &Value, left: &mut usize) -> Value {
+    match v {
+        Value::String(s) if s == "all" => json!("all"),
+        Value::Array(a) => {
+            let runs: Vec<Value> = a
+                .iter()
+                .filter_map(|r| {
+                    let (f, t) = (r[0].as_u64()?, r[1].as_u64()?);
+                    (f <= t).then(|| json!([f, t]))
+                })
+                .take(HOLD_RUNS.min(*left))
+                .collect();
+            *left -= runs.len();
+            Value::Array(runs)
+        }
+        _ => Value::Null,
+    }
+}
+
+/// A hold's ord or token groups as kept: "all", or the group numbers (each once).
+fn clean_groups(v: &Value) -> Value {
+    match v {
+        Value::String(s) if s == "all" => json!("all"),
+        Value::Array(a) => json!(a.iter().filter_map(|g| g.as_u64().filter(|g| *g < GROUPS as u64)).collect::<BTreeSet<u64>>()),
+        _ => Value::Null,
+    }
+}
+
+/// Keep arcade `id`'s hold, noting the link it came over (`_via`). Holds not renewed within
+/// HOLD_AGE go first. Then, while that link brought HOLDS_PER_LINK of them, or all links
+/// HOLDS_MAX, the oldest hold from the link that brought the most makes way: holds made up
+/// with new ids push out only each other, not those of the arcades linked here.
+fn keep_hold(holds: &mut std::collections::BTreeMap<String, (u64, Value)>, id: &str, via: &str, mut v: Value, now: u64) {
+    v["_via"] = json!(via);
+    holds.retain(|_, (t, _)| t.saturating_add(HOLD_AGE) >= now);
+    let via_of = |c: &Value| c["_via"].as_str().unwrap_or("").to_string();
+    if !holds.get(id).is_some_and(|(_, c)| via_of(c) == via) {
+        holds.remove(id);
+        let oldest_via = |holds: &std::collections::BTreeMap<String, (u64, Value)>, link: &str| {
+            holds.iter().filter(|(_, (_, c))| via_of(c) == link).min_by_key(|(_, (t, _))| *t).map(|(k, _)| k.clone())
+        };
+        while holds.values().filter(|(_, c)| via_of(c) == via).count() >= HOLDS_PER_LINK {
+            let Some(k) = oldest_via(holds, via) else { break };
+            holds.remove(&k);
+        }
+        while holds.len() >= HOLDS_MAX {
+            let mut per: std::collections::BTreeMap<String, usize> = Default::default();
+            for (_, c) in holds.values() {
+                *per.entry(via_of(c)).or_default() += 1;
+            }
+            let Some(busiest) = per.into_iter().max_by_key(|(_, n)| *n).map(|(l, _)| l) else { break };
+            let Some(k) = oldest_via(holds, &busiest) else { break };
+            holds.remove(&k);
+        }
+    }
+    holds.insert(id.to_string(), (now, v));
 }
 
 #[cfg(test)]
@@ -789,6 +872,8 @@ mod tests {
         let kid = hex::encode(k.verifying_key().to_bytes());
         let link = "ab".repeat(32);
         let now = arcade_app::now();
+        // It was linked here once, from its own host.
+        t.node.offers.lock().unwrap().insert(kid.clone(), crate::node::Offer { at: now, addr: "203.0.113.5:8421".into(), ..Default::default() });
         let full = json!({net: {"mode": "full", "h": 100, "blocks": "all", "ord": "all", "tok": "all"}});
         // Another arcade's hold, unsigned, from a link: dropped, not passed on.
         let forged = json!({"t": "sh", "op": "hold", "chains": full, "o": kid, "at": now});
@@ -846,6 +931,109 @@ mod tests {
         arcade_mesh::canon::sign_json(&k, &mut ok, &["sig"], b"");
         on_hold(&t.node, &link, &ok);
         assert_eq!(t.node.mesh_outbox.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn holders_count_once_per_host() {
+        let t = crate::sitesvc::tests::setup();
+        let net = t.p.net;
+        let now = arcade_app::now();
+        let full = json!({net: {"mode": "full", "h": 100, "blocks": "all", "ord": "all", "tok": "all"}});
+        // A signed hold from a new node id, which was linked here from `addr` ("": never linked).
+        let hold = |seed: u8, addr: &str| {
+            let k = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+            let id = hex::encode(k.verifying_key().to_bytes());
+            if !addr.is_empty() {
+                t.node.offers.lock().unwrap().insert(id.clone(), crate::node::Offer { at: now, addr: addr.into(), ..Default::default() });
+            }
+            let mut h = json!({"t": "sh", "op": "hold", "chains": full, "o": id, "at": now});
+            arcade_mesh::canon::sign_json(&k, &mut h, &["sig"], b"");
+            on_hold(&t.node, &"ab".repeat(32), &h);
+        };
+        // Three node ids keeping everything, all on one machine: one holder.
+        for (i, a) in ["198.51.100.7:8421", "198.51.100.7:9000", "[::ffff:198.51.100.7]:8421"].iter().enumerate() {
+            hold(10 + i as u8, a);
+        }
+        assert_eq!(counted_holders(&t.node, net, 0, &[]), 1);
+        // Two in one IPv6 /64: one more.
+        for (i, a) in ["[2001:db8:5:6::1]:8421", "[2001:db8:5:6::2]:8421"].iter().enumerate() {
+            hold(20 + i as u8, a);
+        }
+        assert_eq!(counted_holders(&t.node, net, 0, &[]), 2);
+        // Heard of only through others: its host is unknown, so it doesn't count.
+        hold(30, "");
+        assert_eq!(holders(&t.node, net, "blocks", 0).len(), 6);
+        assert_eq!(counted_holders(&t.node, net, 0, &[]), 2);
+        // A linked arcade counts by the address of its link.
+        hold(31, "");
+        let k31 = hex::encode(ed25519_dalek::SigningKey::from_bytes(&[31; 32]).verifying_key().to_bytes());
+        crate::node::link_add(&t.node.links, "192.0.2.44:8421", &k31, now);
+        assert_eq!(counted_holders(&t.node, net, 0, &[]), 3);
+    }
+
+    #[test]
+    fn index_holders_spread_over_hosts() {
+        let host = |id: &str| match id {
+            "a1" | "a2" | "a3" => Some("198.51.100.7".to_string()),
+            "b" => Some("192.0.2.44".to_string()),
+            _ => None,
+        };
+        let v: Vec<(String, u64)> = ["a1", "a2", "x", "a3", "b"].iter().map(|s| (s.to_string(), 100)).collect();
+        let order: Vec<String> = spread_hosts(v, host).into_iter().map(|x| x.0).collect();
+        assert_eq!(order, ["a1", "b", "a2", "a3", "x"]);
+    }
+
+    #[test]
+    fn holds_are_bounded_per_link_in_all_and_by_age() {
+        let mut h = std::collections::BTreeMap::new();
+        let now = 1_000_000;
+        keep_hold(&mut h, "linked", "linked", json!({}), now);
+        // Made-up ids over one link: that link keeps HOLDS_PER_LINK, the newest.
+        for i in 0..1000u64 {
+            keep_hold(&mut h, &format!("x{i}"), "flood", json!({}), now + i);
+        }
+        assert_eq!(h.values().filter(|(_, c)| c["_via"] == "flood").count(), HOLDS_PER_LINK);
+        assert!(h.contains_key("x999") && !h.contains_key("x0"));
+        // Over many links: HOLDS_MAX in all, the busiest links give way, the linked arcade stays.
+        for l in 0..10u64 {
+            for i in 0..100u64 {
+                keep_hold(&mut h, &format!("y{l}-{i}"), &format!("link{l}"), json!({}), now + 1000 + l * 100 + i);
+            }
+        }
+        assert_eq!(h.len(), HOLDS_MAX);
+        assert!(h.contains_key("linked"));
+        // Renewed over its own link: no one makes way.
+        keep_hold(&mut h, "linked", "linked", json!({}), now + 2500);
+        assert_eq!(h.len(), HOLDS_MAX);
+        // Not renewed within HOLD_AGE: gone.
+        keep_hold(&mut h, "late", "linked", json!({}), now + 2500 + HOLD_AGE + 1);
+        assert_eq!(h.keys().collect::<Vec<_>>(), ["late"]);
+    }
+
+    #[test]
+    fn a_hold_keeps_only_checked_fields_in_bounded_size() {
+        let t = crate::sitesvc::tests::setup();
+        let k = ed25519_dalek::SigningKey::from_bytes(&[40u8; 32]);
+        let kid = hex::encode(k.verifying_key().to_bytes());
+        let runs: Vec<Value> = (0..5000u64).map(|i| json!([i * 2, i * 2])).collect();
+        let nets: Vec<&str> = arcade_chain::params::ALL_CHAINS.iter().map(|p| p.net).take(8).collect();
+        let mut chains = Map::new();
+        for n in &nets {
+            chains.insert(n.to_string(), json!({"mode": "x".repeat(1000), "h": "9".repeat(5000), "blocks": runs, "ord": (0..5000u64).collect::<Vec<_>>(),
+                "tok": "all", "lane": 99, "pos": 7.5, "junk": "y".repeat(10_000)}));
+        }
+        let mut h = json!({"t": "sh", "op": "hold", "chains": chains, "o": kid, "at": arcade_app::now()});
+        arcade_mesh::canon::sign_json(&k, &mut h, &["sig"], b"");
+        on_hold(&t.node, &"ab".repeat(32), &h);
+        let kept = t.node.holds.lock().unwrap()[&kid].1.clone();
+        let c = &kept[nets[0]];
+        assert_eq!(c["ord"].as_array().unwrap().len(), GROUPS as usize);
+        assert_eq!(c["tok"], "all");
+        assert!(c["mode"].is_null() && c["h"].is_null() && c["lane"].is_null() && c["pos"].is_null() && c.get("junk").is_none(), "{c}");
+        // HOLD_RUNS per chain, HOLD_RUNS_ALL in all (the chains taken first get theirs).
+        let per: Vec<usize> = nets.iter().map(|n| kept[*n]["blocks"].as_array().map(|a| a.len()).unwrap_or(0)).collect();
+        assert!(per.iter().all(|n| *n <= HOLD_RUNS) && per.contains(&HOLD_RUNS), "{per:?}");
+        assert_eq!(per.iter().sum::<usize>(), HOLD_RUNS_ALL);
     }
 
     /// Arcades joining one by one, each choosing its place from those already there.
@@ -996,7 +1184,16 @@ pub fn index_holders(node: &Node, net: &str, ix: &str) -> Vec<(String, u64)> {
         .collect();
     v.sort_by(|a, b| b.1.cmp(&a.1));
     let own = arcade_chain::params::by_net(net).and_then(|p| node.chain.tip(p.chain_no).ok().flatten()).map(|t| t.height as u64);
-    caught_up(v, own)
+    spread_hosts(caught_up(v, own), |id| holder_host(node, id))
+}
+
+/// One holder per host first (in order), then the rest: node ids made up on one machine can't
+/// take every place asked first. Holders with no known host (heard of only through others) go last.
+fn spread_hosts(v: Vec<(String, u64)>, host: impl Fn(&str) -> Option<String>) -> Vec<(String, u64)> {
+    let mut seen = BTreeSet::new();
+    let (first, rest): (Vec<_>, Vec<_>) = v.into_iter().partition(|(id, _)| host(id).is_some_and(|h| seen.insert(h)));
+    let (known, unknown): (Vec<_>, Vec<_>) = rest.into_iter().partition(|(id, _)| host(id).is_some());
+    first.into_iter().chain(known).chain(unknown).collect()
 }
 
 /// How far behind the highest holder an arcade may be and still answer for a chain.

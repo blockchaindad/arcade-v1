@@ -38,6 +38,16 @@ pub const SENT_GRACE: u64 = 300;
 pub const REOPEN_SPREAD: u64 = 300;
 /// Payment notices kept per asker (the newest).
 const SENT_KEPT: usize = 8;
+/// Askers kept at most with an ask, with payment notices, and closed: past it a new one is
+/// neither kept nor passed on (records are signed, but node keys cost nothing to make). An ask
+/// is kept only while fresh and only up to ASK_BYTES (a real one is a few hundred bytes).
+const MAX_ASKERS: usize = 5_000;
+const ASK_BYTES: usize = 1024;
+
+/// Still within ASK_DAYS of `now`.
+fn ask_fresh(at: u64, now: u64) -> bool {
+    now.saturating_sub(at) < arcade_mesh::welcome::ASK_DAYS * 86_400
+}
 /// "At the tip" for paying and for calling a payment missing: at most this many blocks behind.
 const MAX_LAG: u32 = 2;
 
@@ -140,9 +150,19 @@ pub fn on_welcome(node: &Node, head: &Value) {
         match r["k"].as_str() {
             Some("ask") => {
                 if let Some(a) = r["a"].as_str() {
-                    let fresh = r["at"].as_u64().is_some_and(|t| arcade_app::now().saturating_sub(t) < arcade_mesh::welcome::ASK_DAYS * 86_400);
+                    let now = arcade_app::now();
+                    let fresh = r["at"].as_u64().is_some_and(|t| ask_fresh(t, now));
+                    if !fresh || r.to_string().len() > ASK_BYTES {
+                        continue;
+                    }
                     let newer = {
                         let mut asks = node.asks.lock().unwrap();
+                        if !asks.contains_key(a) && asks.len() >= MAX_ASKERS {
+                            asks.retain(|_, o| o["at"].as_u64().is_some_and(|t| ask_fresh(t, now)));
+                            if asks.len() >= MAX_ASKERS {
+                                continue;
+                            }
+                        }
                         let newer = asks.get(a).map(|o| o["at"].as_u64() < r["at"].as_u64()).unwrap_or(true);
                         if newer {
                             asks.insert(a.to_string(), r.clone());
@@ -151,7 +171,7 @@ pub fn on_welcome(node: &Node, head: &Value) {
                     };
                     // Passed on once to every link, so an ask reaches arcades with coins that
                     // the asker isn't linked to (before, only its direct links heard it).
-                    if newer && fresh {
+                    if newer {
                         relay(node, r);
                     }
                 }
@@ -165,7 +185,17 @@ pub fn on_welcome(node: &Node, head: &Value) {
             }
             Some("closed") => {
                 if let Some(a) = r["a"].as_str() {
-                    node.asks_done.lock().unwrap().insert(a.to_string());
+                    let mut done = node.asks_done.lock().unwrap();
+                    if !done.contains(a) && done.len() >= MAX_ASKERS {
+                        // Full: only askers with an ask kept here stay closed.
+                        let asks = node.asks.lock().unwrap();
+                        done.retain(|x| asks.contains_key(x));
+                        if done.len() >= MAX_ASKERS {
+                            continue;
+                        }
+                    }
+                    done.insert(a.to_string());
+                    drop(done);
                     node.asks_sent.lock().unwrap().remove(a);
                 }
             }
@@ -212,6 +242,12 @@ fn note_sent(node: &Node, asker: &str, txid: &str, at: u64, now: u64) -> bool {
         return false;
     }
     let mut sent = node.asks_sent.lock().unwrap();
+    if !sent.contains_key(asker) && sent.len() >= MAX_ASKERS {
+        sent.retain(|_, l| l.iter().any(|(_, t)| ask_fresh(*t, now)));
+        if sent.len() >= MAX_ASKERS {
+            return false;
+        }
+    }
     let list = sent.entry(asker.to_string()).or_default();
     if list.iter().any(|(t, _)| t == txid) {
         return false;
@@ -600,5 +636,64 @@ mod tests {
         assert_eq!(last(&t).txid, Some(t.spend.txid.to_hex()), "a payment that arrived is not replaced");
         age(&t);
         assert!(!ask_if_needed(&t.node, &mine, "").unwrap(), "paid: no new ask");
+    }
+
+    #[test]
+    fn asks_from_many_new_ids_are_bounded() {
+        let t = setup();
+        let now = arcade_app::now();
+        let outbox = |t: &crate::sitesvc::tests::T| t.node.mesh_outbox.lock().unwrap().len();
+        // Stale, or padded far past a real ask: neither kept nor passed on.
+        let k = key(50);
+        on_welcome(&t.node, &wl(arcade_mesh::welcome::ask(&k, &addr(&t, 9), "", now - arcade_mesh::welcome::ASK_DAYS * 86_400 - 1)));
+        let padded = arcade_mesh::welcome::sign(json!({"a": id(&k), "addr": addr(&t, 9), "at": now, "k": "ask", "tag": "x".repeat(2000)}), &k);
+        on_welcome(&t.node, &wl(padded));
+        assert!(t.node.asks.lock().unwrap().is_empty());
+        assert_eq!(outbox(&t), 0);
+        // Full of fresh asks: a new asker is neither kept nor passed on; a known one still is.
+        {
+            let mut asks = t.node.asks.lock().unwrap();
+            for i in 0..MAX_ASKERS {
+                asks.insert(format!("{i:064x}"), json!({"at": now}));
+            }
+        }
+        on_welcome(&t.node, &wl(arcade_mesh::welcome::ask(&k, &addr(&t, 9), "", now)));
+        assert!(!t.node.asks.lock().unwrap().contains_key(&id(&k)));
+        assert_eq!(outbox(&t), 0);
+        // Once those are stale they make way.
+        for v in t.node.asks.lock().unwrap().values_mut() {
+            v["at"] = json!(now - arcade_mesh::welcome::ASK_DAYS * 86_400 - 1);
+        }
+        on_welcome(&t.node, &wl(arcade_mesh::welcome::ask(&k, &addr(&t, 9), "", now)));
+        assert_eq!(t.node.asks.lock().unwrap().len(), 1);
+        assert_eq!(outbox(&t), 1);
+        // Payment notices and closed askers: bounded the same way.
+        {
+            let mut sent = t.node.asks_sent.lock().unwrap();
+            for i in 0..MAX_ASKERS {
+                sent.insert(format!("{i:064x}"), vec![(NO_SUCH_TX.to_string(), now)]);
+            }
+        }
+        assert!(!note_sent(&t.node, "new-asker", NO_SUCH_TX, now, now));
+        // Closed askers: past the bound, those without an ask kept here make way.
+        {
+            let mut done = t.node.asks_done.lock().unwrap();
+            for i in 0..MAX_ASKERS {
+                done.insert(format!("{i:064x}"));
+            }
+        }
+        let closed = |k: &SigningKey| arcade_mesh::welcome::sign(json!({"a": id(k), "at": now, "k": "closed"}), k);
+        on_welcome(&t.node, &wl(closed(&k)));
+        assert_eq!(t.node.asks_done.lock().unwrap().iter().cloned().collect::<Vec<_>>(), [id(&k)]);
+        // All of them with an ask here: a new one is not kept.
+        {
+            let (mut asks, mut done) = (t.node.asks.lock().unwrap(), t.node.asks_done.lock().unwrap());
+            for i in 0..MAX_ASKERS {
+                asks.insert(format!("{i:064x}"), json!({"at": now}));
+                done.insert(format!("{i:064x}"));
+            }
+        }
+        on_welcome(&t.node, &wl(closed(&key(51))));
+        assert!(!t.node.asks_done.lock().unwrap().contains(&id(&key(51))));
     }
 }
