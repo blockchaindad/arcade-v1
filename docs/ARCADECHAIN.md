@@ -74,6 +74,12 @@ Index tables themselves (state) aren't paid: they change every block, so they ca
 
 **Listed chains** are written in the chain rules: at genesis, every chain V1.0 follows (Pepecoin, Pepecoin testnet, Dogecoin, DigiByte, Flopcoin, Wojakcoin, Kotia, Litecoin) plus **Bitcoin**. Adding a chain or family later is a rule upgrade (a new version all arcades take, activated at a set ARCADE height).
 
+*As built (`listed` in crates/arcade-arc/src/params.rs, the one source; ARCADE #6):*
+- **Mainnet:** `arc`, `pep`, `peptest`, `doge`, `dgb`, `flop`, `wjk`, `kot`, `ltc`, `btc`.
+- **Testnet:** `arctest`, `pep`, `peptest`, `doge`, `dgb`, `dgbtest`, `flop`, `wjk`, `kot`, `ltc`, `ltctest`, `btc`.
+- **Not listed, so never sealed or paid:** `shic`, `bel`, `lky`, `jkc`, though Coins & Chains offers them. Their Earn card reads *not paid on this network*, and `arc.earn` says `"paid": false` and refuses to switch on.
+- **Families paid on a listed chain kept in full** (crates/arcaded/src/arcseg.rs `families`): blocks, coins, and the journaled indexes ord, names, tokens, maps (riders of ord's journal), ledger, profiles, messages, tags. The ARCADE chain's own are blocks and blobs. The addresses, collections and dogefeed indexes have no journal family yet, and an index taken in as a copy has no journals from its start: none of these is sealed or paid. `arc.earn` names them in `not_paid` with the reason, and the Earn card lists them.
+
 Bitcoin needs work V1.0 doesn't have yet:
 - Keeping Bitcoin at all: about 650 GB of blocks; the chain parameters exist (`btc`), but nothing syncs it fully today.
 - Bitcoin's inscriptions and runes live in **witness data**. V1.0's ord indexer reads only the scriptSig envelopes of the Dogecoin family, so Bitcoin ord and runes journals need new indexers.
@@ -527,7 +533,7 @@ Everything here follows from the source chain alone, so every arcade that keeps 
 
 Which segments exist, as every arcade agrees on them. Kept by the blocks: catalog items are in a block's storage section (at most 64 per block), and a branch change takes them back block by block.
 
-- **Listed chains.** Mainnet: `pep`, `peptest`, `doge`, `dgb`, `flop`, `wjk`, `kot`, `ltc`, `btc`. The testnet lists the same and the two other test chains V1.0 follows, `dgbtest` and `ltctest`, so the testnet has small chains to work on. Only the blocks family (0) exists.
+- **Listed chains.** Mainnet: `arc`, `pep`, `peptest`, `doge`, `dgb`, `flop`, `wjk`, `kot`, `ltc`, `btc`. The testnet lists `arctest` in place of `arc`, the same coins, and the two other test chains V1.0 follows, `dgbtest` and `ltctest`, so the testnet has small chains to work on. The families are those of §2.3's *as built* list (blocks first; coins and the index journals since; blobs on the ARCADE chain).
 - **Rows of spans.** For each family of each listed chain the catalog holds a row of spans from height 0 on, each starting where the one before ended. A span holds one confirmed segment, or nothing where its segment was proved wrong and removed.
 - **An entry** is `{chain, family, first, last, bytes, manifest, root, poster, signature}`. Its **segment id** is the tagged hash of `chain, family, first, last, bytes, root`. An entry is taken into a block only if, in this order: its chain is listed; its family exists; `first..=last` are whole ranges; `bytes` is at least the table plus a full segment; its signature is its poster's; its poster has draw weight; its id was never removed; it isn't waiting already; its span is open (the one after the row's last, or a removed entry's with the same first and last); and its poster doesn't stand behind another entry for the same first height.
 - **Offering is attesting.** An **attestation** `{segment id, attester, signature}` is taken if the entry waits, the signature is the attester's, the attester has draw weight, and it stands behind no entry for that first height yet. A key stands behind one entry per first height at a time.
@@ -587,6 +593,7 @@ What Martin asked for, word for word in substance: "Each coin should just have a
 - **One copy:** a sealed piece replaces its plain copy; reads unseal only the leaves they need (about 1.4 µs per 127-byte leaf). The newest, not yet settled data stays plain until it is sealed. Off stops sealing and earning; the sealed data stays the database.
 - **Pay** is still counted per confirmed segment (so arcades agree on what a copy holds): a segment earns once it is sealed here, confirmed and registered. Each index is its own family of segments, in a fixed journal form, so arcades keeping the same index confirm it together; lookup tables keep pointers into the sealed data, not the data.
 - **The ARCADE chain** itself is a listed chain, sealed like any coin, and keeps its blocks once (built: the chain store's copy, whole; no block log).
+- **A chain the network doesn't list** (§2.3) has no switch: its card reads *not paid on this network*. An index with no journal family, or one taken in as a copy, is named under the switch as not paid (ARCADE #6).
 - **Testnet:** restarts with 16 MiB segments (the mainnet's size too, 2026-11-12) so small chains (Pepecoin testnet) take part.
 
 Build order: the sealed-only store for blocks; the switch and its card line; index journals (ord first); the ARCADE chain's single copy; the testnet restart and release.

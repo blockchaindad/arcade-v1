@@ -347,11 +347,22 @@
       cb.disabled = !full; earnBox(st);
     };
     const title = document.createElement("div"); title.className = "earn-h";
-    title.append(Object.assign(document.createElement("img"), { src: "coins/arctest.png", alt: "" }), Object.assign(document.createElement("b"), { textContent: "Earn ARCADE" }), sw);
+    // A chain the ARCADE network doesn't list is never sealed or paid (ARCADE #6): no switch that reads on.
+    const unpaid = e.paid === false;
+    const tag = Object.assign(document.createElement("span"), { className: "earn-np", textContent: "not paid on this network" });
+    title.append(Object.assign(document.createElement("img"), { src: "coins/arctest.png", alt: "" }), Object.assign(document.createElement("b"), { textContent: "Earn ARCADE" }), unpaid ? tag : sw);
     const line = document.createElement("div"); line.className = "earn-line";
     const bar = document.createElement("div"); bar.className = "bar"; const fill = document.createElement("i"); bar.append(fill);
     let pct = 0;
-    if (!full) line.textContent = `Needs ${st.name} kept in full: its whole database is sealed.`;
+    const np = e.not_paid || [];
+    let npLine = null;
+    if (!unpaid && np.length) {
+      npLine = document.createElement("div"); npLine.className = "earn-line";
+      npLine.textContent = `Not paid here: ${np.map((i) => i.index).join(", ")}.`;
+      npLine.title = np.map((i) => `${i.index}: ${i.why}`).join("\n");
+    }
+    if (unpaid) line.textContent = `${st.name} isn't one of this ARCADE network's listed chains, so keeping it earns nothing. Adding a chain is a rules change.`;
+    else if (!full) line.textContent = `Needs ${st.name} kept in full: its whole database is sealed.`;
     else if (!e.on) line.textContent = `Seal ${st.name}'s whole database (one sealed copy, read by unsealing) and earn ARCADE for holding it.`;
     else {
       // The blocks and every index together: one percent, one bar.
@@ -365,7 +376,7 @@
         : `Sealed to block ${fmtN(e.sealed_to)} of ${fmtN(e.of)}${ixText} · ${pct.toFixed(1)}%${sealing} · earning with ${mib(e.weight)} (${share}% of all weight)`;
     }
     fill.style.width = pct + "%";
-    box.replaceChildren(title, line, ...(e.on && full ? [bar] : []));
+    box.replaceChildren(title, line, ...(npLine ? [npLine] : []), ...(e.on && full ? [bar] : []));
   }
 
   function showProgress(st) {

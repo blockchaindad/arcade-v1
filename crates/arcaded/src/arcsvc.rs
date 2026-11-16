@@ -2517,8 +2517,20 @@ pub fn sealing(node: &Node, req: &Value) -> Result<Value, String> {
 pub fn earn(node: &Node, req: &Value) -> Result<Value, String> {
     let key = req["chain"].as_str().ok_or("give a chain")?;
     let p = node.chain_params(key).ok_or_else(|| format!("{key} isn't installed here"))?;
+    // Only the network's listed chains are cut, sealed and paid (§2.3, arcseg::kept), so the switch says so for any
+    // other (ARCADE #6). Before any ARCADE network is known here, nothing is claimed either way.
+    let paid = svc_net().or_else(|| defined_net().map(|d| d.0)).is_none_or(|n| n.listed.contains(&key));
+    let kept_indexes = if key == node.params.key { crate::chains::home_indexes(node) } else { node.extra.lock().unwrap().get(key).map(|r| r.indexes.clone()).unwrap_or_default() };
+    let not_paid: Vec<Value> = if paid {
+        kept_indexes.iter().filter_map(|ix| crate::arcseg::index_unpaid(node, p, ix).map(|why| json!({"index": ix, "why": why}))).collect()
+    } else {
+        Vec::new()
+    };
     if let Some(on) = req["on"].as_bool() {
         if on {
+            if !paid {
+                return Err(format!("{} isn't paid on this ARCADE network: only its listed chains earn (docs/ARCADECHAIN.md §2.3)", p.name));
+            }
             if node.mode_of(key).as_deref() != Some("full") {
                 return Err(format!("Earn ARCADE needs {} kept in full (its whole database is sealed)", p.name));
             }
@@ -2530,9 +2542,10 @@ pub fn earn(node: &Node, req: &Value) -> Result<Value, String> {
         crate::arcseg::set_earn(node, key, on)?;
         let _ = node.app.event("chains", &format!("Earn ARCADE {} for {}", if on { "on" } else { "off" }, p.name));
     }
-    // On by default for a coin kept in full; a coin kept otherwise can't be sealed, so it shows off.
-    let on = crate::arcseg::earn_on(node, key) && node.mode_of(key).as_deref() == Some("full");
-    let Some(svc) = svc() else { return Ok(json!({"chain": key, "on": on, "running": false})) };
+    // On by default for a coin kept in full; a coin kept otherwise can't be sealed, and one the network doesn't list
+    // isn't sealed (arcseg::kept), so both show off.
+    let on = paid && crate::arcseg::earn_on(node, key) && node.mode_of(key).as_deref() == Some("full");
+    let Some(svc) = svc() else { return Ok(json!({"chain": key, "on": on, "paid": paid, "not_paid": not_paid, "running": false})) };
     let (sealed, of) = crate::arcseg::earn_progress(node, &svc.net, p);
     let me = node.identity.verifying_key().to_bytes();
     let (weight, total, pot, height) = {
@@ -2550,7 +2563,7 @@ pub fn earn(node: &Node, req: &Value) -> Result<Value, String> {
             json!({"family": f, "name": crate::arcseg::family_name(f), "sealed_to": to, "of": of})
         })
         .collect();
-    Ok(json!({"chain": key, "on": on, "running": true, "sealed_to": sealed, "of": of, "indexes": indexes, "sealing": sealing, "weight": weight, "total_weight": total,
+    Ok(json!({"chain": key, "on": on, "paid": paid, "not_paid": not_paid, "running": true, "sealed_to": sealed, "of": of, "indexes": indexes, "sealing": sealing, "weight": weight, "total_weight": total,
               "pot": pot, "height": height, "note": update_needed().unwrap_or_else(crate::arcseg::seal_note)}))
 }
 

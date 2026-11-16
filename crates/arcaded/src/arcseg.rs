@@ -226,6 +226,24 @@ pub fn families(node: &Node, p: &ChainParams) -> Vec<u8> {
     v
 }
 
+/// Why an index kept on a listed chain earns nothing here, or None when it is sealed and paid with the coin
+/// (ARCADE #6): only the journaled families are cut, and only when their journals run from the index's start.
+pub fn index_unpaid(node: &Node, p: &ChainParams, index: &str) -> Option<&'static str> {
+    use arcade_chaindb::journal::*;
+    let family = match index {
+        "ord" => ORD,
+        "ledger" => LEDGER,
+        "profiles" => PROFILES,
+        "messages" => MESSAGES,
+        "names" => NAMES,
+        "tokens" => TOKENS,
+        "maps" => MAPS,
+        "tags" => TAGS,
+        _ => return Some("no journal form yet, so it isn't sealed or paid"),
+    };
+    journal_span(node, p, family).is_none().then_some("taken in as a copy or not started: no journals from its start, so it isn't sealed or paid")
+}
+
 /// A family's name for people.
 pub fn family_name(family: u8) -> &'static str {
     use arcade_chaindb::journal::*;
