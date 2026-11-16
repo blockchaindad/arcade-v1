@@ -501,8 +501,48 @@ pub fn listen(node: Arc<Node>, port: u16) {
     accept(node, l);
 }
 
+/// Inbound links once their handshake is done: at most this many in all and from one IP, so links that prove a
+/// free identity can't use up the process's open files.
+const MAX_INBOUND_LINKS: usize = 256;
+const MAX_INBOUND_LINKS_PER_IP: usize = 8;
+
+/// An established inbound link's place, given back when dropped (see MAX_INBOUND_LINKS).
+struct LinkSlot(std::net::IpAddr);
+
+impl LinkSlot {
+    fn take(ip: std::net::IpAddr) -> Option<LinkSlot> {
+        let mut h = inbound_links();
+        let n = h.by_ip.get(&ip).copied().unwrap_or(0);
+        if h.all >= MAX_INBOUND_LINKS || n >= MAX_INBOUND_LINKS_PER_IP {
+            return None;
+        }
+        h.all += 1;
+        h.by_ip.insert(ip, n + 1);
+        Some(LinkSlot(ip))
+    }
+}
+
+impl Drop for LinkSlot {
+    fn drop(&mut self) {
+        inbound_links().give(self.0);
+    }
+}
+
+fn inbound_links() -> std::sync::MutexGuard<'static, Handshakes> {
+    static H: std::sync::OnceLock<std::sync::Mutex<Handshakes>> = std::sync::OnceLock::new();
+    H.get_or_init(Default::default).lock().unwrap()
+}
+
 fn accept(node: Arc<Node>, l: std::net::TcpListener) {
-    for s in l.incoming().flatten() {
+    for s in l.incoming() {
+        // Out of open files or another accept error: wait a moment rather than spin on it.
+        let s = match s {
+            Ok(s) => s,
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+        };
         let Ok(ip) = s.peer_addr().map(|a| a.ip()) else { continue };
         // Too many handshakes under way (from this IP or in all): close it unread.
         let Some(slot) = Slot::take(ip) else { continue };
@@ -523,6 +563,7 @@ fn accept(node: Arc<Node>, l: std::net::TcpListener) {
             done.store(true, std::sync::atomic::Ordering::Relaxed);
             drop(slot);
             let Ok(mut link) = r else { return };
+            let Some(_held) = LinkSlot::take(ip) else { return };
             let addr = format!("{peer_ip}:{}", link.peer_listen.unwrap_or(0));
             let key = crate::node::link_add(&node.links, &addr, &link.peer_id, now());
             let _ = serve(&node, &mut link, &addr);
@@ -557,6 +598,7 @@ pub fn accept_ws(node: Arc<Node>, s: std::net::TcpStream, ip: std::net::IpAddr, 
         done.store(true, std::sync::atomic::Ordering::Relaxed);
         drop(slot);
         let Ok(mut link) = r else { return };
+        let Some(_held) = LinkSlot::take(ip) else { return };
         let addr = format!("{ip}:{}", link.peer_listen.unwrap_or(0));
         let k = crate::node::link_add(&node.links, &addr, &link.peer_id, now());
         let _ = serve(&node, &mut link, &addr);
@@ -1033,5 +1075,21 @@ mod bk_tests {
         assert_eq!(bk["203.0.113.5:8421"], 25, "the same host, its own announced port");
         assert_eq!(bk["wss://relay.example/mesh"], 30);
         assert_eq!(bk["198.51.100.7:8421"], 10, "another arcade's untouched");
+    }
+}
+
+#[cfg(test)]
+mod link_cap_tests {
+    use super::*;
+
+    /// Established inbound links are capped per IP and in all; a place is given back when the link ends.
+    #[test]
+    fn inbound_links_are_capped() {
+        let ip: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        let held: Vec<LinkSlot> = (0..MAX_INBOUND_LINKS_PER_IP).map(|_| LinkSlot::take(ip).expect("under the cap")).collect();
+        assert!(LinkSlot::take(ip).is_none(), "one IP holds at most MAX_INBOUND_LINKS_PER_IP");
+        drop(held);
+        let again = LinkSlot::take(ip);
+        assert!(again.is_some(), "places come back when links end");
     }
 }
