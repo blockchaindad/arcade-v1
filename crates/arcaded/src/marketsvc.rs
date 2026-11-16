@@ -856,7 +856,7 @@ fn dd_terms(node: &Node, chain: &str, m: &Value) -> Result<(String, Option<Strin
             let o = dd_order(node, chain, m)?;
             let cents = units_of(&m["amount"]).ok_or("give the dollars to fill, in cents")? as i64;
             crate::ddmarket::fill_ok(&o, cents)?;
-            let price = crate::ddmarket::fill_price(&o, cents);
+            let price = m["price"].as_u64().unwrap_or_else(|| crate::ddmarket::fill_price(&o, cents));
             let said = if o["side"] == "sell" { format!("buy {} for {}", dollars(cents), dgb_words(chain, price)) } else { format!("sell {} for {}", dollars(cents), dgb_words(chain, price)) };
             Ok((format!("a DigiDollar trade: {said}, in one transaction both sides sign"), o["node"].as_str().map(String::from)))
         }
@@ -906,11 +906,14 @@ pub fn build_request(node: &Node, m: &Value, send: bool) -> Result<(String, u64,
                 let o = dd_order(node, chain, m)?;
                 let maker = o["node"].as_str().unwrap_or("").to_string();
                 let cents = units_of(&m["amount"]).ok_or("give the dollars to fill, in cents")? as i64;
+                // The price the card showed when the request was filed; a request filed before prices were pinned
+                // takes the book's price now.
+                let pinned = m["price"].as_u64().unwrap_or_else(|| crate::ddmarket::fill_price(&o, cents));
                 let (tx_outs, txid, fee) = if send {
-                    let (tx, fee) = crate::ddmarket::take(node, chain, &maker, m["order"].as_str().unwrap_or(""), cents)?;
+                    let (tx, fee) = crate::ddmarket::take(node, chain, &maker, m["order"].as_str().unwrap_or(""), cents, pinned)?;
                     (tx.outputs.iter().map(|o| (o.value, o.script_pubkey.clone())).collect::<Vec<_>>(), tx.txid.to_hex(), fee)
                 } else {
-                    let (_, u, ..) = crate::ddmarket::ask_fill(node, chain, &maker, m["order"].as_str().unwrap_or(""), cents)?;
+                    let (_, u, ..) = crate::ddmarket::ask_fill(node, chain, &maker, m["order"].as_str().unwrap_or(""), cents, pinned)?;
                     (u.outs.iter().map(|o| (o.value, o.script.clone())).collect(), String::new(), u.fee)
                 };
                 let (_, _, _, dd_script, change) = crate::ddsvc::trade_coins(node, p)?;
@@ -959,12 +962,25 @@ pub fn file(node: &Node, page: &str, op: &str, body: &Value) -> (u16, Value) {
             }
         }
     }
+    // A DigiDollar take: pin the DGB the card shows (the book's price now). At the Approve the maker lays out the fill
+    // again, and it goes ahead only at this price or one better for this side (ddmarket::ask_fill).
+    m["price"] = Value::Null;
+    if op == "take" {
+        if let Some(chain) = dd_network(&m) {
+            if let (Ok(o), Some(cents)) = (dd_order(node, chain, &m), units_of(&m["amount"])) {
+                m["price"] = json!(crate::ddmarket::fill_price(&o, cents as i64));
+                if m["node"].is_null() {
+                    m["node"] = o["node"].clone();
+                }
+            }
+        }
+    }
     let (what, to) = match terms(node, &m) {
         Ok(t) => t,
         Err(e) => return (400, json!({"ok": false, "error": e})),
     };
     let market = json!({"op": op, "give": m["give"], "get": m["get"], "order": m["order"], "amount": m["amount"],
-                        "network": m["network"], "node": m["node"], "expires": m["expires"]});
+                        "network": m["network"], "node": m["node"], "expires": m["expires"], "price": m["price"]});
     crate::walletsvc::file_market(node, page, &what, to, market)
 }
 
