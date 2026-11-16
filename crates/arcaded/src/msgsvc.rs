@@ -767,6 +767,10 @@ pub fn publish_addresses(node: &Node, send: bool) -> Result<Value, String> {
     let home = node.ledger_home();
     let (address, tag, sk) = sender_key(node)?;
     let tag = tag.ok_or("claim an @tag first: the addresses go on your @tag's profile")?;
+    // The explorer reads a profile where its @tag is held; one held only on ARCADE has its profile there (ledger.announce).
+    if arcade_ledger::index::tag_of(&node.chain, home.chain_no, &address).ok().flatten().as_deref() != Some(tag.as_str()) {
+        return Err(format!("@{tag} is held on the ARCADE chain, so its profile is there: publish it from People (Publish profile), which lists your addresses"));
+    }
     let prof = arcade_ledger::index::profile(&node.chain, home.chain_no, &address).map_err(|e| e.to_string())?;
     let listed: Vec<(String, String)> = prof.as_ref().and_then(|v| v["linked"].as_array()).into_iter().flatten()
         .filter_map(|l| Some((l["chain"].as_str()?.to_string(), l["address"].as_str()?.to_string()))).collect();
