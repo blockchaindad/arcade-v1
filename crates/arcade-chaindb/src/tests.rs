@@ -466,6 +466,36 @@ fn a_pruned_block_reads_back_from_its_sealed_copy() {
     assert!(f.db.tx_raw(f.p, &cb1.txid).unwrap().is_none());
 }
 
+/// An index added after Earn ARCADE sealed the blocks and pruned their plain bodies: the
+/// backfill reads each block, and each spent output's transaction, from the sealed copy, and
+/// builds the same journal as from plain blocks (it used to stop at the first pruned block).
+#[test]
+fn an_index_backfills_through_sealed_pruned_blocks() {
+    let a = fixture();
+    let c = a.p.chain_no;
+    let cb1 = tx(&[], &[(5000, p2pkh(1))], 1);
+    let b1 = block(a.g.hash(), vec![cb1.clone()], 2);
+    let b2 = block(b1.hash(), vec![tx(&[], &[(1, p2pkh(9))], 2), tx(&[(cb1.txid, 0)], &[(4000, p2pkh(2))], 0)], 3);
+    a.db.connect_blocks(a.p, &[b1.clone(), b2.clone()]).unwrap();
+    a.db.add_indexer(c, std::sync::Arc::new(JournaledCount)).unwrap();
+    while a.db.backfill(a.p, "count", 1).unwrap() > 0 {}
+
+    let dir = tempfile::tempdir().unwrap();
+    let bdb = ChainDb::open(dir.path().join("c.mdbx")).unwrap();
+    bdb.connect_blocks(a.p, &[a.g.clone(), b1.clone(), b2.clone()]).unwrap();
+    let n = |h: &Block| bdb.header(c, &h.hash()).unwrap().unwrap().b;
+    bdb.prune_blocks(a.p, &[n(&b1), n(&b2)]).unwrap();
+    bdb.add_indexer(c, std::sync::Arc::new(JournaledCount)).unwrap();
+    assert!(bdb.backfill(a.p, "count", 5).is_err(), "no sealed copy: the backfill can't read the pruned blocks");
+    let sealed: std::collections::HashMap<Hash256, Vec<u8>> = [(b1.hash(), b1.encode()), (b2.hash(), b2.encode())].into_iter().collect();
+    bdb.set_sealed_reader(std::sync::Arc::new(move |_c, h| sealed.get(h).cloned()));
+    while bdb.backfill(a.p, "count", 1).unwrap() > 0 {}
+    assert_eq!(bdb.indexed_to(c, "count").unwrap(), a.db.indexed_to(c, "count").unwrap());
+    for h in 1..=2 {
+        assert_eq!(bdb.journal(c, 7, h).unwrap(), a.db.journal(c, 7, h).unwrap(), "block {h}");
+    }
+}
+
 /// A chain with spends across blocks, scripts paid twice in one tx, and paying-and-spending
 /// the same script in one tx.
 fn busy_chain(g: &Block, n: u32) -> Vec<Block> {
