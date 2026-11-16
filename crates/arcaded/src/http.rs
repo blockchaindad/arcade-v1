@@ -289,6 +289,7 @@ fn status_line(code: u16) -> &'static str {
         403 => "403 Forbidden",
         404 => "404 Not Found",
         413 => "413 Payload Too Large",
+        502 => "502 Bad Gateway",
         503 => "503 Service Unavailable",
         _ => "500 Internal Server Error",
     }
@@ -720,7 +721,8 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
         // The ARCADE chain's git repositories (/r/git/..., arcgit::page_read): public data, with or without a pass, so an
         // app can show them as a code host does.
         if matches!(r.method.as_str(), "GET" | "HEAD") {
-            if let Some(a) = crate::arcgit::page_read(node, &path, &query_fields(&r.query)) {
+            let q = query_fields(&r.query);
+            if let Some(a) = crate::arcgit::lent(node, &path, &q).or_else(|| crate::arcgit::page_read(node, &path, &q)) {
                 let mut extra = cors.clone();
                 if a.gzip {
                     extra.push(("Content-Encoding", "gzip".into()));
@@ -840,9 +842,9 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
     // A git repository from ARCADE blobs (§15 step 6), in git's "dumb" HTTP protocol, so any git client clones it:
     // /git/<manifest blob>/{HEAD, info/refs, objects/info/packs, objects/pack/pack-<name>.pack|.idx}.
     if path.starts_with("/git/") {
-        let (status, body) = crate::arcgit::serve(node, &path["/git/".len()..]);
-        let ctype = if status.starts_with("200") { "application/octet-stream" } else { "text/plain" };
-        return respond(&mut s, status, ctype, &[("Cache-Control", "no-store".into())], if r.method == "HEAD" { &[] } else { &body });
+        // An arcade only borrowing the ARCADE chain asks an arcade that lends it (arcgit::lent).
+        let a = crate::arcgit::lent(node, &path, &Default::default()).unwrap_or_else(|| crate::arcgit::here(node, &path, &Default::default()).unwrap());
+        return respond(&mut s, status_line(a.code), a.ctype, &[("Cache-Control", "no-store".into())], if r.method == "HEAD" { &[] } else { &a.body });
     }
     // A blob of the ARCADE chain by its id (§15 step 5: apps and games load their parts from here), when the chain holds a
     // blob of that id: fetched from linked arcades if it isn't here, and kept in the viewer cache.

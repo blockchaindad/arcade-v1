@@ -19,7 +19,20 @@ fn on_chain(id: &str) -> Option<Vec<u8>> {
         return crate::relrepo::blob(id);
     }
     let bid: [u8; 32] = hex::decode(id).ok()?.try_into().ok()?;
-    crate::arcsvc::holds_blob(&bid).then(|| crate::arcblob::view(&bid)).flatten()
+    crate::arcsvc::holds_blob(&bid).then(|| whole(&bid)).flatten()
+}
+
+/// The most a file of many blobs read here as one git file may be (a pack bigger than a blob: its parts in a file
+/// manifest, crate::arcblob::file_manifest, as scripts/git-remote-arcade publishes one holding a file over 4 MB).
+const MAX_JOINED: u64 = 256 << 20;
+
+/// A blob's bytes; a file manifest's whole file, its parts joined.
+fn whole(id: &[u8; 32]) -> Option<Vec<u8>> {
+    if let Some(f) = crate::arcblob::file_manifest(id).filter(|f| f.size <= MAX_JOINED) {
+        let mut out = Vec::with_capacity(f.size as usize);
+        return crate::arcblob::file_range(&f, 0, f.size.saturating_sub(1), |b| { out.extend_from_slice(b); true }).then_some(out);
+    }
+    crate::arcblob::view(id)
 }
 
 fn manifest(id: &str) -> Option<Value> {
@@ -89,6 +102,63 @@ fn serve_manifest(id: &str, file: &str) -> (&'static str, Vec<u8>) {
         _ => ("404 Not Found", Vec::new()),
     }
 }
+
+/// A git read here, by its path: `/r/git/...` (page_read) or `/git/...` (serve, the dumb HTTP files). None for any other.
+pub fn here(node: &crate::node::Node, path: &str, q: &serde_json::Map<String, Value>) -> Option<PageAnswer> {
+    if let Some(rest) = path.strip_prefix("/git/") {
+        let (status, body) = serve(node, rest);
+        let code = status.split(' ').next().and_then(|c| c.parse().ok()).unwrap_or(500);
+        return Some(PageAnswer { code, ctype: if code == 200 { "application/octet-stream" } else { "text/plain" }, gzip: false, body });
+    }
+    page_read(node, path, q)
+}
+
+/// A git read on an arcade that only borrows the ARCADE chain (crate::arcborrow): it holds no ledger and no blobs, so
+/// the read is asked of an arcade lending the chain (rpc.rs "arcade_git"), which answers from its own copy. That
+/// arcade's word, as a borrowed chain's blocks are before their headers check them; git checks every object it
+/// clones by its hash. Packs, indexes and blobs never change: kept here a while (BORROWED_CACHE bytes in all).
+/// None while the chain runs here (or isn't defined), and for paths that aren't git reads.
+pub fn lent(node: &crate::node::Node, path: &str, q: &serde_json::Map<String, Value>) -> Option<PageAnswer> {
+    let p = crate::arcsvc::defined()?;
+    if crate::arcsvc::runs(p) || !(path.starts_with("/r/git/") || path.starts_with("/git/")) {
+        return None;
+    }
+    let fixed = path.starts_with("/r/git/blob/") || path.contains("/objects/pack/pack-");
+    type Cache = std::collections::VecDeque<(String, PageAnswer)>;
+    static C: std::sync::Mutex<Cache> = std::sync::Mutex::new(std::collections::VecDeque::new());
+    if fixed {
+        if let Some((_, a)) = C.lock().unwrap().iter().find(|(k, _)| k == path) {
+            return Some(PageAnswer { code: a.code, ctype: a.ctype, gzip: a.gzip, body: a.body.clone() });
+        }
+    }
+    let a = match crate::borrow::ask_lender(node, p, "arcade_git", serde_json::json!([path, q])) {
+        Ok(v) => {
+            use base64::Engine;
+            let ctype = match v["ctype"].as_str().unwrap_or("") {
+                "application/json" => "application/json",
+                "text/plain" => "text/plain",
+                _ => "application/octet-stream",
+            };
+            let body = base64::engine::general_purpose::STANDARD.decode(v["b64"].as_str().unwrap_or("")).unwrap_or_default();
+            PageAnswer { code: v["code"].as_u64().unwrap_or(502) as u16, ctype, gzip: v["gzip"] == true, body }
+        }
+        Err(e) => {
+            let body = if path.starts_with("/r/git/") { serde_json::json!({"ok": false, "error": format!("this arcade borrows the ARCADE chain; asking an arcade that lends it: {e}")}).to_string() } else { format!("this arcade borrows the ARCADE chain; asking an arcade that lends it: {e}\n") };
+            return Some(PageAnswer { code: 502, ctype: if path.starts_with("/r/git/") { "application/json" } else { "text/plain" }, gzip: false, body: body.into_bytes() });
+        }
+    };
+    if fixed && a.code == 200 {
+        let mut c = C.lock().unwrap();
+        c.push_back((path.to_string(), PageAnswer { code: a.code, ctype: a.ctype, gzip: a.gzip, body: a.body.clone() }));
+        while c.iter().map(|(_, x)| x.body.len()).sum::<usize>() > BORROWED_CACHE {
+            c.pop_front();
+        }
+    }
+    Some(a)
+}
+
+/// Bytes of packs, indexes and blobs an arcade borrowing the ARCADE chain keeps from its lender (crate::arcgit::lent).
+const BORROWED_CACHE: usize = 96 << 20;
 
 /// One answer of the git page reads: (status code, content type, whether the body is gzipped, body).
 pub struct PageAnswer {
@@ -163,8 +233,8 @@ pub fn page_read(node: &crate::node::Node, path: &str, q: &serde_json::Map<Strin
                 });
             }
             let bid: Option<[u8; 32]> = hex::decode(id).ok().and_then(|b| b.try_into().ok());
-            match bid.filter(crate::arcsvc::holds_blob).and_then(|b| crate::arcblob::view(&b).map(|bytes| (b, bytes))) {
-                Some((b, body)) => PageAnswer { code: 200, ctype: "application/octet-stream", gzip: crate::arcblob::gzipped(&b), body },
+            match bid.filter(crate::arcsvc::holds_blob).and_then(|b| whole(&b).map(|bytes| (b, bytes))) {
+                Some((b, body)) => PageAnswer { code: 200, ctype: "application/octet-stream", gzip: crate::arcblob::gzipped(&b) && crate::arcblob::file_manifest(&b).is_none(), body },
                 None => PageAnswer { code: 404, ctype: "text/plain", gzip: false, body: b"no such blob on the ARCADE chain here nor at the arcades linked to this one\n".to_vec() },
             }
         }
