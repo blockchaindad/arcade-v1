@@ -79,6 +79,7 @@
         <div class="wl-bal"><span id="w-bal">—</span> <span class="wl-unit" id="w-unit"></span></div>
         <div class="wl-sub" id="w-sub"></div>
         <div class="wl-addrrow">
+          <label class="wl-kind" id="w-kind-row" hidden>Address type <select id="w-kind" title="Which kind of address this wallet shows and sends from"></select></label>
           <code id="w-addr"></code>
           <button class="small" id="w-copy">Copy</button>
           <button class="small" id="w-forget" hidden>Remove this wallet</button>
@@ -95,7 +96,7 @@
         <textarea id="w-isecret" rows="2" placeholder="private key (WIF) or recovery words" autocomplete="off" spellcheck="false" autocapitalize="off" autocorrect="off"></textarea>
         <p class="wl-hint web-only" hidden>In a browser, the key goes through your tunnel to this arcade only. Do it on a computer you trust: browser extensions can read what a page shows.</p>
         <div class="row">
-          <label class="wl-hint">Address kind <select id="w-ikind"><option value="legacy">legacy</option><option value="p2wpkh">SegWit (p2wpkh)</option><option value="p2sh-p2wpkh">wrapped SegWit (p2sh-p2wpkh, receive only)</option></select></label>
+          <label class="wl-hint">Address kind <select id="w-ikind"><option value="legacy">legacy</option><option value="p2wpkh">SegWit (p2wpkh)</option><option value="p2sh-p2wpkh">wrapped SegWit (p2sh-p2wpkh)</option></select></label>
           <input id="w-iname" placeholder="name (optional)" maxlength="60" autocomplete="off" style="max-width:12em">
           <button class="primary" id="w-import">Import</button>
           <button id="w-imp-cancel">Cancel</button>
@@ -111,6 +112,8 @@
           <span class="wl-unit" id="w-amt-unit"></span>
           <button class="primary" id="w-review">Review</button>
         </div>
+        <p class="wl-hint" id="w-from" hidden></p>
+        <label class="wl-hint" id="w-allkinds-row" hidden><input type="checkbox" id="w-allkinds"> Also spend coins on my other address types</label>
         <p class="msg" id="w-send-msg"></p>
         <div id="w-confirm" class="warn" hidden>
           <div id="w-confirm-text"></div>

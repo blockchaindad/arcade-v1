@@ -103,8 +103,9 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 |---|---|---|---|---|
 | `wallet.create` | `/api/v1/wallet/create` | local | phrase? | Create a wallet (or restore one from 12 words). Returns the new words once. |
 | `wallet.phrase` | `/api/v1/wallet/phrase` | local | — | The wallet's 12 words. |
-| `wallet.keys` | `/api/v1/wallet/keys` | read | chain? | Your addresses on a chain, their @tags and balances. |
-| `wallet.send` | `/api/v1/wallet/send` | local | chain?, to, amount, from?, send? | Pay amount (satoshis) on a chain (home, installed or borrowed) from this wallet (from: one of its addresses or an imported wallet's; otherwise the own address with the most), signed here; send: true broadcasts, otherwise it's only built and shown with its fee (and a warning when the address could be meant for another chain). |
+| `wallet.keys` | `/api/v1/wallet/keys` | read | chain? | Your addresses on a chain, their @tags and balances (on SegWit chains each address type's address and balance under kinds; balance counts every type). |
+| `wallet.addr_kind` | `/api/v1/wallet/addr_kind` | wallet | chain, kind? | The address type the Wallet shows on a chain (legacy, p2sh-p2wpkh, p2wpkh, p2tr; remembered per chain) and the types it offers; kind: remember that one. |
+| `wallet.send` | `/api/v1/wallet/send` | local | chain?, to, amount, from?, kind?, all_kinds?, send? | Pay amount (satoshis) on a chain (home, installed or borrowed) from this wallet (from: one of its addresses or an imported wallet's; otherwise the own address with the most), signed here; kind: the address type it's sent from, change back to it (default: from's type, else the one the Wallet shows); all_kinds: also spend the wallet's other address types' coins; send: true broadcasts, otherwise it's only built and shown with its fee (and a warning when the address could be meant for another chain). |
 | `wallet.link` | `/api/v1/wallet/link` | wallet | chain, wif, tag | Link another wallet to your @tag (signed by both keys). |
 | `wallet.unlink` | `/api/v1/wallet/unlink` | wallet | chain, address, tag | Remove a linked wallet. |
 | `wallet.links` | `/api/v1/wallet/links` | read | chain | Your linked wallets on a chain. |
@@ -288,7 +289,7 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | `borrow.status` | `/api/v1/borrow/status` | read | — | Borrowed coins: the switches, and per chain its lenders, tip, floor, tip mismatch and your balance. |
 | `borrow.set` | `/api/v1/borrow/set` | admin | on, chain? | Turn borrowing on or off: for every coin (no chain) or for one chain (off removes its borrowed data). |
 | `borrow.coins` | `/api/v1/borrow/coins` | read | chain | Your coins on a borrowed chain (from blocks read since the floor, and the lender's coin scan). |
-| `borrow.send` | `/api/v1/borrow/send` | local | chain, to, amount, from?, send? | Pay amount (satoshis) on a borrowed chain, signed here; send: true broadcasts to every lender, otherwise only built and shown. |
+| `borrow.send` | `/api/v1/borrow/send` | local | chain, to, amount, from?, kind?, all_kinds?, send? | Pay amount (satoshis) on a borrowed chain, signed here (kind, all_kinds: as wallet.send); send: true broadcasts to every lender, otherwise only built and shown. |
 
 ### Mining
 
