@@ -688,6 +688,7 @@ fn serve_loop(
                 }
             }
             "wl" => crate::faucet::on_welcome(node, &f.head),
+            "af" => crate::arcfaucet::on_frame(node, &f.head),
             "op" if f.head["op"] == "me" => {
                 crate::meshview::on_op_me(&link.peer_id, &f.head);
                 crate::handlegate::on_op_me(node, &link.peer_id, &f.head);

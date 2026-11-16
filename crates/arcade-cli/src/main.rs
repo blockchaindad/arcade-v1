@@ -18,6 +18,8 @@ const HELP: &str = "arcade — Arcade V1.0
   arcade tag claim <tag>         claim @tag (asks the mesh for test coins if needed)
   arcade tag list                your claims and their status
   arcade faucet                  ask the mesh for test coins
+  arcade faucet arc [address]    top an ARCADE address up to 0.01 (once a day; default: your wallet's)
+  arcade faucet arc status       ARCADE top-up asks and what this arcade paid today
   arcade events                  recent activity
   arcade mempool                 unconfirmed transactions and pending tag claims
   arcade chain list                         chains you can install, and their state
@@ -289,6 +291,9 @@ fn main() {
         ["tag", "claim", t] => json!({"cmd": "tag.claim", "tag": t}),
         ["tag", "list"] => json!({"cmd": "tag.list"}),
         ["faucet"] => json!({"cmd": "faucet.ask"}),
+        ["faucet", "arc"] => json!({"cmd": "faucet.arc"}),
+        ["faucet", "arc", "status"] => json!({"cmd": "faucet.arc_status"}),
+        ["faucet", "arc", a] => json!({"cmd": "faucet.arc", "address": a}),
         ["events"] => json!({"cmd": "events"}),
         ["mempool"] => json!({"cmd": "mempool"}),
         ["profile", who] => json!({"cmd": "profile", "who": who}),

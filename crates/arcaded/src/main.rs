@@ -53,6 +53,7 @@ mod crsource;
 mod crvia;
 mod explorer;
 mod faucet;
+mod arcfaucet;
 mod http;
 mod importsvc;
 mod ledger;
@@ -488,6 +489,7 @@ fn main() {
                             *n.sync_state.lock().unwrap() = format!("index stopped: {e}");
                         }
                         faucet::pay_asks(&n);
+                        arcfaucet::pay(&n);
                         last = std::time::Instant::now();
                     }
                     claims::advance_all(&n);
