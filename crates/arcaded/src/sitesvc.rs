@@ -152,6 +152,9 @@ pub fn coins(node: &Node, req: &Value) -> R {
     let pooled = pool(node, p);
     let spent_in_pool: HashSet<OutPoint> = pooled.iter().flat_map(|(_, t)| t.inputs.iter().map(|i| i.prevout)).collect();
     let tip = tip_height(node, p);
+    // Confirmations as they count for money (arcade_chaindb::proven: on DigiByte, Kotia and Wojakcoin only checked
+    // work above a coin counts).
+    let money = node.chain.money_depth(p).ok();
     let mut out = serde_json::Map::new();
     for (a, script) in &want {
         let mut confirmed = Vec::new();
@@ -168,7 +171,7 @@ pub fn coins(node: &Node, req: &Value) -> R {
                 continue;
             }
             total += value;
-            confirmed.push(json!({"txid": op.txid.to_hex(), "vout": op.vout, "value": value, "height": height, "confirmations": tip.saturating_sub(height) + 1}));
+            confirmed.push(json!({"txid": op.txid.to_hex(), "vout": op.vout, "value": value, "height": height, "confirmations": money.as_ref().map(|m| m.at(height)).unwrap_or(0)}));
         }
         let mut unconfirmed = Vec::new();
         for (_, t) in &pooled {
@@ -743,6 +746,33 @@ pub(crate) mod tests {
         let wraps = tx(&[(t.spend.txid, 1)], &[(u64::MAX, p2pkh(4)), (2, p2pkh(5))], 0);
         assert!(broadcast(&t.node, &json!({"hex": hex::encode(&wraps.raw)})).unwrap_err().contains("more than any amount"));
         assert!(t.node.tx_outbox.lock().unwrap().is_empty());
+    }
+
+    /// On a chain whose blocks' work isn't all checked and bounded here (DigiByte, Kotia, Wojakcoin), a coin or a
+    /// payment counts confirmations only by the checked work above it: these test blocks (easier than the
+    /// chain's minimum) carry none, so nothing is confirmed. With the work bounded, the same blocks confirm.
+    #[test]
+    fn no_confirmations_without_checked_work() {
+        let t = setup_with(|p| {
+            p.max_easier = false;
+            p.digishield_from = None;
+        });
+        assert!(t.p.confirms_by_proven_work());
+        let a = addr(&t, 1);
+        let v = coins(&t.node, &json!({"addresses": [a]})).unwrap();
+        assert_eq!(v["addresses"][&a]["confirmed"][0]["confirmations"], 0);
+        let st = crate::walletsvc::tx_status(&t.node, &t.spend.txid.to_hex()).unwrap();
+        assert_eq!((st["confirmed"].clone(), st["confirmations"].clone()), (json!(false), json!(0)));
+        let out = crate::rpc::call_on(&t.node, t.p, "gettxout", &[json!(t.spend.txid.to_hex()), json!(1)]).unwrap();
+        assert_eq!(out["confirmations"], 0);
+
+        let t = setup();
+        let v = coins(&t.node, &json!({"addresses": [a]})).unwrap();
+        assert_eq!(v["addresses"][&a]["confirmed"][0]["confirmations"], 1);
+        let st = crate::walletsvc::tx_status(&t.node, &t.spend.txid.to_hex()).unwrap();
+        assert_eq!((st["confirmed"].clone(), st["confirmations"].clone()), (json!(true), json!(1)));
+        let out = crate::rpc::call_on(&t.node, t.p, "gettxout", &[json!(t.spend.txid.to_hex()), json!(1)]).unwrap();
+        assert_eq!(out["confirmations"], 1);
     }
 
     #[test]

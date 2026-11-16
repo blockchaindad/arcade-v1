@@ -153,6 +153,31 @@ pub(crate) fn depth(node: &Node, p: &ChainParams, txid: &Hash256) -> u32 {
     let Some((_, h, _)) = node.chain.block_at(p, b).ok().flatten() else { return 0 };
     node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height).unwrap_or(0).saturating_sub(h) + 1
 }
+/// [`depth`] as it counts for money: where a block's height proves little (DigiByte, Kotia, Wojakcoin: headers
+/// whose work isn't checked here, or whose bits aren't tied to the chain's difficulty), only the checked work above
+/// the transaction counts (arcade_chaindb::proven). The other side's lock is read with this; this side's own steps
+/// use the plain depth.
+pub(crate) fn money_depth(node: &Node, p: &ChainParams, txid: &Hash256) -> u32 {
+    let Ok(Some((b, _))) = node.chain.tx_location(p, txid) else { return 0 };
+    let Some((_, h, _)) = node.chain.block_at(p, b).ok().flatten() else { return 0 };
+    node.chain.money_depth(p).map(|m| m.at(h)).unwrap_or(0)
+}
+/// A leg on a chain where nothing can confirm a lock (no checked work at its tip: Kotia's staked blocks) is
+/// refused before anything is locked: the other side's lock there could never be seen as mined.
+fn confirmable(node: &Node, leg: &Value) -> Result<(), String> {
+    match crate::chains::find(leg["chain"].as_str().unwrap_or("")) {
+        Some(p) => confirmable_on(node, p),
+        None => Ok(()),
+    }
+}
+fn confirmable_on(node: &Node, p: &ChainParams) -> Result<(), String> {
+    let Ok(m) = node.chain.money_depth(p) else { return Ok(()) };
+    if p.confirms_by_proven_work() && m.tip() > 0 && !m.confirms() {
+        let why = if p.work_checkable_at(m.tip() + 1) { "" } else { " (they are proof of stake, which is not checked yet)" };
+        return Err(format!("{}'s blocks here carry no work this arcade can check{why}: a lock on it can't be confirmed, so it can't be a swap leg", p.name));
+    }
+    Ok(())
+}
 fn tx_of(node: &Node, p: &ChainParams, txid: &Hash256) -> Option<Tx> {
     if let Ok(Some((raw, _))) = node.chain.tx_raw(p, txid) {
         return Tx::parse_with(&raw, &p.format).ok();
@@ -568,7 +593,8 @@ fn seen(node: &Node, leg: &Value, spec: &Spec, st: &Value) -> Result<bool, Strin
     let kind = leg["kind"].as_str().unwrap_or("");
     let Ok(txid) = h256(&st["txid"]) else { return Ok(false) };
     let Some(tx) = tx_of(node, p, &txid) else { return Ok(false) };
-    if depth(node, p, &txid) < 1 {
+    // Mined under work this arcade checked, not just in a block (a made-up block costs nothing on some chains).
+    if money_depth(node, p, &txid) < 1 {
         return Ok(false);
     }
     let script = spec.script(kind)?;
@@ -717,7 +743,8 @@ fn pair_ok(node: &Node, give: &Value, get_leg: &Value) -> Result<(), String> {
     if !sized_on(node, give) && get_leg["kind"] == "dd" {
         return Err("an ARCADE coin leg can't be swapped for DigiDollars yet".into());
     }
-    Ok(())
+    confirmable(node, give)?;
+    confirmable(node, get_leg)
 }
 
 /// Place an order: give `give`, get `get` (whole, one fill). `opts` (all optional): `key` {chain: 32-byte secret hex}
@@ -1072,6 +1099,8 @@ pub fn take(node: &Node, maker: &str, order: &str, shown: Option<&Value>) -> Res
     }
     leg_ok(node, &o["give"])?;
     leg_ok(node, &o["get"])?;
+    confirmable(node, &o["give"])?;
+    confirmable(node, &o["get"])?;
     let secret: [u8; 32] = arcade_mesh::random::bytes();
     let id = hex::encode(Sha256::digest(secret));
     let secs = quote["maker_secs"].as_u64().unwrap_or(4 * 3600) as u32;
@@ -1288,6 +1317,36 @@ mod arcade_lock_tests {
         let (ok, _) = check(&htlc::refund(p, &early, &coin, outs, &b).unwrap());
         assert!(ok.is_err(), "a refund signed for an earlier height must not spend this lock");
     }
+}
+
+/// The other side's lock counts as mined only under work this arcade checked; a chain where nothing is checked any
+/// more (Kotia's staked blocks) is refused as a leg before anything is locked.
+#[cfg(test)]
+#[test]
+fn a_lock_counts_only_under_checked_work() {
+    use crate::sitesvc::tests::{setup, setup_with};
+    let t = setup_with(|p| {
+        p.max_easier = false;
+        p.digishield_from = None;
+    });
+    assert_eq!(depth(&t.node, t.p, &t.spend.txid), 1);
+    assert_eq!(money_depth(&t.node, t.p, &t.spend.txid), 0, "in a block, under no checked work");
+    let why = confirmable_on(&t.node, t.p).unwrap_err();
+    assert!(why.contains("no work this arcade can check") && !why.contains("stake"), "{why}");
+
+    let t = setup();
+    assert_eq!(money_depth(&t.node, t.p, &t.spend.txid), 1);
+    assert!(confirmable_on(&t.node, t.p).is_ok());
+    assert!(confirmable(&t.node, &json!({"chain": "peptest"})).is_ok());
+    assert!(confirmable(&t.node, &json!({"chain": "kot"})).is_ok(), "not installed: refused elsewhere, not here");
+    // A staked chain (Kotia after its last PoW height): refused, saying why.
+    let t = setup_with(|p| {
+        p.max_easier = false;
+        p.digishield_from = None;
+        p.pow = arcade_chain::pow::PowRule::PowThenStake { algo: arcade_chain::pow::PowAlgo::Scrypt, last_pow_height: 0 };
+    });
+    let why = confirmable_on(&t.node, t.p).unwrap_err();
+    assert!(why.contains("proof of stake"), "{why}");
 }
 
 #[cfg(test)]
