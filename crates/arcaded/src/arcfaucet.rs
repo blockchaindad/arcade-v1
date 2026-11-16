@@ -285,6 +285,16 @@ pub fn pay(node: &Node) {
     }
 }
 
+/// For the Home tab: `addr`'s top-up as the welcome faucet's is shown ({status: "paid", txid, by} once a payment notice
+/// was seen, {status: "asked", at} while asked), or None.
+pub fn of_address(addr: &str) -> Option<Value> {
+    let st = state().lock().unwrap();
+    if let Some((txid, at)) = st.sent.get(addr).and_then(|l| l.last()) {
+        return Some(json!({"status": "paid", "at": at, "txid": txid, "by": Value::Null}));
+    }
+    st.asks.get(addr).map(|r| json!({"status": "asked", "at": r["at"], "txid": Value::Null, "by": r["a"]}))
+}
+
 /// `faucet.arc_status`: the asks this arcade knows and what it paid today.
 pub fn status(node: &Node) -> Value {
     let now = arcade_app::now();

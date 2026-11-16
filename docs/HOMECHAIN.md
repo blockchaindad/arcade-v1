@@ -99,6 +99,18 @@ Each phase ships as a release, and each has a pass test like §15.2's.
 
 ### 3. Writes go to ARCADE: the switch
 
+**Step 1 built (2026-11-16): new @handles on ARCADE.**
+- **Where claims go:** with no chain named, `tag.claim` and `tag.check` use ARCADE when it runs here
+  (`claims::claim_home`). Asking for Pepecoin testnet by name still works.
+- **Funding:** a claim waiting for coins asks the ARCADE faucet (#175) for its address.
+- **The start screen:** `start.status` follows the claim's chain (ARCADE balance, faucet state and heights, a `chain`
+  field), so the screen says "Waiting for 0.01 ARCADE".
+- **Restored wallets** get their @handle back from either chain.
+- **Explorer:** the tag page and search find a tag held on ARCADE.
+- **Pass** (scratchpad `lnet/claimnet.py`, two arcades on a closed local chain): a fresh wallet claims `@claimtest`
+  with no chain named; the other arcade's faucet pays it; the claim confirms on ARCADE; the other arcade's explorer
+  shows it; and on Pepecoin testnet it reads "taken on ARCADE testnet".
+
 - **`ledger_home()` returns ARCADE.**
   - **What moves:** claims, profiles, follows, posts, messages, links and the handle proof are written there.
   - **Keys:** they come from the wallet's existing keys. The BIP44 coin type is the home chain's (§13 q6), so an
