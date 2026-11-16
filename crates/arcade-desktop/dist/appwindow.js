@@ -630,7 +630,9 @@
     finally { showing = null; }
   }, 1500);
 
-  // The page with its pass for the page API (a new address, so a copy cached before passes isn't used).
-  el.src = frame + "?pass=1";
+  // The page with its pass for the page API (a new address, so a copy cached before passes isn't used), and the place
+  // to open it at when the window was asked for one (`at`: a plain #/ route, as Arcade Git's #/@owner/name).
+  const at = q.get("at") || "";
+  el.src = frame + "?pass=1" + (/^#\/[A-Za-z0-9@._\/-]{0,200}$/.test(at) ? at : "");
   window.arcadeApp = { id, frame, el };
 })();

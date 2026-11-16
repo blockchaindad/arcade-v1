@@ -55,6 +55,24 @@ async function optionsDo(what, f) {
 
 $("o-auto").addEventListener("change", (e) => optionsDo(e.target.checked ? "Turning automatic updates on…" : "Turning automatic updates off…",
   () => api("update.set", { on: e.target.checked })));
+// The code of the release an update would install (Arcade V1.0's releases are the read-only repository
+// @arcade/arcade-v1, relrepo.rs), in Arcade Git: Strawberry's app, installed from the App Store first if it isn't here.
+const CODE_REPO = "arcade/arcade-v1";
+async function openCode() {
+  const git = (l) => (l || []).filter((a) => a.card && a.card.family === "arcade-git" && a.creator_tag === "strawberry")
+    .sort((x, y) => (y.height || 0) - (x.height || 0))[0];
+  let a = git(await api("apps.installed"));
+  if (!a) {
+    a = git((await api("apps.store", { q: "arcade git" })).apps);
+    if (!a) throw new Error("Arcade Git isn't in the App Store on this arcade yet: the code is also at /git/@arcade/arcade-v1 for git clone");
+    if (!confirm("Arcade Git (by @strawberry) isn't installed here. Install it from the App Store to read the code?")) return;
+    await api("apps.install", { chain: a.chain, txid: a.txid });
+  }
+  // The repository's main is the newest release this arcade holds: the one Update now would install.
+  const l = await api("apps.launch", { chain: a.chain, txid: a.txid });
+  await invoke("open_app", { id: l.id, title: l.title, frame: l.frame, at: `#/@${CODE_REPO}` });
+}
+$("o-code").addEventListener("click", () => openCode().catch((e) => say("o-msg", e.message || String(e), true)));
 $("o-check").addEventListener("click", () => optionsDo("Looking for a new release on the network…", () => api("update.check")));
 $("o-now").addEventListener("click", () => {
   if (!confirm("Install the newest release now? The service restarts; your wallet and data stay as they are.")) return;
