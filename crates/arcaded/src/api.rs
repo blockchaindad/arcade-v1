@@ -137,9 +137,13 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
                 let balance = f.as_ref().map(|f| f.balance);
                 let waiting: Vec<_> = f.as_ref().map(|f| &f.waiting[..]).unwrap_or_default().iter()
                     .map(|(id, received, spent)| json!({"txid": id.to_hex(), "received": received, "spent": spent})).collect();
+                // Own transactions that left the pool without a block (crate::ownwait): their coins are free again.
+                let dropped: Vec<_> = crate::ownwait::dropped(node, cp, |s| sc.iter().any(|x| x.as_slice() == s)).into_iter()
+                    .map(|(id, received, spent)| json!({"txid": id.to_hex(), "received": received, "spent": spent})).collect();
                 json!({"index": k.index, "address": scripts[0].0, "legacy": scripts.get(1).map(|x| x.0.clone()),
-                       // confirmed: the blocks' figure; free: confirmed coins no waiting transaction spends (spendable
-                       // now); pending: waiting outputs arriving (pending_coins of them), spendable already.
+                       // confirmed: the blocks' figure; free: confirmed coins spendable now (no waiting transaction spends
+                       // them, mature, no inscription); pending: waiting outputs arriving (pending_coins of them).
+                       "dropped": dropped,
                        "confirmed": f.as_ref().map(|f| f.confirmed), "free": f.as_ref().map(|f| f.free),
                        "pending": f.as_ref().map_or(0, |f| f.arriving), "pending_coins": f.as_ref().map_or(0, |f| f.arriving_coins),
                        "waiting": waiting,

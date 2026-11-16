@@ -73,7 +73,7 @@ pub fn send(node: &Node, payload: &[u8]) -> Result<(String, u64), String> {
     let tx = arcade_wallet::tx::build_arcade_with(p, payload, vec![], &sk, &coins, fee_per_kb, arcade_arc::params::DUST,
         arcade_app::now() as u32, arcade_wallet::tx::ARCADE_CLASS_C_MAX)
         .map_err(|e| format!("could not build the record's transaction: {e}"))?;
-    let (txid, fee) = crate::arcsvc::send_raw(&tx.raw)?;
+    let (txid, fee) = crate::ownwait::send_arc(node, &tx)?;
     Ok((txid.to_hex(), fee))
 }
 
@@ -161,7 +161,7 @@ pub fn tag_checkin(node: &Node) -> Result<Value, String> {
         rate = rate.saturating_mul(x.checkin_fee).div_ceil(fee.max(1)) + 1;
     }
     let tx = built.ok_or("could not make a check-in that pays its fee")?;
-    let (txid, fee) = crate::arcsvc::send_raw(&tx.raw)?;
+    let (txid, fee) = crate::ownwait::send_arc(node, &tx)?;
     Ok(json!({"txid": txid.to_hex(), "fee": fee, "tag": tag}))
 }
 

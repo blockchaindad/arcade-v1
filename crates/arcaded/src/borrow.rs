@@ -657,6 +657,24 @@ pub fn unspent_coin(node: &Node, p: &ChainParams, op: &OutPoint) -> Option<(Vec<
     Some((hex::decode(c["s"].as_str()?).ok()?, c["v"].as_u64()?))
 }
 
+/// Whether a transaction waits in the borrowed pool here.
+pub fn pooled(p: &ChainParams, txid: &Hash256) -> bool {
+    ST.pool.lock().unwrap().get(p.key).is_some_and(|m| m.contains_key(txid))
+}
+
+/// Whether a block has this transaction, as the coins read for this wallet show it: one of its
+/// outputs is a coin row, or a coin it spends is marked spent by it.
+pub fn mined(node: &Node, p: &ChainParams, tx: &Tx) -> bool {
+    let id = tx.txid.to_hex();
+    (0..tx.outputs.len()).any(|v| coin(node, p, &OutPoint { txid: tx.txid, vout: v as u32 }).is_some())
+        || tx.inputs.iter().any(|i| coin(node, p, &i.prevout).is_some_and(|c| c["sp"].as_str() == Some(id.as_str())))
+}
+
+/// A transaction sent from here that a lender already holds: waiting here again (after a restart).
+pub fn keep_waiting(p: &ChainParams, tx: &Tx) {
+    ST.pool.lock().unwrap().entry(p.key.to_string()).or_default().insert(tx.txid, (tx.raw.clone(), arcade_app::now()));
+}
+
 /// The transactions waiting on a borrowed chain (sent from here, held until a lender's block has them).
 pub fn pool_txs(p: &ChainParams) -> Vec<Tx> {
     let pool: Vec<Vec<u8>> = ST.pool.lock().unwrap().get(p.key).map(|m| m.values().map(|v| v.0.clone()).collect()).unwrap_or_default();
@@ -1496,6 +1514,7 @@ pub fn broadcast_tx(node: &Node, p: &'static ChainParams, tx: &Tx) -> Result<Val
         return Err((format!("no lender took the transaction: {}", json!(answers)), json!(answers)));
     }
     ST.pool.lock().unwrap().entry(p.key.to_string()).or_default().insert(tx.txid, (tx.raw.clone(), arcade_app::now()));
+    crate::ownwait::note(node, p, tx);
     Ok(json!(answers))
 }
 

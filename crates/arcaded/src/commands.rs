@@ -81,7 +81,7 @@ cmds! {
     // Wallet
     "wallet.create" Local "phrase?" "Create a wallet (or restore one from 12 words). Returns the new words once.";
     "wallet.phrase" Local "" "The wallet's 12 words.";
-    "wallet.keys" Read "chain?" "Your addresses on a chain, their @tags and balances.";
+    "wallet.keys" Read "chain?" "Your addresses on a chain, their @tags and balances. balance follows the mempool (confirmed coins less those a waiting transaction spends, plus waiting outputs to you); confirmed is the blocks' figure; free the confirmed coins spendable now (not spent by a waiting transaction, mature, no inscription); pending / pending_coins what is arriving; waiting and dropped this wallet's transactions in the mempool and those that left it without a block.";
     "dd.wallet" Read "chain?" "Your DigiDollar on DigiByte (chain dgb, the default, or dgbtest): address (DD.../TD...), cents, coins, borrowed, whole (false when only coins from the borrow floor on can be seen).";
     "dd.coins" Read "chain?, pubkey" "The DigiDollar address and coins (txid, vout, cents, height) of any DigiByte key (33-byte hex), as dd.wallet shows this wallet's: for a website whose accounts sign in their browsers.";
     "dd.send" Local "chain?, to, cents, send?" "Send DigiDollars (cents, $1 to $100,000 per send) to a DD.../TD... address, with DGB from the same wallet for the fee (0.35 DGB/kB, at least 0.1, at most 0.5 DGB); send: true broadcasts, otherwise it's only built and shown.";
@@ -195,7 +195,7 @@ cmds! {
     "explorer.blocks" Public "chain?, offset?, limit?" "Recent blocks.";
     "explorer.block" Public "chain?, id" "One block (height or hash).";
     "explorer.tx" Public "chain?, txid" "One transaction.";
-    "explorer.address" Public "chain?, address, history?, inscriptions?, content?" "An address: balance, history, inscriptions (the first 60; all with explorer.held), tokens. history: false or inscriptions: false leaves that part out; content: false lists inscriptions without previews.";
+    "explorer.address" Public "chain?, address, history?, inscriptions?, content?" "An address: balance, history, inscriptions (the first 60; all with explorer.held), tokens. history: false or inscriptions: false leaves that part out; content: false lists inscriptions without previews. pending: the balance with the mempool taken in, what arrives and leaves, and the waiting transactions (when the mempool touches the address).";
     "explorer.inscriptions" Public "chain?, offset?, limit?" "Inscriptions, newest first.";
     "explorer.inscription" Public "chain?, id" "One inscription.";
     "explorer.tokens" Public "chain?, q?, open?, offset?, limit?" "Tokens, in tick order: q, those starting with it; open: true, only those still being minted (minted under supply).";

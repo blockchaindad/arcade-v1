@@ -469,7 +469,13 @@
     return h("div", {}, crumbs("Address"),
       head(short(a.address, 14, 8), a.tag ? h("span", { class: "chip arc" }, "@" + a.tag) : ""),
       a.note ? h("p", { class: "note" }, a.note) : "",
-      kv([["Address", h("span", { class: "mono" }, a.address)], a.balance != null && ["Balance", coins(a.balance)], a.tx_count != null && ["Transactions", fmt(a.tx_count)],
+      // With waiting transactions: the balance as the mempool leaves it, the blocks' figure beside it.
+      kv([["Address", h("span", { class: "mono" }, a.address)],
+        a.pending ? ["Balance", h("span", {}, coins(a.pending.balance), h("span", { class: "faint" }, ` · ${coins(a.balance)} confirmed`
+          + (a.pending.arriving ? ` · ${coins(a.pending.arriving)} arriving` : "") + (a.pending.leaving ? ` · ${coins(a.pending.leaving)} leaving` : "") + " (in the mempool)"))]
+          : a.balance != null && ["Balance", coins(a.balance)],
+        a.pending && ["Waiting transactions", h("span", {}, ...a.pending.waiting.flatMap((t, i) => [i ? ", " : "", link(short(t.txid, 8, 6), "tx", t.txid)]))],
+        a.tx_count != null && ["Transactions", fmt(a.tx_count)],
         a.inscription_count != null && ["Inscriptions held", fmt(a.inscription_count)]]),
       a.tokens && a.tokens.length ? h("div", {}, h("h2", { class: "x-h2" }, "Tokens"), table([["Tick"], ["Balance", 1], ["Transferable", 1]],
         a.tokens.map((t) => ({ go: () => go("token", t.tick), cells: [[h("b", {}, t.tick)], [units(t.overall, t.dec), 1], [units(t.transferable, t.dec), 1]] })))) : "",
