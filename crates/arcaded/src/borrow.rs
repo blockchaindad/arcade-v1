@@ -651,6 +651,18 @@ fn coin(node: &Node, p: &ChainParams, op: &OutPoint) -> Option<Value> {
     get_json(node, &k_c(p.key, op))
 }
 
+/// A borrowed coin not spent yet: (script, value).
+pub fn unspent_coin(node: &Node, p: &ChainParams, op: &OutPoint) -> Option<(Vec<u8>, u64)> {
+    let c = coin(node, p, op).filter(|c| c["sp"].is_null())?;
+    Some((hex::decode(c["s"].as_str()?).ok()?, c["v"].as_u64()?))
+}
+
+/// The transactions waiting on a borrowed chain (sent from here, held until a lender's block has them).
+pub fn pool_txs(p: &ChainParams) -> Vec<Tx> {
+    let pool: Vec<Vec<u8>> = ST.pool.lock().unwrap().get(p.key).map(|m| m.values().map(|v| v.0.clone()).collect()).unwrap_or_default();
+    pool.iter().filter_map(|raw| Tx::parse_with(raw, &p.format).ok()).collect()
+}
+
 /// Every coin row of a chain: (outpoint, row).
 fn coin_rows(node: &Node, key: &str) -> Vec<(OutPoint, Value)> {
     let pre = k(key, "c/");

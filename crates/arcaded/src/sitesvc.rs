@@ -129,7 +129,7 @@ fn not_final(node: &Node, p: &ChainParams, tx: &Tx) -> Option<String> {
 }
 
 /// The pool, parsed once: (first seen, tx).
-fn pool(node: &Node, p: &ChainParams) -> Vec<(u64, Tx)> {
+pub(crate) fn pool(node: &Node, p: &ChainParams) -> Vec<(u64, Tx)> {
     // The ARCADE chain's waiting transactions are its own pool's (crate::arcsvc).
     if crate::arcsvc::runs(p) {
         return crate::arcsvc::waiting(100_000).into_iter().filter_map(|raw| Tx::parse_with(&raw, &p.format).ok().map(|t| (0, t))).collect();
@@ -140,6 +140,84 @@ fn pool(node: &Node, p: &ChainParams) -> Vec<(u64, Tx)> {
         .into_iter()
         .filter_map(|(seen, raw)| Tx::parse_with(&raw, &p.format).ok().map(|t| (seen, t)))
         .collect()
+}
+
+/// A wallet's coins with its waiting transactions taken in, counted as tx.coins counts them.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Figures {
+    /// Confirmed coins, as the blocks say.
+    pub confirmed: u64,
+    /// Confirmed coins no waiting transaction spends: spendable without waiting for a block.
+    pub free: u64,
+    /// Confirmed coins a waiting transaction spends.
+    pub leaving: u64,
+    /// Outputs of waiting transactions paying the wallet, not spent again in the pool.
+    pub arriving: u64,
+    /// How many such outputs.
+    pub arriving_coins: usize,
+    /// confirmed - leaving + arriving.
+    pub balance: u64,
+    /// Waiting transactions touching the wallet: (txid, received, spent).
+    pub waiting: Vec<(arcade_chain::Hash256, u64, u64)>,
+}
+
+/// Figures for the scripts `mine` takes, from their confirmed total, the pool, and a lookup of an
+/// unspent confirmed coin ((script, value)). A pooled output already in a block counts once.
+pub(crate) fn figures(confirmed: u64, pooled: &[Tx], mine: impl Fn(&[u8]) -> bool, coin: impl Fn(&OutPoint) -> Option<(Vec<u8>, u64)>) -> Figures {
+    let spent_in_pool: HashSet<OutPoint> = pooled.iter().flat_map(|t| t.inputs.iter().map(|i| i.prevout)).collect();
+    let pool_out: HashMap<OutPoint, (&[u8], u64)> = pooled
+        .iter()
+        .flat_map(|t| t.outputs.iter().enumerate().map(move |(i, o)| (OutPoint { txid: t.txid, vout: i as u32 }, (o.script_pubkey.as_slice(), o.value))))
+        .collect();
+    let mut f = Figures { confirmed, ..Default::default() };
+    let mut counted: HashSet<OutPoint> = HashSet::new();
+    for t in pooled {
+        let (mut received, mut spent) = (0u64, 0u64);
+        for (vout, o) in t.outputs.iter().enumerate() {
+            let op = OutPoint { txid: t.txid, vout: vout as u32 };
+            if !mine(&o.script_pubkey) || coin(&op).is_some() {
+                continue; // not ours, or in a block already (in confirmed)
+            }
+            received += o.value;
+            if !spent_in_pool.contains(&op) && counted.insert(op) {
+                f.arriving += o.value;
+                f.arriving_coins += 1;
+            }
+        }
+        for i in &t.inputs {
+            if let Some((s, v)) = pool_out.get(&i.prevout) {
+                if mine(s) {
+                    spent += v;
+                }
+            } else if let Some((_, v)) = coin(&i.prevout).filter(|(s, _)| mine(s)) {
+                spent += v;
+                // Two waiting spends of one coin (a replacement) take it once.
+                if counted.insert(i.prevout) {
+                    f.leaving += v;
+                }
+            }
+        }
+        if received > 0 || spent > 0 {
+            f.waiting.push((t.txid, received, spent));
+        }
+    }
+    f.free = confirmed.saturating_sub(f.leaving);
+    f.balance = f.free + f.arriving;
+    f
+}
+
+/// Figures for a wallet's scripts on a chain kept here (any chain with a pool here, ARCADE too) or
+/// borrowed; None when its balance can't be read. Read from the live pool each time, so a spend
+/// that leaves the pool without a block gives its coins back at once.
+pub(crate) fn wallet_figures(node: &Node, p: &'static ChainParams, scripts: &[Vec<u8>]) -> Option<Figures> {
+    let mine = |s: &[u8]| scripts.iter().any(|x| x.as_slice() == s);
+    if crate::borrow::is_borrowed(p.key) {
+        let confirmed = scripts.iter().map(|s| crate::borrow::balance(node, p, s)).sum::<Option<u64>>()?;
+        return Some(figures(confirmed, &crate::borrow::pool_txs(p), mine, |op| crate::borrow::unspent_coin(node, p, op)));
+    }
+    let confirmed = scripts.iter().map(|s| node.chain.balance_for_script(p.chain_no, s).ok()).sum::<Option<u64>>()?;
+    let pooled: Vec<Tx> = pool(node, p).into_iter().map(|(_, t)| t).collect();
+    Some(figures(confirmed, &pooled, mine, |op| node.chain.coin(p, op).ok().flatten().map(|c| (c.script, c.value))))
 }
 
 pub fn coins(node: &Node, req: &Value) -> R {
@@ -577,6 +655,82 @@ pub(crate) mod tests {
         })
     }
 
+    /// Two confirmed coins of the wallet (script 1), a and b, for the figures tests.
+    fn two_coins() -> (OutPoint, OutPoint, impl Fn(&OutPoint) -> Option<(Vec<u8>, u64)>) {
+        let (a, b) = (OutPoint { txid: Hash256([0xa; 32]), vout: 0 }, OutPoint { txid: Hash256([0xb; 32]), vout: 1 });
+        let coin = move |op: &OutPoint| match op {
+            o if *o == a => Some((p2pkh(1), 150_000_000)),
+            o if *o == b => Some((p2pkh(1), 95_000_000)),
+            _ => None,
+        };
+        (a, b, coin)
+    }
+    const B: u64 = 245_000_000;
+
+    /// A send of A with fee F: the balance is B - A - F at once, its change arriving, and the coin it
+    /// spends no longer free (ARCADE #15).
+    #[test]
+    fn a_waiting_send_leaves_the_balance_at_b_less_amount_and_fee() {
+        let (a, _, coin) = two_coins();
+        let mine = |s: &[u8]| s == p2pkh(1);
+        let (amt, fee) = (40_000_000, 500_000);
+        let t = tx(&[(a.txid, a.vout)], &[(amt, p2pkh(2)), (150_000_000 - amt - fee, p2pkh(1))], 1);
+        let f = figures(B, &[t.clone()], mine, &coin);
+        assert_eq!(f.balance, B - amt - fee);
+        assert_eq!((f.confirmed, f.leaving, f.free), (B, 150_000_000, 95_000_000));
+        assert_eq!((f.arriving, f.arriving_coins), (150_000_000 - amt - fee, 1));
+        assert_eq!(f.waiting, vec![(t.txid, 150_000_000 - amt - fee, 150_000_000)]);
+        // Nothing waiting: the confirmed figure, all free.
+        let f = figures(B, &[], mine, &coin);
+        assert_eq!((f.balance, f.free, f.arriving), (B, B, 0));
+    }
+
+    /// Fee-only spends of both coins (a post's fee, change back), then one spending the change of
+    /// the first: B - fees, and no confirmed coin free.
+    #[test]
+    fn fee_only_spends_take_only_the_fee() {
+        let (a, b, coin) = two_coins();
+        let mine = |s: &[u8]| s == p2pkh(1);
+        let t1 = tx(&[(a.txid, a.vout)], &[(150_000_000 - 4_053_000, p2pkh(1))], 1);
+        let t2 = tx(&[(b.txid, b.vout)], &[(95_000_000 - 55_200, p2pkh(1))], 2);
+        let t3 = tx(&[(t1.txid, 0)], &[(150_000_000 - 4_053_000 - 1_000, p2pkh(1))], 3);
+        let f = figures(B, &[t1.clone(), t2.clone()], mine, &coin);
+        assert_eq!(f.balance, B - 4_053_000 - 55_200);
+        assert_eq!((f.free, f.arriving_coins), (0, 2));
+        let f = figures(B, &[t1, t2, t3.clone()], mine, &coin);
+        assert_eq!(f.balance, B - 4_053_000 - 55_200 - 1_000);
+        assert_eq!((f.free, f.arriving_coins), (0, 2));
+        assert_eq!(f.waiting.last(), Some(&(t3.txid, 150_000_000 - 4_054_000, 150_000_000 - 4_053_000)));
+    }
+
+    /// A coin from someone else still waiting counts once: as arriving, not again when the same tx
+    /// is pooled twice or is in a block already.
+    #[test]
+    fn a_received_waiting_coin_counts_once() {
+        let (_, _, coin) = two_coins();
+        let mine = |s: &[u8]| s == p2pkh(1);
+        let other = OutPoint { txid: Hash256([0xc; 32]), vout: 0 };
+        let t = tx(&[(other.txid, other.vout)], &[(7_000_000, p2pkh(1)), (1_000_000, p2pkh(3))], 1);
+        let f = figures(B, &[t.clone(), t.clone()], mine, &coin);
+        assert_eq!((f.balance, f.free, f.arriving, f.arriving_coins), (B + 7_000_000, B, 7_000_000, 1));
+        // In a block now (its output a confirmed coin, in B2), still pooled a moment: not counted again.
+        let paid = OutPoint { txid: t.txid, vout: 0 };
+        let coin2 = |op: &OutPoint| if *op == paid { Some((p2pkh(1), 7_000_000)) } else { coin(op) };
+        let f = figures(B + 7_000_000, &[t], mine, coin2);
+        assert_eq!((f.balance, f.arriving), (B + 7_000_000, 0));
+    }
+
+    /// Two waiting spends of the same coin (a replacement) take it once.
+    #[test]
+    fn a_replaced_spend_takes_the_coin_once() {
+        let (a, _, coin) = two_coins();
+        let mine = |s: &[u8]| s == p2pkh(1);
+        let t1 = tx(&[(a.txid, a.vout)], &[(149_000_000, p2pkh(1))], 1);
+        let t2 = tx(&[(a.txid, a.vout)], &[(148_000_000, p2pkh(2))], 2);
+        let f = figures(B, &[t1, t2], mine, &coin);
+        assert_eq!((f.leaving, f.free), (150_000_000, 95_000_000));
+    }
+
     /// A mining reward too young to spend is not offered as a coin, and a transaction that spends
     /// it is refused (the coin's network refuses it: bad-txns-premature-spend-of-coinbase).
     #[test]
@@ -717,6 +871,11 @@ pub(crate) mod tests {
         // Address 4's 1000 is spent by the waiting child: nothing left for it.
         let d = addr(&t, 4);
         assert_eq!(coins(&t.node, &json!({"addresses": [d]})).unwrap()["addresses"][&addr(&t, 4)]["total"], 0);
+        // The wallet's figures (wallet.keys) agree with tx.coins: confirmed 1900, none free, 800 arriving.
+        let f = wallet_figures(&t.node, t.node.params, &[p2pkh(1)]).unwrap();
+        assert_eq!((f.confirmed, f.free, f.arriving, f.balance), (1900, 0, 800, 800));
+        assert_eq!(f.waiting, vec![(good.txid, 800, 1900)]);
+        assert_eq!(wallet_figures(&t.node, t.node.params, &[p2pkh(4)]).unwrap().balance, 0);
 
         // tx.activity: confirmed rows above `since`, and the waiting txs touching each address.
         let v = activity(&t.node, &json!({"addresses": [a.clone(), addr(&t, 6)], "since": 1})).unwrap();

@@ -326,6 +326,7 @@ async function refreshWallet() {
   state.keys = keys;
   W.list = [
     ...keys.map((k) => ({ id: "own:" + k.index, own: true, index: k.index, address: k.address, legacy: k.legacy, tag: k.tag, balance: k.balance, pending: k.pending || 0,
+      confirmed: k.confirmed, free: k.free, pendingCoins: k.pending_coins || 0, waiting: k.waiting || [],
       label: k.tag ? "@" + k.tag : k.index ? `This arcade's wallet · address ${k.index}` : "This arcade's wallet" })),
     ...imps.filter((w) => w.chain === ch.key).map((w) => ({ id: "imp:" + w.address, own: false, address: w.address, balance: w.balance, name: w.name,
       kind: w.kind, addr_kind: w.addr_kind, spendable: w.addr_kind !== "p2sh-p2wpkh",
@@ -351,6 +352,14 @@ async function refreshWallet() {
   drawCard(ch);
   const w = cur();
   const key = `${ch.key}|${w && w.address}`;
+  // Waiting transactions changed: Activity shows them now, and one that left the pool (into a
+  // block, or dropped) has its block row read again.
+  const wsig = key + JSON.stringify((w && w.waiting) || []);
+  if (wsig !== W.waitSig) {
+    const left = W.waitSig && W.waitSig.startsWith(key + "[") && (W.waitList || []).some((t) => !((w && w.waiting) || []).some((x) => x.txid === t.txid));
+    W.waitSig = wsig; W.waitList = (w && w.waiting) || [];
+    if (left) W.viewAt = 0; else if (key === W.viewKey) drawPane(ch);
+  }
   if (w && (key !== W.viewKey || Date.now() - W.viewAt > 30000)) {
     if (key !== W.viewKey) { W.view = null; drawPane(ch); }
     W.viewKey = key; W.viewAt = Date.now();
@@ -380,7 +389,11 @@ function drawCard(ch) {
   const ddOn = w.own && w.index === 0 && isDD(ch.key) && W.dd && !W.dd.error;
   const sub = [];
   if (w.balance == null) sub.push(`${ch.name} isn't installed or borrowed with addresses here: add it in Chains & Coins to see balances.`);
-  if (w.pending > 0) sub.push(`+${coinNum(w.pending)} ${tk} arriving (in the mempool, spendable now)`);
+  // The balance follows the mempool (wallet.keys): the blocks' figure beside it when they differ.
+  if (w.confirmed != null && w.confirmed !== w.balance) sub.push(`${coinNum(w.confirmed)} ${tk} confirmed`);
+  if (w.pending > 0) sub.push(`${coinNum(w.pending)} ${tk} of it arriving (in the mempool)`);
+  if (w.own && w.free === 0 && w.pendingCoins > 0)
+    sub.push(`every confirmed coin is spent by a waiting transaction: waiting for ${w.pendingCoins} coin${w.pendingCoins === 1 ? "" : "s"} to confirm before you can post`);
   if (ddOn) sub.push(`${usd(W.dd.cents)} DigiDollar`);
   if (!w.own && !w.spendable) sub.push("Wrapped SegWit: receive only for now.");
   $("w-sub").textContent = sub.join(" · ");
@@ -450,10 +463,13 @@ function drawPane(ch) {
       const t = by.get(r.txid) || { txid: r.txid, height: r.height, net: 0 };
       t.net += (r.received || 0) - (r.sent || 0); by.set(r.txid, t);
     }
-    const txs = [...by.values()];
+    // This wallet's waiting transactions first (wallet.keys), unconfirmed until a block has them.
+    const waiting = ((w && w.own && w.waiting) || []).filter((x) => !by.has(x.txid))
+      .map((x) => ({ txid: x.txid, net: (x.received || 0) - (x.spent || 0), waiting: true }));
+    const txs = [...waiting, ...by.values()];
     pane.replaceChildren(txs.length ? h("div", { class: "wl-rows" }, txs.map((t) => h("div", { class: "wl-row click", onclick: () => openExplorer("tx", t.txid) },
       h("span", { class: "ic " + (t.net >= 0 ? "in" : "out") }, t.net >= 0 ? "↓" : "↑"),
-      h("div", { class: "mid" }, h("div", {}, t.net >= 0 ? "Received" : "Sent"), h("div", { class: "s" }, `block ${num(t.height)} · ${t.txid}`)),
+      h("div", { class: "mid" }, h("div", {}, t.net >= 0 ? "Received" : "Sent"), h("div", { class: "s" }, `${t.waiting ? "unconfirmed (in the mempool)" : "block " + num(t.height)} · ${t.txid}`)),
       h("span", { class: "amt " + (t.net >= 0 ? "in" : "") }, (t.net >= 0 ? "+" : "−") + coins(Math.abs(t.net), ch.key)))))
       : h("div", { class: "x-empty" }, v.history ? "No activity yet." : "Activity needs the Addresses index for this chain (Chains & Coins)."));
   } else if (W.tab === "tokens") {
