@@ -63,6 +63,12 @@ pub fn fill_price(o: &Value, cents: i64) -> u64 {
     (if taker_buys_dollars { n.div_ceil(total) } else { n / total }) as u64
 }
 
+/// Whether the maker's `asked` price keeps to the `agreed` one: a taker buying dollars pays no more DGB, one selling
+/// dollars gets no less.
+pub fn price_ok(taker_buys: bool, asked: u64, agreed: u64) -> bool {
+    if taker_buys { asked <= agreed } else { asked >= agreed }
+}
+
 /// Whether `cents` may be filled from what is left: $1 or more, at most what is left, and leaving $1 or more
 /// (or nothing).
 pub fn fill_ok(o: &Value, cents: i64) -> Result<(), String> {
@@ -356,7 +362,8 @@ pub fn book(node: &Node, chain: &str) -> Result<Vec<Value>, String> {
 
 /// Ask the maker to lay out a fill of `cents` of its order, with this wallet's coins as the taker's side,
 /// and check the answer as this side's own: (the answer, the checked transaction, the deal, this key).
-pub fn ask_fill(node: &Node, chain: &str, maker: &str, order: &str, cents: i64) -> Result<(Value, Unsigned, Deal, Role, Vec<Utxo>, Vec<u8>), String> {
+/// `price`: the DGB this side agreed to (the card's): a buyer of dollars pays no more, a seller gets no less.
+pub fn ask_fill(node: &Node, chain: &str, maker: &str, order: &str, cents: i64, price: u64) -> Result<(Value, Unsigned, Deal, Role, Vec<Utxo>, Vec<u8>), String> {
     let p = dd_chain(chain).ok_or("DigiDollar trades on dgb or dgbtest")?;
     let (_, held, dgb, dd_script, change) = crate::ddsvc::trade_coins(node, p)?;
     let taker = json!({"dgb": dgb.iter().map(utxo_json).collect::<Vec<_>>(), "dgb_change": hex::encode(&change),
@@ -380,6 +387,11 @@ pub fn ask_fill(node: &Node, chain: &str, maker: &str, order: &str, cents: i64) 
     }
     let taker_buys = a["maker_side"] == "sell";
     let role = if taker_buys { Role::Buyer } else { Role::Seller };
+    // The price is this side's too, not only the maker's word: the checks below measure the transaction against
+    // deal.price, so a maker that names another price at the Approve is refused here.
+    if !price_ok(taker_buys, deal.price, price) {
+        return Err(format!("the maker asks a different price now ({} DGB satoshis where you agreed to {price}); ask again", deal.price));
+    }
     if taker_buys && deal.dollars_to != dd_script {
         return Err("the maker would send the dollars somewhere else".into());
     }
@@ -393,9 +405,9 @@ pub fn ask_fill(node: &Node, chain: &str, maker: &str, order: &str, cents: i64) 
 }
 
 /// The taker signs its inputs and hands them to the maker, who signs last and broadcasts: the sent tx.
-pub fn take(node: &Node, chain: &str, maker: &str, order: &str, cents: i64) -> Result<(Tx, u64), String> {
+pub fn take(node: &Node, chain: &str, maker: &str, order: &str, cents: i64, price: u64) -> Result<(Tx, u64), String> {
     let p = dd_chain(chain).ok_or("DigiDollar trades on dgb or dgbtest")?;
-    let (a, u, ..) = ask_fill(node, chain, maker, order, cents)?;
+    let (a, u, ..) = ask_fill(node, chain, maker, order, cents, price)?;
     let (sk, ..) = crate::ddsvc::trade_coins(node, p)?;
     let part = ddtrade::sign_mine(p, &u, &sk)?;
     let q = json!({"op": "sign", "chain": p.key, "fill": a["fill"], "part": part_json(&part)});
@@ -408,4 +420,33 @@ pub fn take(node: &Node, chain: &str, maker: &str, order: &str, cents: i64) -> R
         return Err("the maker sent a different transaction".into());
     }
     Ok((tx, u.fee))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The maker's price at the Approve must keep to the card's: a buyer of dollars never pays more DGB, a seller of
+    /// dollars never gets less; a better price for this side goes ahead.
+    #[test]
+    fn the_approved_price_holds_at_the_take() {
+        let agreed = 1_000_000;
+        assert!(price_ok(true, agreed, agreed));
+        assert!(price_ok(true, agreed - 1, agreed));
+        assert!(!price_ok(true, agreed + 1, agreed));
+        assert!(!price_ok(true, u64::MAX, agreed));
+        assert!(price_ok(false, agreed, agreed));
+        assert!(price_ok(false, agreed + 1, agreed));
+        assert!(!price_ok(false, agreed - 1, agreed));
+        assert!(!price_ok(false, 0, agreed));
+    }
+
+    /// The pinned price is the book's fill price, rounded against the taker either way.
+    #[test]
+    fn the_pinned_price_is_the_books() {
+        let sell = json!({"side": "sell", "cents": 300, "dgb": 1000});
+        let buy = json!({"side": "buy", "cents": 300, "dgb": 1000});
+        assert_eq!(fill_price(&sell, 100), 334); // a taker buying dollars pays the rounding
+        assert_eq!(fill_price(&buy, 100), 333); // a taker selling dollars gets it rounded down
+    }
 }
