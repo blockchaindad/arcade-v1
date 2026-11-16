@@ -525,6 +525,39 @@ fn accept(node: Arc<Node>, l: std::net::TcpListener) {
     }
 }
 
+/// A mesh link that came as a WebSocket upgrade on the HTTP port (`wss://<host>/mesh`, TLS ended by a proxy in front,
+/// as on the Ashburn relay): the same as an inbound TCP link from `ip` (the client's address as the proxy gave it), on a
+/// thread of its own. Only on an arcade that takes inbound mesh links (a mesh port).
+pub fn accept_ws(node: Arc<Node>, s: std::net::TcpStream, ip: std::net::IpAddr, key: &str, pre: Vec<u8>) {
+    if node.mesh_port.is_none() {
+        return;
+    }
+    let Some(slot) = Slot::take(ip) else { return };
+    let key = key.to_string();
+    std::thread::spawn(move || {
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Ok(w) = s.try_clone() {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(HANDSHAKE_FOR);
+                if !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = w.shutdown(std::net::Shutdown::Both);
+                }
+            });
+        }
+        let r = arcade_mesh::transport::WsServer::accept(s, &key, pre, format!("wss {ip}"))
+            .map_err(LinkError::from)
+            .and_then(|t| Link::handshake_over(Box::new(t), NET, &node.identity, false, node.mesh_port));
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(slot);
+        let Ok(mut link) = r else { return };
+        let addr = format!("{ip}:{}", link.peer_listen.unwrap_or(0));
+        let k = crate::node::link_add(&node.links, &addr, &link.peer_id, now());
+        let _ = serve(&node, &mut link, &addr);
+        crate::node::link_remove(&node.links, &k);
+    });
+}
+
 fn our_tip(node: &Node) -> u64 {
     node.chain.tip(node.params.chain_no).ok().flatten().map(|t| t.height as u64).unwrap_or(0)
 }
@@ -576,7 +609,7 @@ pub fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> 
         serve_loop(node, link, addr, &peer, conn, &mut cr_reqs, &mut last_ping, &mut sent_outbox, &mut last_sz, &mut last_hold, &mut last_me, &mut last_offer)
     });
     crate::crvia::down(&peer);
-    crate::udpsvc::link_down(&peer);
+    crate::udpsvc::link_down(&peer, link.session_keys());
     crate::realtime::link_down(&peer, conn);
     r
 }

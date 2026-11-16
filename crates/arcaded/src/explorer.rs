@@ -181,7 +181,7 @@ fn page_route_ok(path: &str) -> bool {
 /// Mesh answers kept a short while: the Explorer asks the same things again and again
 /// (switching coins and back, the overview's 30 s refresh). A failure is kept too, so a
 /// holder that can't be reached costs one wait, not one per page.
-fn mesh_ask(node: &Node, p: &'static ChainParams, ix: &str, cmd: &str, q: &Value) -> Result<(Value, String), String> {
+pub(crate) fn mesh_ask(node: &Node, p: &'static ChainParams, ix: &str, cmd: &str, q: &Value) -> Result<(Value, String), String> {
     type Cache = std::collections::HashMap<String, (std::time::Instant, Result<(Value, String), String>)>;
     static C: std::sync::OnceLock<std::sync::Mutex<Cache>> = std::sync::OnceLock::new();
     let c = C.get_or_init(Default::default);
@@ -1405,13 +1405,17 @@ fn imported_lists(tag: &str) -> Vec<(String, serde_json::Map<String, Value>)> {
 /// An @tag on the picked chain: the tag lives on Pepecoin testnet; its owner's addresses on
 /// this chain are the ones their published profile lists (there can be several).
 fn tag_page(x: &Ctx, t: &str) -> R {
-    let home = x.node.params;
     let t = t.trim_start_matches('@').to_lowercase();
+    // Where the tag is held: ARCADE first, then the ledger home (crate::hometag, docs/HOMECHAIN.md).
+    let (home, _) = crate::hometag::owner(x.node, &t).ok_or_else(|| format!("@{t} is not claimed"))?;
     let row = arcade_ledger::index::tag_row(&x.node.chain, home.chain_no, &t).map_err(e)?.ok_or_else(|| format!("@{t} is not claimed"))?;
     let prof = arcade_ledger::index::profile(&x.node.chain, home.chain_no, &row.address).map_err(e)?;
     let mut addrs: Vec<(String, &str)> = Vec::new();
     if x.p.chain_no == home.chain_no {
         addrs.push((row.address.clone(), "the @tag's address"));
+    } else if let Some(a) = crate::hometag::address_on(x.p, &row.address).filter(|_| x.p.chain_no == x.node.ledger_home().chain_no || crate::arcsvc::runs(x.p)) {
+        // The same key on this chain (one key, one wallet on ARCADE and the ledger home).
+        addrs.push((a, "the @tag's key on this chain"));
     }
     for l in prof.as_ref().and_then(|v| v["linked"].as_array().cloned()).unwrap_or_default() {
         if l["chain"] == x.p.net {
@@ -1465,7 +1469,7 @@ fn search(x: &Ctx, q: &str) -> R {
     let hit = |kind: &str, id: String| Ok(json!({"kind": kind, "id": id}));
     if let Some(t) = q.strip_prefix('@') {
         // A tag page: every address the tag's owner has on this chain.
-        arcade_ledger::index::tag_row(&x.node.chain, x.node.ledger_home().chain_no, &t.to_lowercase()).map_err(e)?.ok_or_else(|| format!("@{t} is not claimed"))?;
+        crate::hometag::owner(x.node, t).ok_or_else(|| format!("@{t} is not claimed"))?;
         return hit("tag", t.to_lowercase());
     }
     if let Some(num) = q.strip_prefix('#') {
@@ -1500,7 +1504,7 @@ fn search(x: &Ctx, q: &str) -> R {
     // A plain word: everything it could be on this chain, as a list.
     let w = q.to_lowercase();
     let mut items: Vec<Value> = Vec::new();
-    if arcade_ledger::index::tag_row(&x.node.chain, x.node.ledger_home().chain_no, &w).ok().flatten().is_some() {
+    if crate::hometag::owner(x.node, &w).is_some() {
         items.push(json!({"kind": "tag", "id": w, "label": format!("@{w}"), "what": "@tag"}));
     }
     if x.has("names") {

@@ -27,8 +27,17 @@ pub fn chain_of(node: &Node, c: u16) -> Option<&'static ChainParams> {
 }
 
 /// A chain asked for by key (none: the home chain), if claims can be made on it.
+/// Where a new @tag is claimed when no chain is named (docs/HOMECHAIN.md phase 3): the ARCADE chain when it runs
+/// here, else the ledger home.
+pub fn claim_home(node: &Node) -> &'static ChainParams {
+    crate::arcsvc::defined().filter(|p| crate::arcsvc::runs(p)).unwrap_or(node.ledger_home())
+}
+
 pub fn chain_for(node: &Node, key: Option<&str>) -> Result<&'static ChainParams, String> {
-    match key.filter(|k| !k.is_empty() && !k.eq_ignore_ascii_case(node.ledger_home().key)) {
+    if key.is_none_or(|k| k.is_empty()) {
+        return Ok(claim_home(node));
+    }
+    match key.filter(|k| !k.eq_ignore_ascii_case(node.ledger_home().key)) {
         None => Ok(node.ledger_home()),
         Some(k) => crate::arcsvc::params_for(k).filter(|p| crate::arcsvc::runs(p)).ok_or_else(|| format!("@tags are claimed on {} or on the ARCADE chain (installed here); not on {k}", node.ledger_home().name)),
     }
@@ -295,6 +304,8 @@ fn advance_one(node: &Node, mut c: Claim) -> Result<Claim, String> {
                     }
                 }
                 Err(e) if !home => {
+                    // The ARCADE faucet tops the address up (once a day at most; #175).
+                    let _ = crate::arcfaucet::ask(node, &key.address);
                     set(&mut c, ClaimStatus::Funding, &format!("waiting for ARCADE at {} ({e})", key.address));
                 }
                 Ok(tx) => {
@@ -450,12 +461,15 @@ pub fn find_own_tag(node: &Node, now: bool) -> Option<String> {
     if !node.app.has_wallet().unwrap_or(false) {
         return None;
     }
-    if let Some(t) = node.app.tag_keys(p.chain_no).unwrap_or_default().into_iter().find_map(|k| k.tag) {
-        return Some(t);
+    // Its tag key on the chain claims go to (ARCADE), else on the ledger home.
+    for c in [claim_home(node).chain_no, p.chain_no] {
+        if let Some(t) = node.app.tag_keys(c).unwrap_or_default().into_iter().find_map(|k| k.tag) {
+            return Some(t);
+        }
     }
     // A claim under way is this arcade's own wallet's (claims are made from Home, for it): an added account
     // in use still has its @handle looked for, or its arcade could prove no handle and lose the mesh's indexes.
-    if node.app.active_account().is_empty() && node.app.claims().unwrap_or_default().iter().any(|c| c.chain == p.chain_no && c.status != ClaimStatus::Failed) {
+    if node.app.active_account().is_empty() && node.app.claims().unwrap_or_default().iter().any(|c| c.status != ClaimStatus::Failed) {
         return None;
     }
     // Looked for at most every 30 s (a minute while other arcades are asked): the words are
@@ -475,7 +489,8 @@ pub fn find_own_tag(node: &Node, now: bool) -> Option<String> {
         // Derived without being written down: only the slot found is kept.
         let Ok(x) = arcade_wallet::keys::tag_key(&seed[..], p.bip44_coin_type, i) else { return None };
         let address = arcade_wallet::keys::p2pkh_address(&x.public(), p.p2pkh_version);
-        let mut tag = arcade_ledger::index::tag_of(&node.chain, p.chain_no, &address).ok().flatten();
+        // On ARCADE or the ledger home: the same key (crate::hometag).
+        let mut tag = crate::hometag::of_address(node, &address);
         if tag.is_none() && lag {
             tag = tag_by_mesh(node, &address);
         }
@@ -611,7 +626,9 @@ pub fn signals_rbf(tx: &arcade_chain::Tx) -> bool {
 /// wallet made, handle claimed or being claimed, test coins asked for or here.
 pub fn start_status(node: &Node) -> serde_json::Value {
     use serde_json::json;
-    let p = node.ledger_home();
+    // The chain a new @handle is claimed on (ARCADE when it runs here), and what it is paid in.
+    let p = claim_home(node);
+    let home = is_home(node, p);
     let wallet = node.app.has_wallet().unwrap_or(false);
     if !wallet {
         return json!({"wallet": false});
@@ -626,7 +643,18 @@ pub fn start_status(node: &Node) -> serde_json::Value {
         Err(e) => return json!({"wallet": true, "error": e.to_string()}),
     };
     let script = arcade_wallet::keys::p2pkh_script_for(&arcade_wallet::secp256k1::PublicKey::from_slice(&hex::decode(&key.pubkey).unwrap()).unwrap());
-    let balance: u64 = coins(node, &script).iter().map(|u| u.value).sum();
+    let balance: u64 = if home { coins(node, &script) } else { arc_coins(node, p, &script) }.iter().map(|u| u.value).sum();
+    if !home {
+        // ARCADE: its own faucet (#175); the heights are the ARCADE chain's.
+        let tip = node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height);
+        return json!({
+            "wallet": true, "tag": tag, "address": key.address, "balance": balance,
+            "chain": {"key": p.key, "name": p.name, "unit": crate::explorer::unit(p)},
+            "claim": claim.map(|c| json!({"tag": c.tag, "status": format!("{:?}", c.status).to_lowercase(), "note": c.note})),
+            "faucet": crate::arcfaucet::of_address(&key.address),
+            "synced": crate::arcsvc::lends().is_some(), "height": tip, "best": tip,
+        });
+    }
     let ask = crate::faucet::last_ask(node, &key.address);
     let best = {
         let ours = node.chain.best_header(p.chain_no).ok().flatten().and_then(|h| node.chain.header(p.chain_no, &h).ok().flatten()).map(|r| r.height as u64).unwrap_or(0);
@@ -636,6 +664,7 @@ pub fn start_status(node: &Node) -> serde_json::Value {
     };
     json!({
         "wallet": true, "tag": tag, "address": key.address, "balance": balance,
+        "chain": {"key": p.key, "name": p.name, "unit": crate::explorer::unit(p)},
         "claim": claim.map(|c| json!({"tag": c.tag, "status": format!("{:?}", c.status).to_lowercase(), "note": c.note})),
         "faucet": ask.map(|(s, at)| {
             let paid = node.app.faucet_requests().unwrap_or_default().into_iter().filter(|f| f.address == key.address && f.txid.is_some()).max_by_key(|f| f.created);

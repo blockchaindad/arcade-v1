@@ -278,6 +278,171 @@ impl Transport for Wss {
     }
 }
 
+// ---------------- WebSocket, accepted (wss://host/mesh with TLS ended by a proxy in front) ----------------
+
+/// The answer to a WebSocket upgrade's Sec-WebSocket-Key (RFC 6455 §4.2.2).
+pub fn ws_accept_key(key: &str) -> String {
+    use base64::Engine as _;
+    use sha1::{Digest, Sha1};
+    let mut h = Sha1::new();
+    h.update(key.trim().as_bytes());
+    h.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    base64::engine::general_purpose::STANDARD.encode(h.finalize())
+}
+
+/// The server side of [`Wss`]: an upgrade answered on a plain TCP connection (a proxy in front holds the TLS), then
+/// the link's byte stream (u32 BE length + body, as on TCP) in binary messages. The client's frames must be masked;
+/// ours aren't (RFC 6455 §5.1).
+pub struct WsServer {
+    s: TcpStream,
+    /// Bytes read past the HTTP head before the upgrade was answered, read first.
+    pre: Vec<u8>,
+    desc: String,
+    partial: Vec<u8>,
+    inbox: Vec<u8>,
+}
+
+impl WsServer {
+    /// Answer the upgrade (its Sec-WebSocket-Key `key`, the head already read); `pre`: bytes read past the head.
+    pub fn accept(mut s: TcpStream, key: &str, pre: Vec<u8>, desc: String) -> io::Result<WsServer> {
+        if key.trim().is_empty() || key.len() > 64 {
+            return Err(bad("no Sec-WebSocket-Key"));
+        }
+        s.set_nodelay(true)?;
+        s.set_write_timeout(Some(Duration::from_secs(10)))?;
+        let head = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+            ws_accept_key(key)
+        );
+        s.write_all(head.as_bytes())?;
+        Ok(WsServer { s, pre, desc, partial: Vec::new(), inbox: Vec::new() })
+    }
+
+    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        let n = buf.len().min(self.pre.len());
+        buf[..n].copy_from_slice(&self.pre[..n]);
+        self.pre.drain(..n);
+        if n < buf.len() {
+            self.s.read_exact(&mut buf[n..])?;
+        }
+        Ok(())
+    }
+
+    fn write_frame(&mut self, opcode: u8, payload: &[u8]) -> io::Result<()> {
+        let mut f = Vec::with_capacity(10 + payload.len());
+        f.push(0x80 | opcode); // FIN, not masked
+        let n = payload.len();
+        if n < 126 {
+            f.push(n as u8);
+        } else if n <= 0xffff {
+            f.push(126);
+            f.extend_from_slice(&(n as u16).to_be_bytes());
+        } else {
+            f.push(127);
+            f.extend_from_slice(&(n as u64).to_be_bytes());
+        }
+        f.extend_from_slice(payload);
+        self.s.write_all(&f)?;
+        self.s.flush()
+    }
+
+    /// Next whole WebSocket message (pings answered, a close ends it).
+    fn message(&mut self) -> io::Result<Vec<u8>> {
+        loop {
+            let mut h = [0u8; 2];
+            self.read_exact(&mut h)?;
+            let fin = h[0] & 0x80 != 0;
+            let opcode = h[0] & 0x0f;
+            if h[1] & 0x80 == 0 {
+                return Err(bad("unmasked frame from a client"));
+            }
+            let mut n = (h[1] & 0x7f) as usize;
+            if n == 126 {
+                let mut e = [0u8; 2];
+                self.read_exact(&mut e)?;
+                n = u16::from_be_bytes(e) as usize;
+            } else if n == 127 {
+                let mut e = [0u8; 8];
+                self.read_exact(&mut e)?;
+                n = usize::try_from(u64::from_be_bytes(e)).unwrap_or(usize::MAX);
+            }
+            if n > MAX_WS_MESSAGE {
+                return Err(bad("message too large"));
+            }
+            let mut mask = [0u8; 4];
+            self.read_exact(&mut mask)?;
+            let mut p = vec![0u8; n];
+            self.read_exact(&mut p)?;
+            for (i, b) in p.iter_mut().enumerate() {
+                *b ^= mask[i % 4];
+            }
+            match opcode {
+                0x9 => self.write_frame(0xA, &p)?,
+                0xA => {}
+                0x8 => return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "WebSocket closed")),
+                0x0 | 0x1 | 0x2 => {
+                    self.partial.extend_from_slice(&p);
+                    if self.partial.len() > MAX_WS_MESSAGE {
+                        return Err(bad("message too large"));
+                    }
+                    if fin {
+                        return Ok(std::mem::take(&mut self.partial));
+                    }
+                }
+                _ => return Err(bad("unknown WebSocket opcode")),
+            }
+        }
+    }
+}
+
+impl Transport for WsServer {
+    fn send(&mut self, body: &[u8]) -> io::Result<()> {
+        if body.len() > MAX_FRAME {
+            return Err(bad("frame too large"));
+        }
+        let mut b = Vec::with_capacity(4 + body.len());
+        b.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        b.extend_from_slice(body);
+        self.write_frame(0x2, &b)
+    }
+
+    fn recv(&mut self) -> io::Result<Vec<u8>> {
+        loop {
+            if self.inbox.len() >= 4 {
+                let n = u32::from_be_bytes(self.inbox[..4].try_into().unwrap()) as usize;
+                if n > MAX_INBOUND {
+                    return Err(bad("frame too large"));
+                }
+                if self.inbox.len() >= 4 + n {
+                    let body = self.inbox[4..4 + n].to_vec();
+                    self.inbox.drain(..4 + n);
+                    return Ok(body);
+                }
+            }
+            let m = self.message()?;
+            self.inbox.extend_from_slice(&m);
+            if self.inbox.len() > MAX_INBOUND + 4 {
+                return Err(bad("frame too large"));
+            }
+        }
+    }
+
+    fn set_read_timeout(&mut self, d: Duration) -> io::Result<()> {
+        self.s.set_read_timeout(Some(d))
+    }
+
+    fn wait_readable(&mut self, d: Duration) -> io::Result<bool> {
+        if !self.inbox.is_empty() || !self.partial.is_empty() || !self.pre.is_empty() {
+            return Ok(true);
+        }
+        peek_tcp(&self.s, d)
+    }
+
+    fn describe(&self) -> String {
+        self.desc.clone()
+    }
+}
+
 // ---------------- plain HTTPS GET (for public old-arcade routes) ----------------
 
 /// GET `https://host/path` and return (status, body). HTTP/1.0 so the body is never chunked.
@@ -317,4 +482,61 @@ pub fn https_get(url: &str, timeout: Duration, max: usize) -> io::Result<(u16, V
     let head = String::from_utf8_lossy(&all[..split]);
     let status: u16 = head.split_whitespace().nth(1).and_then(|x| x.parse().ok()).ok_or_else(|| bad("bad status line"))?;
     Ok((status, all[split + 4..].to_vec()))
+}
+
+#[cfg(test)]
+mod ws_server_tests {
+    use super::*;
+
+    /// RFC 6455 §1.3's example key and answer.
+    #[test]
+    fn the_accept_key_is_the_rfcs() {
+        assert_eq!(ws_accept_key("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+    }
+
+    /// A client's masked binary messages carrying the link stream come out as its frames; ours go back unmasked; an
+    /// unmasked client frame is refused.
+    #[test]
+    fn frames_both_ways() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            let mut head = Vec::new();
+            let mut b = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                c.read_exact(&mut b).unwrap();
+                head.push(b[0]);
+            }
+            assert!(String::from_utf8_lossy(&head).contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
+            // Two link frames in one masked message: "hi", "there".
+            let mut stream = Vec::new();
+            for body in [&b"hi"[..], b"there"] {
+                stream.extend_from_slice(&(body.len() as u32).to_be_bytes());
+                stream.extend_from_slice(body);
+            }
+            let mask = [1u8, 2, 3, 4];
+            let mut f = vec![0x82, 0x80 | stream.len() as u8];
+            f.extend_from_slice(&mask);
+            f.extend(stream.iter().enumerate().map(|(i, x)| x ^ mask[i % 4]));
+            c.write_all(&f).unwrap();
+            // Our answer: one unmasked binary message, length + "ok".
+            let mut h = [0u8; 2];
+            c.read_exact(&mut h).unwrap();
+            assert_eq!((h[0], h[1]), (0x82, 6));
+            let mut p = [0u8; 6];
+            c.read_exact(&mut p).unwrap();
+            assert_eq!(&p, b"\0\0\0\x02ok");
+            // An unmasked frame is refused.
+            c.write_all(&[0x82, 0x01, 0x00]).unwrap();
+        });
+        let (s, _) = l.accept().unwrap();
+        let mut w = WsServer::accept(s, "dGhlIHNhbXBsZSBub25jZQ==", Vec::new(), "test".into()).unwrap();
+        w.set_read_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(w.recv().unwrap(), b"hi");
+        assert_eq!(w.recv().unwrap(), b"there");
+        w.send(b"ok").unwrap();
+        assert!(w.recv().is_err(), "unmasked client frame");
+        client.join().unwrap();
+    }
 }

@@ -54,7 +54,7 @@ The card is an ordinary app card with `"category": "themes"`, e.g.
 | `font`, `size`, `radius` | `system tahoma ubuntu mac serif mono`; 11–16 px; 0–16 px corners. |
 | `brand` | Text in the menu bar and at the head of the start menu. |
 | `desktop` | `bar` (taskbar: bottom, top, none), `dock` (none, left, bottom), `topbar` (none; `clock`: a bar with the start button and a clock; `menus`: a menu bar), `start` (its label), `icons` (on the desktop), `clock`, `buttons` (a window's buttons at the left or right). |
-| `icons` | Pictures for `home wallet messages feed apps explorer chains mine activity apitab options start`, as base64 `data:image/png`, `gif`, `webp` or `svg+xml` (under 12,000 characters each). Without them, plain line icons. |
+| `icons` | Pictures for the app's tabs (`home wallet messages feed people apps explorer chains mine activity apitab options`) and `start`; a tab the app adds later shows in every theme by itself, with a line icon until the theme gives it a picture, as base64 `data:image/png`, `gif`, `webp` or `svg+xml` (under 12,000 characters each). Without them, plain line icons. |
 | `chrome` | CSS for the frame only (below). |
 
 The page must be under 64 KB: the window reads it as the Explorer does (`explorer.ledger_inscription`).
