@@ -851,7 +851,10 @@ fn run_writer_on(node: Arc<Node>, svc: Arc<Svc>, wrote: &mut VecDeque<Hash256>, 
             // with links up but no blocks getting through). No block from anyone else in the last half of the limit
             // means this arcade isn't hearing the network (on a healthy one an arcade with a third of the weight
             // writes 50 in a row once in 3^50 tries): it waits until another's block comes.
-            if (t.weight as u128) < st.chain.storage().total_weight() {
+            // Counted against the weight that can write now: a writer whose rivals are all silenced (an answered
+            // challenge or demand, an audit period) is alone by the rules, not cut off, and must go on (ARCADE #11:
+            // testnet stopped at 675 while the JB20B was silenced).
+            if (t.weight as u128) < st.chain.storage().drawing_weight() {
                 let me = node.identity.verifying_key().to_bytes();
                 if alone_streak(&st.chain, &me, params::REORG_LIMIT / 2) >= params::REORG_LIMIT / 2 {
                     if alone_said.is_none_or(|t: Instant| t.elapsed() > Duration::from_secs(60)) {

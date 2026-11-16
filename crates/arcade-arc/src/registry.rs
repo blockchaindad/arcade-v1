@@ -888,6 +888,14 @@ impl Registry {
         self.total()
     }
 
+    /// The draw weight of every key that can write the next block: [`Self::total_weight`] without the keys silenced
+    /// for an answered challenge or demand (weight() leaves them out too). Local policy only (the alone guard in
+    /// arcsvc): the catalog and the serving checks keep counting total_weight, so no rule changes with it.
+    pub fn drawing_weight(&self) -> u128 {
+        let keys: BTreeSet<&Key> = self.genesis.keys().chain(self.owners.keys()).collect();
+        keys.into_iter().map(|k| self.weight(k) as u128).sum()
+    }
+
     /// A registered replica: (segment, owner, the block that held its proof).
     pub fn replica(&self, id: &Hash) -> Option<(Hash, Key, u64)> {
         self.replicas.get(id).map(|r| (r.segment, r.owner, r.height))
@@ -2684,6 +2692,9 @@ mod tests {
         r.items(&[Item::RevealAnswer(RevealAnswer { demand: d.id(&NET), run: crate::segment::Run::of(&data, 100, 10).unwrap() })], 3).unwrap();
         assert!(r.demands_on(&seg).is_empty() && r.catalog.get(&seg).is_some());
         assert_eq!(r.weight(&key(1).1), 0);
+        // The silenced demander still counts in total_weight (the catalog's and checkers' rule), but not in the
+        // weight that can write the next block, so the writers left aren't stopped by the alone guard.
+        assert_eq!(r.drawing_weight() + r.genesis[&key(1).1].0 as u128, r.total_weight());
         // Unanswered: the segment goes.
         let (mut r2, _, _, _, _) = tx_segment(h, &txs, &txs);
         r2.step(&[Item::RevealDemand(demand(1, 5, 3))], &at(2)).unwrap();
