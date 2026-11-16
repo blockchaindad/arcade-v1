@@ -261,6 +261,11 @@ pub fn publish_blobs(node: &Node, items: &[(Vec<u8>, String, arcade_arc::blob::C
         }
     }
     coins.sort_by(|a, b| b.value.cmp(&a.value));
+    // Then this key's change still waiting in the pool (the pool takes chains of waiting transactions): a second post
+    // right after a first spends the first one's change instead of waiting for a block (@strawberry/arcade-v1 #7).
+    for (_, sc) in &scripts {
+        coins.extend(crate::arcsvc::waiting_outputs(sc).into_iter().map(|(op, value)| Utxo { outpoint: op, value, script: sc.clone() }));
+    }
     let fp = fee_policy(p);
     let change_script = scripts[0].1.clone();
     let mut out_scripts: Vec<usize> = recs.iter().map(|r| r.0.script().len()).collect();
