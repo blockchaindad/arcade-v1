@@ -78,7 +78,7 @@ curl -fsSL https://raw.githubusercontent.com/martinseeger2002/arcade-v1/main/scr
 | `--home DIR` | Data folder (default `~/.local/share/arcade`). |
 | `--http-port N`, `--mesh-port N`, `--stun-port N` | Ports. The defaults are 8420, 8421 and 3478. A port that's already taken (for example, by another arcade on the same PC) moves to the next free one. STUN turns off (`0`) if its port is taken. |
 
-If the web port is reached through a reverse proxy or a tunnel, add `--behind-proxy` to `arcaded`'s own options (its service's `ExecStart` line): then nothing that arrives over the web port counts as this computer, so the API and the wallet's page API answer only the local socket.
+If the web port is reached through a reverse proxy or a tunnel, put `ARCADED_OPTS=--behind-proxy` in `~/.config/arcade/arcaded.env` and restart the service (`systemctl --user restart arcaded`): then nothing that arrives over the web port counts as this computer, so the API and the wallet's page API answer only the local socket. That file is yours: installs and updates rewrite the service, never it. Don't edit the service's `ExecStart` line, which the next update replaces.
 
 To keep the service running while you're logged out, and to start it at boot: `sudo loginctl enable-linger $USER`.
 
