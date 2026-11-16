@@ -996,7 +996,7 @@ mainnet. Marked *(default)* where Martin has not said yes.
 | 16 | built; gennet2 passes: the assembler leaves B's receipted commit out of its signed list, every arcade corrects it, the final list and the chain are as with an honest one |
 | 17 | built: Genesis::code; crates/arcaded/arcmain-genesis.json (timetable, the GX10 assembling); gennet3, the timetable shortened to minutes, makes a block 0 naming a release and starts the chain. To fill in before 12-21: the release id and the first difficulty |
 | 18 | built; cpnet passes: a fresh arcade with the right checkpoint syncs to the tip, with a wrong one it stops below it; the testnet ships block 1,000's |
-| 19 | built: the ledger snapshot (322 tags, 121 tokens, 462 balances of the testnet at Pepecoin testnet block 1,569,080, hash 3d0e902c…) named in block 0 and carried in; mignet passes: every tag on all three arcades with the same key hash, all 462 balances exact, a migrated tag taken |
+| 19 | built: the ledger snapshot (322 tags, 121 tokens, 462 balances of the testnet at Pepecoin testnet block 1,569,080, hash 3d0e902c…) named in block 0 and carried in; mignet passes: every tag on all three arcades with the same key hash, all 462 balances exact, a migrated tag taken. Since v0.1.84 the "carried in" note lives with the chain's own rows (chain store STATE `note:ledger_snapshot`): a copy made again takes the snapshot again right after block 0, and a store with blocks but no note has its ledger made again, the snapshot first, then every record walked once more (the JB20B lost all 322 tags to a rebuild under the old app-store flag, 2026-11-15) |
 | 20–22 | the testnet rehearsal (mid-December), the genesis window (12-21 to 12-31), launch (2027-01-01): dates, not code |
 | 23 | Martin |
 | 24 | todo |

@@ -13,6 +13,7 @@ mod handlegate;
 mod addrsvc;
 mod collsvc;
 mod knowncoll;
+mod oplist;
 mod announce;
 mod api;
 mod apikeys;
@@ -53,6 +54,7 @@ mod crsource;
 mod crvia;
 mod explorer;
 mod faucet;
+mod arcfaucet;
 mod http;
 mod importsvc;
 mod ledger;
@@ -582,6 +584,7 @@ fn main() {
                             *n.sync_state.lock().unwrap() = format!("index stopped: {e}");
                         }
                         faucet::pay_asks(&n);
+                        arcfaucet::pay(&n);
                         last = std::time::Instant::now();
                     }
                     claims::advance_all(&n);
@@ -610,6 +613,7 @@ fn main() {
         for (a, src) in heard {
             meshsvc::dial_heard(&node, a, src);
         }
+        meshsvc::retry_parked(&node);
         // Arcades that announce themselves on chain (MESH records), checked every 10 minutes.
         if !no_seeds {
             let n = node.clone();

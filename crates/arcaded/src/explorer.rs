@@ -488,6 +488,9 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
                 if let Some(rec) = ord::inscription(&x.node.chain, x.p, &id) {
                     r["cover_content"] = image_link(&x, &rec, &id).or_else(|| no_preview(&rec)).unwrap_or_else(|| content(&x, &id, 96 << 10));
                     r["cover_ct"] = rec["ct"].clone();
+                } else if r["kind"] == "list" {
+                    // An operator list's cover not held here: loaded through /content (the mesh), as a page.
+                    r["cover_content"] = json!({"kind": "html", "src": format!("/content/{id}")});
                 }
             }
             Ok(v)
@@ -495,6 +498,7 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
         "explorer.collection" => {
             x.need("collections")?;
             let mut v = crate::collsvc::get(node, x.p, req)?;
+            let list = v["kind"] == "list";
             // Each item held here: its record (n, h, ct) and a preview, as the inscriptions list.
             for it in v["items"].as_array_mut().into_iter().flatten() {
                 let id = it["id"].as_str().unwrap_or("").to_string();
@@ -503,6 +507,9 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
                     it["h"] = rec["h"].clone();
                     it["ct"] = rec["ct"].clone();
                     it["content"] = image_link(&x, &rec, &id).or_else(|| no_preview(&rec)).unwrap_or_else(|| content(&x, &id, 96 << 10));
+                } else if list {
+                    // A piece of an operator list not held here: loaded through /content (the mesh).
+                    it["content"] = json!({"kind": "html", "src": format!("/content/{id}")});
                 }
             }
             Ok(v)

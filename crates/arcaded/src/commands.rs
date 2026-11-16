@@ -100,6 +100,8 @@ cmds! {
     "start.status" Read "" "Getting started: wallet made, handle (claimed or being claimed), test coins asked for or here, synced.";
     "tag.list" Read "" "Your tag claims and their progress.";
     "faucet.ask" Wallet "index?, tag?" "Ask the mesh for test coins.";
+    "faucet.arc" Wallet "address?" "Ask the mesh to top an ARCADE address up to 0.01 ARCADE (once per address a day; a website calls it when a user signs in). Without address: this wallet's.";
+    "faucet.arc_status" Read "" "The ARCADE top-up asks this arcade knows and how many it paid today.";
     // Messaging
     "msg.me" Read "" "Your messaging key, fingerprint and whether it is published.";
     "msg.stats" Public "" "How many message candidates, posts, acts and machine records the home chain holds.";
@@ -310,6 +312,9 @@ cmds! {
     "dogefeed.registrar" Admin "fee_address?" "This arcade's D:// registrar (kid, key, address, fee address); fee_address sets where its 0.1 DOGE fees go.";
     "dogefeed.registrars_add" Admin "kid, pubkey, address, fee_address, name?" "Count another registrar's stamps (another arcade's) on this arcade.";
     "dogefeed.registrars_remove" Admin "kid" "Stop counting a registrar added with dogefeed.registrars_add.";
+    "collections.list_add" Admin "chain, name, file, slug?, description?, supply?, cover?" "Add (or replace) an operator list to a chain's collections index from a list file, nothing inscribed: OW.json ([{id, meta: {name: \"X #n\", attributes}}]), a doggy.market trait file, or [{id, number, traits}]. Shared on the mesh with its fingerprint (the sha256 an on-chain root of the same items carries).";
+    "collections.list_remove" Admin "chain, slug" "Remove an operator list from this arcade.";
+    "collections.list_copy" Admin "chain, slug" "Keep here a copy of an operator list another arcade shares, read from the mesh and kept only if it matches its fingerprint.";
     "collections.known_set" Admin "on" "Ask Nintondo for its lists of Doginals, Pepinals and Bellinals (off by default): the listing once a day, a collection's pieces when somebody opens it.";
     "referee.get" Read "" "The referee arcade this one asks for seeds when a page names none, and whose key /r/verified trusts by default: {url, pubkey}, or {} when none is set.";
     "referee.set" Admin "url" "Name the referee arcade (https://...): its key is read from its /r/referee. An empty url clears it.";

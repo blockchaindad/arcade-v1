@@ -4,7 +4,9 @@
 //! (legacy P2PKH, P2SH-P2WPKH, P2WPKH). Kept encrypted like the phrase; nothing is published.
 
 use crate::node::Node;
-use arcade_chain::params::{by_key, ChainParams};
+use arcade_chain::params::ChainParams;
+// Every coin and the ARCADE chain this arcade knows (an ARCADE key may be imported, e.g. a publisher's, to sign as its @tag).
+use crate::chains::find as by_key;
 use arcade_ledger::address::{base58check, hash160, p2pkh_script};
 use arcade_wallet::keys::{from_wif, XPriv, HARDENED};
 use arcade_wallet::secp256k1::{PublicKey, SecretKey, SECP256K1};

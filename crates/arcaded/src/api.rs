@@ -70,6 +70,16 @@ pub fn create_wallet(node: &Node, phrase: Option<&str>) -> Result<Value, String>
 }
 
 pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
+    // `"as": "@tag"` on an ARCADE write (ledger.*, a.*, arc.blob_publish*): signed by the key holding that tag, the
+    // wallet's own or an imported one (crate::arcledger::with_sign_as).
+    let cmd = req["cmd"].as_str().unwrap_or("");
+    if let Some(tag) = req["as"].as_str().filter(|_| cmd.starts_with("ledger.") || cmd.starts_with("a.") || cmd.starts_with("arc.blob_publish")) {
+        return crate::arcledger::with_sign_as(Some(tag.to_string()), || dispatch_inner(node, req));
+    }
+    dispatch_inner(node, req)
+}
+
+fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
     let s = |k: &str| req[k].as_str().map(String::from);
     let p = node.params;
     let c = p.chain_no;
@@ -325,6 +335,15 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         "dogefeed.act" => crate::dproto::act(node, req),
         "dogefeed.registrars_add" | "dogefeed.registrars_remove" => crate::dproto::registrars_edit(node, req["cmd"].as_str().unwrap_or(""), req),
         "collections.known_set" => crate::knowncoll::set(node, req["on"] == true),
+        "collections.list_add" | "collections.list_remove" | "collections.list_copy" => {
+            let key = s("chain").ok_or("chain required")?;
+            let p = crate::chains::find(&key).ok_or_else(|| format!("unknown chain {key}"))?;
+            match req["cmd"].as_str().unwrap_or("") {
+                "collections.list_add" => crate::oplist::add(node, p, req),
+                "collections.list_remove" => crate::oplist::remove(node, p, &s("slug").ok_or("slug required")?),
+                _ => crate::oplist::copy(node, p, &s("slug").ok_or("slug required")?),
+            }
+        }
         "realtime.lanes" => crate::realtime::fast::lanes(node, &s("token").ok_or("token required")?),
         "ring.send" => crate::ringsvc::send(node, &s("page").ok_or("page required")?, &s("to").unwrap_or_default(), &s("line").unwrap_or_default(), &s("link").unwrap_or_default()),
         "ring.waiting" => Ok(crate::ringsvc::waiting(node)),
@@ -396,6 +415,18 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             let (k, _) = node.app.tag_key(p, s("index").and_then(|i| i.parse().ok()).unwrap_or(0)).map_err(|e| e.to_string())?;
             Ok(json!(crate::faucet::ask(node, &k.address, &s("tag").unwrap_or_default())?))
         }
+        "faucet.arc" => {
+            // A website signs a user in and names their ARCADE address; without one, this wallet's.
+            match s("address").filter(|a| !a.is_empty()) {
+                Some(a) => crate::arcfaucet::ask(node, &a),
+                None => {
+                    let ap = crate::arcsvc::defined().ok_or("this arcade doesn't know the ARCADE chain")?;
+                    let (k, _) = node.app.tag_key(ap, 0).map_err(|e| e.to_string())?;
+                    crate::arcfaucet::ask(node, &k.address)
+                }
+            }
+        }
+        "faucet.arc_status" => Ok(crate::arcfaucet::status(node)),
         "mempool" => {
             // The chain asked for (`--chain`), the home chain by default; the ARCADE chain's pool is its own.
             let p = crate::sitesvc::chain(node, req)?;

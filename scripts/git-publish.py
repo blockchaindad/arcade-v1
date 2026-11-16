@@ -2,7 +2,7 @@
 """Push a git repository onto the ARCADE chain as blobs (crates/arcaded/src/arcgit.rs).
 
   git-publish.py --sock <arcade home>/arcaded.sock --repo DIR [--ref main] [--name arcade-v1] [--prev MANIFEST_ID]
-                 [--to @owner/name]
+                 [--to @owner/name] [--as @tag]
 
 Packs every object reachable from --ref that the manifest --prev doesn't reach yet (git pack-objects, pieces under
 3 MB so a pack and its index fit one block's 4 MB of blobs), publishes each pack and its index from the arcade's
@@ -12,6 +12,9 @@ manifest's id: `git clone http://<arcade>/git/<id>` clones it from any arcade.
 With --to, the push goes to a repository under an @tag (§15 step 9): it carries on from the repository's manifest now
 (unless --prev says otherwise), and once the new manifest is in a block a signed push record points the repository at
 it, so `git clone http://<arcade>/git/@owner/name` follows it. Only the owner and its maintainers can push.
+
+With --as, everything is signed and paid by the key that holds that @tag on the ARCADE chain: the arcade wallet's own,
+or one imported for ARCADE (wallet.import), such as a publisher's key.
 """
 import argparse, glob, json, os, socket, subprocess, sys, tempfile, time
 
@@ -25,11 +28,14 @@ def call(sock, req, t=300):
     return r["result"]
 
 
+AS = {}
+
+
 def publish(sock, files):
     """Publish files in one transaction, waiting while the wallet's coins are tied up in transactions not yet in a block."""
     for _ in range(360):
         try:
-            return call(sock, {"cmd": "arc.blob_publish_many", "files": files, "send": True})
+            return call(sock, {"cmd": "arc.blob_publish_many", "files": files, "send": True, **AS})
         except RuntimeError as e:
             if "not enough ARCADE" not in str(e):
                 raise
@@ -41,8 +47,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sock", required=True); ap.add_argument("--repo", required=True)
     ap.add_argument("--ref", default="main"); ap.add_argument("--name", default="")
-    ap.add_argument("--prev", default=""); ap.add_argument("--to", default="")
+    ap.add_argument("--prev", default=""); ap.add_argument("--to", default=""); ap.add_argument("--as", dest="as_tag", default="")
     a = ap.parse_args()
+    if a.as_tag:
+        AS["as"] = a.as_tag
     if a.to and not a.prev:
         try:
             a.prev = call(a.sock, {"cmd": "ledger.repo", "name": a.to})["manifest"]
@@ -82,7 +90,7 @@ def main():
             time.sleep(5)
         for _ in range(360):
             try:
-                out["push"] = call(a.sock, {"cmd": "ledger.repo_push", "name": a.to, "manifest": out["manifest"]}); break
+                out["push"] = call(a.sock, {"cmd": "ledger.repo_push", "name": a.to, "manifest": out["manifest"], **AS}); break
             except RuntimeError as e:
                 if "not enough" not in str(e) and "could not build" not in str(e):
                     raise
