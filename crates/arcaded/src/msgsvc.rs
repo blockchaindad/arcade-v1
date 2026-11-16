@@ -368,7 +368,8 @@ pub fn who(node: &Node, name: &str) -> Result<Value, String> {
     // "@name", or a bare name that isn't an address (people type handles without the @).
     let tag = n.strip_prefix('@').or_else(|| arcade_ledger::address::p2pkh_hash_of(node.ledger_home(), n).is_none().then_some(n));
     let address = match tag {
-        Some(t) => arcade_ledger::index::tag_row(&node.chain, c, &t.to_lowercase()).map_err(|e| e.to_string())?.ok_or_else(|| format!("@{t} is not claimed"))?.address,
+        // Held on ARCADE or here: the same key's address on this chain, where its messaging key is published.
+        Some(t) => crate::hometag::owner(node, t).and_then(|(_, a)| crate::hometag::address_on(node.ledger_home(), &a)).ok_or_else(|| format!("@{t} is not claimed"))?,
         None => n.to_string(),
     };
     let prof = arcade_ledger::index::profile(&node.chain, c, &address).map_err(|e| e.to_string())?;
@@ -524,7 +525,7 @@ pub fn sender_key(node: &Node) -> Result<(String, Option<String>, arcade_wallet:
     let p = node.ledger_home();
     let keys = node.app.tag_keys(p.chain_no).map_err(|e| e.to_string())?;
     for k in &keys {
-        if let Ok(Some(t)) = arcade_ledger::index::tag_of(&node.chain, p.chain_no, &k.address) {
+        if let Some(t) = crate::hometag::of_address(node, &k.address) {
             let (k, sk) = node.app.tag_key(p, k.index).map_err(|e| e.to_string())?;
             return Ok((k.address, Some(t), sk));
         }

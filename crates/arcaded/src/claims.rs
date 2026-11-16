@@ -55,6 +55,12 @@ pub fn check_on(node: &Node, p: &'static ChainParams, tag: &str) -> Check {
     if let Ok(Some(row)) = arcade_ledger::index::tag_row(&node.chain, p.chain_no, &tag) {
         return Check { tag, available: false, reason: Some(format!("taken by {} at block {}", row.address, row.block_height)) };
     }
+    // A tag held on ARCADE is that key's everywhere (docs/HOMECHAIN.md phase 2): not claimed again on the home chain.
+    if is_home(node, p) {
+        if let Some((on, by)) = crate::hometag::owner(node, &tag).filter(|(on, _)| on.chain_no != p.chain_no) {
+            return Check { tag, available: false, reason: Some(format!("taken on {} by {by}", on.name)) };
+        }
+    }
     if !is_home(node, p) {
         // The ARCADE chain: this arcade keeps it whole (no borrowed copy), and its pool's claims are the chain's
         // business (the first in a block wins).
