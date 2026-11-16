@@ -485,16 +485,29 @@
         cells: [[fmt(r.height)], [h("span", { class: "faint" }, stamp(r.time))], [h("span", { class: "mono" }, short(r.txid || "", 16, 8))], [r.received ? coins(r.received) : "", 1], [r.sent ? coins(r.sent) : "", 1]] })))
         : h("div", { class: "x-empty" }, "No transactions."));
   }
+  function contentVouch(id) {
+    const out = h("span", { class: "faint" }, "checking…");
+    fetch(`${httpBase || ""}/content/${id}`, { method: "HEAD" }).then((r) => {
+      const t = r.ok ? r.headers.get("X-Arcade-Trust") : "red";
+      const note = !r.ok ? "Not shown: arcades on the mesh sent different content for it, or none could send it."
+        : t === "green" ? "Read from the chain (its own transactions, checked here), or two arcades sent the same."
+        : "One arcade's word: its transactions couldn't be read here to check it.";
+      out.replaceWith(t ? vouchLine(t, note) : h("span", { class: "faint" }, "—"));
+    }).catch(() => out.replaceWith(h("span", { class: "faint" }, "—")));
+    return out;
+  }
   async function vInscription() {
     const i = await xapi("explorer.inscription", { chain: chain.key, id: arg, ...(await imgArgs()) });
     const ct = (i.ct || "").split(";")[0];
     // "In collection: Name #k" (collections index, here or on the mesh).
     const inColl = has("collections") ? (await xapi("explorer.collection_of", { chain: chain.key, id: i.id }).catch(() => null))?.collections || [] : [];
     const collRow = inColl.length ? ["In collection", h("span", {}, ...inColl.flatMap((x, k) => [k ? " · " : "", link(x.number != null ? `${x.name} #${fmt(x.number)}` : x.name, "collection", x.kind === "known" ? `known:${x.slug}` : x.id)]))] : null;
+    // From another arcade: whether this arcade's /content could read its bytes from the chain (namesites.rs Vouched).
+    const vouchRow = i._mesh || i.from_arcade ? ["Content", contentVouch(i.id)] : null;
     return h("div", {}, crumbs(link("Inscriptions", "inscriptions"), `#${fmt(i.n)}`),
       head(`Inscription #${fmt(i.n)}`, h("span", { class: "chip ins" }, ct || "no type"), i.burned != null ? pill("burned", false) : "", i.from_arcade || i._mesh ? "" : contentLink(`/content/${i.id}`, `Inscription #${fmt(i.n)}`)),
       h("div", { class: "x-split" }, preview(i, true),
-        kv([["Id", h("span", { class: "mono" }, i.id)], collRow, ["Holder", i.owner ? addrLink(i.owner, i.owner_tag) : h("span", { class: "faint" }, i.burned != null ? `burned at ${fmt(i.burned)}` : "—")],
+        kv([["Id", h("span", { class: "mono" }, i.id)], collRow, vouchRow, ["Holder", i.owner ? addrLink(i.owner, i.owner_tag) : h("span", { class: "faint" }, i.burned != null ? `burned at ${fmt(i.burned)}` : "—")],
           i.at && ["Location", link(short(i.at, 12, 10), "tx", i.at.split(":")[0], "mono")], ["Inscribed", h("span", {}, link(`block ${fmt(i.h)}`, "block", String(i.h)), i.time ? ` · ${when(i.time)}` : "")],
           ["Content type", i.ct || "—"], ["Size", `${fmt(i.size)} bytes · ${i.pieces} piece${i.pieces === 1 ? "" : "s"}`], i.proto && ["Protocol", i.proto],
           i.delegate && ["Delegate", link(short(i.delegate, 12, 6), "inscription", i.delegate, "mono")], i.parent && ["Parent", link(short(i.parent, 12, 6), "inscription", i.parent, "mono")],
@@ -589,6 +602,9 @@
         c.height != null && ["Block", link(fmt(c.height), "block", String(c.height))], c.replaces && ["Replaces", link(short(c.replaces, 12, 6), "collection", c.replaces, "mono")],
         (c.traits || []).length && ["Traits", c.traits.join(", ")], c.reason && ["Why", c.reason],
         c.kind === "list" && ["Fingerprint", h("span", { class: "mono", title: c.fp }, short(c.fp || "", 12, 6))],
+        // Kept here: who vouched for its fingerprint when it was copied (oplist.rs). Shown by another arcade: its word.
+        c.kind === "list" && ["Vouched", c._mesh ? vouchLine("yellow", "Another arcade's list: a copy kept here is checked against other arcades and on-chain roots first.")
+          : c.trust ? vouchLine(c.trust.level, c.trust.note) : "—"],
         c.kind === "list" && ["Kept", c._mesh ? h("span", {}, "by another arcade · ", listBtn("Keep a copy here", "collections.list_copy", c))
           : h("span", {}, c.from === "mesh" ? "here, copied from the mesh · " : "here, from a list file · ", listBtn("Remove", "collections.list_remove", c))]]),
       cpager(), items, cpager());
