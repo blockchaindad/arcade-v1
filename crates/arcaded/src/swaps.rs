@@ -1693,10 +1693,11 @@ mod account_tests {
         assert!(quote("pc", "pc", &ids[0]).unwrap_err().contains("taking that order"), "one taker at a time");
         // Asking again keeps the hold it has.
         let mut o = get(&t.node, "sorder", &ids[0]).unwrap();
-        o["held_until"] = json!(now() + 100);
+        let until = now() + 100;
+        o["held_until"] = json!(until);
         put(&t.node, "sorder", &o);
         quote("pa", "pa", &ids[0]).unwrap();
-        assert_eq!(get(&t.node, "sorder", &ids[0]).unwrap()["held_until"], json!(now() + 100), "not stretched");
+        assert_eq!(get(&t.node, "sorder", &ids[0]).unwrap()["held_until"], json!(until), "not stretched");
         // A website's visitors count as its own takers, up to HOLDS_PER_PEER orders at once.
         quote("pa", "pa:v1", &ids[1]).unwrap();
         quote("pa", "pa:v2", &ids[2]).unwrap();
