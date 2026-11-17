@@ -496,6 +496,12 @@ fn ledger_indexers() -> [Arc<dyn arcade_chaindb::Indexer>; 2] {
     [Arc::new(arcade_ledger::engine::LedgerIndexer), Arc::new(arcade_ledger::index::ProfileIndexer)]
 }
 
+/// The ARCADE chain's other indexes as the ledger home (HOMECHAIN.md phase 3): posts, acts and messages. Not in the
+/// snapshot (Pepecoin testnet keeps those as history), so added beside the ledger and walked over the stored blocks.
+fn home_indexers() -> [Arc<dyn arcade_chaindb::Indexer>; 1] {
+    [Arc::new(arcade_ledger::messages::MessageIndexer)]
+}
+
 /// Carry the snapshot into the store's ledger (only rows not there yet) and note it there.
 fn carry_in(db: &ChainDb, p: &ChainParams) -> Result<(), String> {
     let Some((c, want, snap)) = SNAPSHOT.lock().unwrap().clone().filter(|x| x.0 == p.chain_no) else { return Ok(()) };
@@ -1415,6 +1421,31 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
     let ledger_names: Vec<&'static str> = ledger.iter().map(|ix| ix.name()).collect();
     for ix in ledger {
         node.chain.add_indexer(p.chain_no, ix).map_err(db_err)?;
+    }
+    let home_names: Vec<&'static str> = home_indexers().iter().map(|ix| ix.name()).collect();
+    for ix in home_indexers() {
+        node.chain.add_indexer(p.chain_no, ix).map_err(db_err)?;
+    }
+    {
+        // Walked over the blocks stored before it was added (a short pass: the chain is young), in the background.
+        let n = node.clone();
+        std::thread::Builder::new()
+            .name("arc-home-index".into())
+            .spawn(move || {
+                for name in home_names {
+                    loop {
+                        match n.chain.backfill(p, name, 500) {
+                            Ok(0) => break,
+                            Ok(_) => std::thread::sleep(std::time::Duration::from_millis(30)),
+                            Err(e) => {
+                                eprintln!("arc: the {name} index stopped catching up: {e}");
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+            .map_err(|e| e.to_string())?;
     }
     if stale {
         carry_in(&node.chain, p)?;
