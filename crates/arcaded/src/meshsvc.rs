@@ -737,6 +737,7 @@ pub fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> 
         serve_loop(node, link, addr, &peer, conn, &mut cr_reqs, &mut last_ping, &mut sent_outbox, &mut last_sz, &mut last_hold, &mut last_me, &mut last_offer)
     });
     crate::crvia::down(&peer);
+    crate::svcmesh::link_down(&peer);
     crate::relaysvc::link_ended(link);
     crate::udpsvc::link_down(&peer, link.session_keys());
     crate::realtime::link_down(&peer, conn);
@@ -884,6 +885,9 @@ fn serve_loop(
             // Shared models (crate::llmsvc): an answer to our ask over this link (crvia), else an offer or an ask.
             "lm" if crate::crvia::on_answer(peer, &f) => {}
             "lm" => crate::llmsvc::on_frame(node, peer, &f),
+            // Services over the mesh (crate::svcmesh): an answer to our ask (crvia), else an offer or an ask.
+            "sv" if crate::crvia::on_answer(peer, &f) => {}
+            "sv" => crate::svcmesh::on_frame(node, peer, &f),
             "cb" => crate::coreboot::on_frame(node, link, &f)?,
             "vx" => crate::vxshare::on_frame(node, link, &f)?,
             // A blob piece we asked for over this link (crate::arcblob, crvia), else the ARCADE chain's own frames.
