@@ -156,6 +156,17 @@ pub fn pot_runs(net: &Net, height: u64) -> usize {
     }
 }
 
+/// The most runs the proof of time behind the draw seed of the epoch the block at `height` starts may come in: up to
+/// [`MAX_POT_RUNS`] from rules version 4 (#20: made in saved pieces, so a restart carries on instead of starting
+/// over), one run before.
+pub fn seed_runs(net: &Net, height: u64) -> usize {
+    if rules_v4(net, height) {
+        MAX_POT_RUNS
+    } else {
+        1
+    }
+}
+
 /// The ARCADE mesh protocol this arcade speaks, and the oldest it takes ARCADE frames from (§14.21).
 pub const PROTOCOL: u32 = 1;
 pub const MIN_PROTOCOL: u32 = 1;
