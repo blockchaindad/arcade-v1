@@ -149,6 +149,11 @@ pub fn ask_welcome(node: &Node, addr: &str) -> Result<Value, String> {
     let key = day_key("arc_welcome_asked", now);
     let mut asked = read_list(node, &key);
     if asked.iter().any(|a| a == addr) {
+        // Said again (the same signed ask): an arcade that came up or updated since takes it; others already have it.
+        if let Some(rec) = state().lock().unwrap().welcomes.get(addr).filter(|r| r["a"] == node.id_hex().as_str()).cloned() {
+            node.mesh_outbox.lock().unwrap().push(frame(rec));
+            return Ok(json!({"asked": true, "again": true, "address": addr}));
+        }
         return Ok(json!({"asked": false, "address": addr, "why": "asked for it today already"}));
     }
     let rec = arcade_mesh::welcome::sign(json!({"a": node.id_hex(), "addr": addr, "at": now, "k": "welcome"}), &node.identity);
