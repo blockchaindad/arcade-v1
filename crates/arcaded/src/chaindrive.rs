@@ -225,8 +225,35 @@ fn folder(node: &Node, id: &str, key: &str) -> Result<Option<PathBuf>, String> {
 pub fn add(node: &Node, key: &str, drive: &str, add: impl FnOnce() -> Result<Value, String>) -> Result<Value, String> {
     let fresh = crate::chains::find(key).filter(|p| p.chain_no != node.params.chain_no && !node.extra.lock().unwrap().contains_key(p.key));
     let Some(p) = fresh else { return add() };
+    // Already queued: its drive was chosen when it joined the queue. drive=home here would
+    // clear that place, and the chain would later install on the home drive.
+    if crate::chains::queued_at(node, p.key).is_some() {
+        return add();
+    }
     let dir = folder(node, drive, p.key)?;
     install_at(node, p.chain_no, dir.as_deref(), add)
+}
+
+/// One reply for the Options panel: installed chains (place and a move in progress) and queued
+/// chains (the drive chosen for them). Not the staged status the explorer polls per chain.
+pub fn places(node: &Node) -> Value {
+    let mut rows = Vec::new();
+    let extra: Vec<String> = node.extra.lock().unwrap().keys().cloned().collect();
+    for key in extra {
+        let Some(p) = crate::chains::find(&key) else { continue };
+        if p.chain_no == node.params.chain_no {
+            continue;
+        }
+        rows.push(json!({"key": p.key, "name": p.name, "installed": true, "place": place(node, p.chain_no), "move": status(p.key)}));
+    }
+    if let Some(q) = crate::chains::queue_list(node)["queue"].as_array() {
+        for e in q {
+            let key = e["key"].as_str().unwrap_or("");
+            let Some(p) = crate::chains::find(key) else { continue };
+            rows.push(json!({"key": p.key, "name": p.name, "queued": e["position"], "mode": e["mode"], "with": e["with"], "place": place(node, p.chain_no)}));
+        }
+    }
+    json!({"chains": rows})
 }
 
 fn install_at(node: &Node, c: u16, dir: Option<&Path>, add: impl FnOnce() -> Result<Value, String>) -> Result<Value, String> {
@@ -432,6 +459,24 @@ mod tests {
         install_at(node, c, Some(&on_usb), || Ok(json!({}))).unwrap();
         assert_eq!(node.chain.own_dir(c), on_usb);
         node.chain.set_place(c, None).unwrap();
+    }
+
+    /// A chain already waiting keeps the drive it was given. chains.add with drive=home used to
+    /// clear that place, so a queued Dogecoin on another drive would later install at home.
+    #[test]
+    fn a_queued_chain_on_another_drive_keeps_its_place_when_add_says_home() {
+        let node = &shared().node;
+        let c = crate::chains::find("doge").unwrap().chain_no;
+        crate::chains::enqueue_for_test(node, "doge");
+        let usb = tempfile::tempdir().unwrap();
+        let on_usb = usb.path().join(DIR).join("doge");
+        node.chain.set_place(c, Some(&on_usb)).unwrap();
+        let again = add(node, "doge", "home", || crate::chains::add(node, "doge", "full", vec![])).unwrap();
+        assert_eq!(again["queued"], true);
+        assert_eq!(again["key"], "doge");
+        assert_eq!(node.chain.own_dir(c), on_usb, "drive=home must not clear a queued chain's place");
+        crate::chains::unqueue(node, "doge").unwrap();
+        assert!(!node.chain.placed_elsewhere(c));
     }
 
     /// Martin, PR #153: listing the drives made arcade-chains on every mounted drive.

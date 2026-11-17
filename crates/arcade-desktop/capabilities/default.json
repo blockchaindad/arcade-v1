@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "The main window may call the arcade API and open app and content windows. Content windows (an inscription's page from this arcade's server) are in no capability: they call nothing.",
   "windows": ["main"],
-  "permissions": ["core:default", "allow-api", "allow-open-app", "allow-open-content"]
+  "permissions": ["core:default", "allow-api", "allow-open-app", "allow-open-content", "allow-node-start", "allow-open-cli"]
 }

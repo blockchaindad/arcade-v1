@@ -104,6 +104,11 @@ mod tests {
             for q in ['"', '\'', '`'] {
                 for piece in js.split(q).skip(1).step_by(2) {
                     let looks = piece.contains('.') && piece.split('.').all(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'));
+                    // service.stop is answered on the socket before dispatch, so cookie /rpc cannot
+                    // call it. The window still names it; it is not a commands.rs entry on purpose.
+                    if piece == "service.stop" {
+                        continue;
+                    }
                     if looks && api.contains(&format!("\"{piece}\"")) && crate::commands::find(piece).is_none() {
                         missing.push(format!("{piece} ({name})"));
                     }

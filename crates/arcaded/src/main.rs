@@ -41,6 +41,7 @@ mod coinsend;
 mod ddsvc;
 mod dproto;
 mod commands;
+mod localterm;
 mod diskfree;
 mod chainsvc;
 mod chains;
@@ -184,6 +185,14 @@ static RESTART_ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 pub fn request_restart() {
     RESTART_ASKED.store(true, std::sync::atomic::Ordering::SeqCst);
     STOP_ASKED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Written by service.stop. While it is here, the desktop must not start arcaded again: the
+/// window asks every few seconds, and that would undo Stop. Start, and the login task, delete
+/// it. Distinct from arcaded.stop, which asks a running service to exit and is removed at startup.
+pub fn mark_owner_stopped(home: &std::path::Path) {
+    let _ = std::fs::create_dir_all(home);
+    let _ = std::fs::write(home.join("arcaded.stopped"), b"stopped\n");
 }
 
 #[cfg(unix)]

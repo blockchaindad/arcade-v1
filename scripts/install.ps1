@@ -401,7 +401,11 @@ function Install-Programs([string]$FromDir, [string]$IconPng, [string]$IconIco) 
     $run = "`"$exe`" --home `"$DataDir`" --http-port $HttpPort --mesh-port $MeshPort --stun-port $StunPort"
     $runVbs = $run.Replace('"', '""')
     $vbs = Join-Path $bin 'arcaded-hidden.vbs'
+    # Login (and a Startup-folder fallback) clear the owner's stop marker, then start. The
+    # window's refresh does not: while arcaded.stopped exists it will not run this task.
     @"
+Set fso = CreateObject("Scripting.FileSystemObject")
+If fso.FileExists("$DataDir\arcaded.stopped") Then fso.DeleteFile "$DataDir\arcaded.stopped", True
 Set sh = CreateObject("WScript.Shell")
 sh.Environment("Process")("ARCADE_HOME") = "$DataDir"
 sh.CurrentDirectory = "$DataDir"
