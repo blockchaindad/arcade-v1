@@ -662,6 +662,24 @@ pub(crate) fn seed_proof(chain: &LocalChain) -> Option<TimeProof> {
 /// The epoch's draw seed proof being made (the VDF's, about 15 blocks of steps): its task, and the proof once made.
 static SEED: Mutex<Option<((arcade_arc::merkle::Hash, u64), Option<TimeProof>)>> = Mutex::new(None);
 
+/// Whether this arcade is making the draw seed's proof the next epoch's first block needs: an update waits for it
+/// before it restarts (crate::updater), since the seed's proof is one run of the VDF (chain rules) and a restart starts
+/// it over. Testnet block 900, 2026-11-16: two updates (v0.1.101, v0.1.102) restarted the GX10 in the middle of a
+/// 325M-step seed proof, and with the only other writer silenced the chain waited 81 minutes.
+pub fn seed_running() -> bool {
+    let job = SEED.lock().unwrap().as_ref().map(|j| (j.0, j.1.is_none()));
+    let Some(svc) = svc() else { return false };
+    let st = svc.st.lock().unwrap();
+    let wanted = st.chain.draw_seed_task(&st.chain.tip().id);
+    seed_job_running(job, wanted)
+}
+
+/// [`seed_running`]'s rule: a job whose proof isn't made yet, for the task the tip still wants (a job of an epoch that
+/// already has its first block, or of another branch, holds nothing up).
+fn seed_job_running(job: Option<((arcade_arc::merkle::Hash, u64), bool)>, wanted: Option<(arcade_arc::merkle::Hash, u64)>) -> bool {
+    matches!((job, wanted), (Some((task, true)), Some(w)) if task == w)
+}
+
 /// From the 80th block of an epoch on, the draw seed's task is known: its proof of time starts at once, in the
 /// background, so it is ready by the epoch's last block (the next epoch's first block carries it).
 fn warm_seed(chain: &LocalChain) {
@@ -3217,6 +3235,17 @@ mod tests {
         let p2 = store::chain_params(&NET, &new.id_at(0).unwrap());
         reconcile(&db, p2, &new).unwrap();
         stored_matches(&db, p2, &new);
+    }
+
+    /// An update waits only for a seed proof still running for the task the tip wants.
+    #[test]
+    fn an_update_waits_only_for_the_seed_the_tip_wants() {
+        let (a, b) = (([1u8; 32], 5u64), ([2u8; 32], 5u64));
+        assert!(seed_job_running(Some((a, true)), Some(a)), "running, and wanted");
+        assert!(!seed_job_running(Some((a, false)), Some(a)), "made already");
+        assert!(!seed_job_running(Some((a, true)), Some(b)), "another branch's or epoch's task");
+        assert!(!seed_job_running(Some((a, true)), None), "the tip wants no seed (the epoch has its first block)");
+        assert!(!seed_job_running(None, Some(a)), "none running");
     }
 
     /// A proof of time made in pieces is the one a single run gives, carries on from saved pieces after a restart, and
