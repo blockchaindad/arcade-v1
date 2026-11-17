@@ -663,9 +663,10 @@ pub(crate) fn seed_proof(chain: &LocalChain) -> Option<TimeProof> {
 static SEED: Mutex<Option<((arcade_arc::merkle::Hash, u64), Option<TimeProof>)>> = Mutex::new(None);
 
 /// Whether this arcade is making the draw seed's proof the next epoch's first block needs: an update waits for it
-/// before it restarts (crate::updater), since the seed's proof is one run of the VDF (chain rules) and a restart starts
-/// it over. Testnet block 900, 2026-11-16: two updates (v0.1.101, v0.1.102) restarted the GX10 in the middle of a
-/// 325M-step seed proof, and with the only other writer silenced the chain waited 81 minutes.
+/// before it restarts (crate::updater), since below rules version 4 the seed's proof is one run of the VDF (chain rules)
+/// and a restart starts it over (from version 4 it carries on from its saved pieces, losing only the piece running).
+/// Testnet block 900, 2026-11-16: two updates (v0.1.101, v0.1.102) restarted the GX10 in the middle of a 325M-step seed
+/// proof, and with the only other writer silenced the chain waited 81 minutes.
 pub fn seed_running() -> bool {
     let job = SEED.lock().unwrap().as_ref().map(|j| (j.0, j.1.is_none()));
     let Some(svc) = svc() else { return false };
@@ -680,14 +681,26 @@ fn seed_job_running(job: Option<((arcade_arc::merkle::Hash, u64), bool)>, wanted
     matches!((job, wanted), (Some((task, true)), Some(w)) if task == w)
 }
 
+/// Where the pieces of the draw seed's proof wait (rules version 4): apart from the block's own proof-pieces, as
+/// [`prove_in_pieces`] removes the pieces of any other proof in its directory.
+fn seed_pieces_dir(home: &std::path::Path, net: &Net) -> std::path::PathBuf {
+    home.join("arc").join(net.key).join("seed-pieces")
+}
+
 /// From the 80th block of an epoch on, the draw seed's task is known: its proof of time starts at once, in the
-/// background, so it is ready by the epoch's last block (the next epoch's first block carries it).
-fn warm_seed(chain: &LocalChain) {
+/// background, so it is ready by the epoch's last block (the next epoch's first block carries it). From rules version 4
+/// (#20) the proof may come in up to [`params::MAX_POT_RUNS`] runs: it is made in pieces saved under
+/// `<home>/arc/<net>/seed-pieces` (apart from the block's own proof-pieces, so neither's cleanup removes the other's),
+/// and a restart carries on from them instead of starting over.
+fn warm_seed(chain: &LocalChain, home: &std::path::Path) {
     if *chain.proofs() != Clock::Vdf {
         return;
     }
     let tip = chain.tip();
     let Some(task) = chain.draw_seed_task(&tip.id) else { return };
+    // The block that carries it: the next epoch's first.
+    let most = params::seed_runs(chain.net(), params::epoch_start(tip.height) + params::EPOCH_BLOCKS);
+    let dir = seed_pieces_dir(home, chain.net());
     let mut job = SEED.lock().unwrap();
     if job.as_ref().is_some_and(|j| j.0 == task) {
         return;
@@ -696,7 +709,7 @@ fn warm_seed(chain: &LocalChain) {
     drop(job);
     let _ = std::thread::Builder::new().name("arc draw seed".into()).spawn(move || {
         let t0 = Instant::now();
-        let proof = Clock::Vdf.prove(&task.0, task.1);
+        let proof = if most > 1 { prove_in_pieces(&dir, &task.0, task.1, most) } else { Clock::Vdf.prove(&task.0, task.1) };
         eprintln!("arc: the draw seed's proof of time ({} steps) took {:.0} s", task.1, t0.elapsed().as_secs_f64());
         let mut job = SEED.lock().unwrap();
         if job.as_ref().is_some_and(|j| j.0 == task) {
@@ -923,7 +936,7 @@ fn run_writer_on(node: Arc<Node>, svc: Arc<Svc>, wrote: &mut VecDeque<Hash256>, 
         if written.is_none() {
             let st = svc.st.lock().unwrap();
             let tip = st.chain.tip().id;
-            warm_seed(&st.chain);
+            warm_seed(&st.chain, &node.home);
             // A new tip, or an epoch's first block still waiting for its draw seed's proof: draw (again).
             let first_of_epoch = (st.chain.tip().height + 1) % params::EPOCH_BLOCKS == 0;
             if on != Some(tip) || (ticket.is_none() && first_of_epoch && !wrote.contains(&tip)) {
@@ -3292,6 +3305,47 @@ mod tests {
         // With a cap of 2 runs, a long proof is cut in no more than 2.
         let two = prove_in_pieces_of(dir.path(), &c, steps, 2, piece).unwrap();
         assert!(ChiaVdf.verify_pot(&c, steps, &two, 2));
+    }
+
+    /// From rules version 4 (#20) the draw seed's proof is made in pieces under seed-pieces: after a restart it carries
+    /// on from the saved ones, the proof checks by the seed rule of a v4 height (and not of a lower one), its draw seed is
+    /// a single run's, and the block's own proof-pieces next to it are left alone.
+    #[test]
+    fn a_draw_seed_proof_in_pieces_carries_on_after_a_restart() {
+        use arcade_arc::time::{draw_seed, Segment};
+        const NET4: Net = Net { rules: &[(1, 0), (2, 1), (3, 2), (4, 200)], ..params::TESTNET };
+        let home = tempfile::tempdir().unwrap();
+        let dir = seed_pieces_dir(home.path(), &NET4);
+        let pot_dir = home.path().join("arc").join(NET4.key).join("proof-pieces");
+        std::fs::create_dir_all(&pot_dir).unwrap();
+        std::fs::write(pot_dir.join("a-block-proof-1"), b"x").unwrap();
+        let c = [9u8; 32];
+        let (steps, piece) = (6_000u64, 2_000u64);
+        let most = params::seed_runs(&NET4, 200);
+        assert_eq!((most, params::seed_runs(&NET4, 100)), (params::MAX_POT_RUNS, 1));
+        let whole = ChiaVdf.prove(&c, steps).unwrap();
+        // Two pieces were made and saved before a restart.
+        let a = ChiaVdf.run(&c, &ChiaVdf::start(), piece).unwrap();
+        let b = ChiaVdf.run(&c, &a.output, piece).unwrap();
+        let mut raw = Vec::new();
+        for r in [&a, &b] {
+            raw.extend_from_slice(&r.steps.to_le_bytes());
+            raw.extend_from_slice(&r.output);
+            raw.extend_from_slice(&r.proof);
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{}-{steps}", hex::encode(c))), raw).unwrap();
+        let proof = prove_in_pieces_of(&dir, &c, steps, most, piece).unwrap();
+        // It carried on: its first two runs are the saved ones.
+        let runs: Vec<Segment> = arcade_arc::time::segments(&proof, steps, most).unwrap();
+        assert_eq!(runs.len(), 3);
+        assert_eq!((&runs[0], &runs[1]), (&a, &b));
+        assert_eq!(proof.output, whole.output);
+        assert_eq!(draw_seed(&NET4, &proof.output), draw_seed(&NET4, &whole.output));
+        assert!(Clock::Vdf.verify_pot(&c, steps, &proof, most));
+        assert!(!Clock::Vdf.verify(&c, steps, &proof), "one run only below rules version 4");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "nothing left once it is done");
+        assert!(pot_dir.join("a-block-proof-1").exists(), "the block's own pieces are not the seed's to remove");
     }
 }
 
