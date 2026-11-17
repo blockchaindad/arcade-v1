@@ -118,7 +118,17 @@ pub const BLOB_WINDOW: u64 = 30 * 24 * 3600;
 
 /// The newest rules version this arcade knows. Version 2 (time keepers, §6.2): a block's proof of time may come in
 /// up to [`MAX_POT_RUNS`] runs one after another. Version 3 (blobs, §15 step 1): blob records and a block's blob section.
-pub const RULES_KNOWN: u32 = 3;
+/// Version 4 (Martin 2026-11-16, ARCADE issues #6, #10, #11, #14, #20): see [`rules_v4`].
+pub const RULES_KNOWN: u32 = 4;
+
+/// Whether rules version 4 applies to the block at `height` (testnet only so far; the height is set in the release
+/// that ships it, about a day ahead): Shibacoin, Bellscoin, Luckycoin and Junkcoin listed and the collections and
+/// dogefeed journal families paid (#6); a repository push names the manifest it was based on (#10); draw weight from a
+/// replica's first passed audit (#11); index catalog entries confirmed by a tenth of the draw weight (#14); the draw
+/// seed's proof of time in up to [`MAX_POT_RUNS`] runs (#20).
+pub fn rules_v4(net: &Net, height: u64) -> bool {
+    net.rules_at(height) >= 4
+}
 
 /// The most runs a block's proof of time may come in from rules version 2 (a time keeper serving the 8 lowest
 /// candidates of a height; the 8th candidate's proof is 8 runs).
