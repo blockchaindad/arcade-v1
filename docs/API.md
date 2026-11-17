@@ -147,7 +147,7 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | method | route | needs | params | what |
 |---|---|---|---|---|
 | `faucet.ask` | `/api/v1/faucet/ask` | wallet | index?, tag? | Ask the mesh for test coins. |
-| `faucet.arc` | `/api/v1/faucet/arc` | wallet | address? | Ask the mesh to top an ARCADE address up to 0.01 ARCADE (once per address a day; a website calls it when a user signs in). Without address: this wallet's. |
+| `faucet.arc` | `/api/v1/faucet/arc` | wallet | address? | Ask the mesh to top an ARCADE address up to 0.05 ARCADE (once per address a day; a website calls it when a user signs in). Without address: this wallet's. |
 | `faucet.arc_status` | `/api/v1/faucet/arc_status` | read | — | The ARCADE top-up asks this arcade knows and how many it paid today. |
 
 ### Messages
