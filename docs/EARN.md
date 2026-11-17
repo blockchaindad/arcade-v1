@@ -118,7 +118,9 @@ Two weights, kept apart on purpose:
   audit, from the block holding its registration proof. The pot is shared by this.
 - **Draw weight** (`draw_weight`): what writes blocks, offers and attests catalog entries, and makes serving checks.
   A replica counts **200 blocks after its first passed audit** (`DRAW_WEIGHT_WAIT`, longer than the 100-block reorg
-  limit, so weight registered on a secret branch can't write there). Genesis bytes count from block 0.
+  limit, so weight registered on a secret branch can't write there). Genesis bytes count from block 0. **Rules version
+  4 (testnet only):** no wait: a replica counts from the block after its first passed audit (one still waiting when
+  version 4 begins counts from then); `draw_weight_wait` in `arc.earn` shows 0. Mainnet keeps the 200 blocks.
 - A key whose **reveal demand or transaction challenge is answered** (it challenged good data) has **no draw weight
   for one audit period** (`silenced_until`). Its pay weight is untouched. A key proved to have **signed two blocks on
   one parent** loses everything: replicas removed, accrued pay to the pot, no weight ever again.
@@ -162,7 +164,9 @@ A segment is offered by an arcade with draw weight that keeps the chain (and the
 - **blocks and coins**: by more than **a tenth** of the draw weight (rules version 3). Such a segment is in a
   **challenge window** of 100 blocks (`CHALLENGE_WINDOW`): listed, but no replica of it registers until the window
   is over.
-- **every index family**: by more than **half** of the draw weight.
+- **every index family**: by more than **half** of the draw weight. **Rules version 4 (testnet only):** by more than
+  a tenth too, with the same challenge window, so one of the two genesis writers lists an index segment alone.
+  Mainnet keeps half.
 
 On the testnet today the draw weight is the two genesis writers' (the GX10 and the JB20B), so only the chains and
 families they keep can be listed, and an index family needs both of them. A sealed segment that isn't listed shows

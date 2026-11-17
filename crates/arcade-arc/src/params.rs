@@ -32,7 +32,8 @@ pub const AUDIT_SAMPLE: usize = 4;
 pub const REGISTRATION_LEAVES: usize = 16;
 /// Audits in a row a replica may fail before it is removed.
 pub const MAX_MISSED_AUDITS: u32 = 3;
-/// Blocks after a first passed audit before a replica counts for the writer draw.
+/// Blocks after a first passed audit before a replica counts for the writer draw (below rules version 4; see
+/// [`draw_weight_wait`]).
 pub const DRAW_WEIGHT_WAIT: u64 = 200;
 /// An arcade never leaves its chain for one that splits off further back than this.
 pub const REORG_LIMIT: u64 = 100;
@@ -167,6 +168,19 @@ pub fn seed_runs(net: &Net, height: u64) -> usize {
     }
 }
 
+/// Blocks after its first passed audit, in the block at `height`, before a replica counts for the writer draw: none
+/// from rules version 4 (#11, testnet only: it counts from the next block), [`DRAW_WEIGHT_WAIT`] before. Mainnet's
+/// schedule has no version 4, so mainnet keeps the 200-block wait and with it §6.3's guarantee (REORG_LIMIT <
+/// DRAW_WEIGHT_WAIT: nothing registered on a secret branch counts for the draw before the branch is too old to take).
+/// The testnet gives that guarantee up on purpose (Martin 2026-11-16).
+pub fn draw_weight_wait(net: &Net, height: u64) -> u64 {
+    if rules_v4(net, height) {
+        0
+    } else {
+        DRAW_WEIGHT_WAIT
+    }
+}
+
 /// The ARCADE mesh protocol this arcade speaks, and the oldest it takes ARCADE frames from (§14.21).
 pub const PROTOCOL: u32 = 1;
 pub const MIN_PROTOCOL: u32 = 1;
@@ -225,8 +239,12 @@ mod tests {
     fn the_numbers_fit_together() {
         assert_eq!(BLOCK_REWARD * EPOCH_BLOCKS, 5_000 * COIN);
         assert_eq!(AUDIT_PERIOD_BLOCKS * BLOCK_SECONDS, 2 * 86_400);
-        // Nothing registered on a secret branch can count before the branch is too old (§6.3).
+        // Nothing registered on a secret branch can count before the branch is too old (§6.3). Mainnet has no rules
+        // version 4, so this holds there at every height; the testnet drops the wait from version 4 (#11).
         assert!(REORG_LIMIT < DRAW_WEIGHT_WAIT);
+        assert!((0..1_000_000).step_by(997).all(|h| REORG_LIMIT < draw_weight_wait(&MAINNET, h)));
+        let v4 = Net { rules: &[(3, 0), (4, 500)], ..TESTNET };
+        assert_eq!((draw_weight_wait(&v4, 499), draw_weight_wait(&v4, 500)), (DRAW_WEIGHT_WAIT, 0));
         // The draw seed's proof of time ends before the epoch it is for begins (§6.1).
         assert!(DRAW_SEED_BLOCKS + DRAW_SEED_TIME_BLOCKS < EPOCH_BLOCKS);
         assert_eq!(epoch_start(0), 0);
