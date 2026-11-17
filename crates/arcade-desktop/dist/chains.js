@@ -73,7 +73,7 @@
       }
     } else if (borrowed) {
       d.textContent = `${bc.state || "Borrowed"} · from block ${(bc.floor ?? 0).toLocaleString()} · ${bc.coins || 0} coin${bc.coins === 1 ? "" : "s"}${bc.scan ? " · " + bc.scan : ""}`;
-      l.textContent = (bc.lenders || []).length ? "Lenders: " + bc.lenders.map((x) => `${x.addr} (tip ${(x.tip || 0).toLocaleString()}${x.fails ? `, ${x.fails} recent failure${x.fails === 1 ? "" : "s"}` : ""})`).join(" · ") : "No lender right now";
+      l.textContent = (bc.lenders || []).length ? "Lenders: " + bc.lenders.map((x) => `${x.addr} (tip ${(x.tip || 0).toLocaleString()}${x.disagreed ? ", named another block: not used" : x.behind ? ", stopped far behind: not used until it catches up" : ""}${x.fails ? `, ${x.fails} recent failure${x.fails === 1 ? "" : "s"}` : ""})`).join(" · ") : "No lender right now";
       info.append(l);
     } else {
       d.textContent = "Not installed" + (bc.on === false || !globalOn ? " · borrowing off" : bc.lendable ? " · borrowing starts soon" : " · no arcade lends it right now");
