@@ -200,7 +200,7 @@ cmds! {
     "ledger.balances" Read "address" "An address's arcade token balances on the ARCADE chain (free, reserved, offered, accepted).";
     "ledger.tag_commit" Wallet "tag" "Commit ahead to claiming a released @tag on the ARCADE chain.";
     "ledger.tag_checkin" Wallet "" "Keep this wallet's @tag on the ARCADE chain with a check-in (0.1 ARCADE into the pot).";
-    "ledger.repo_push" Wallet "name, manifest" "Point @owner/name at a git manifest blob (owner or maintainer).";
+    "ledger.repo_push" Wallet "name, manifest, base?, force?" "Point @owner/name at a git manifest blob (owner or maintainer). From rules v4 the push names base (the manifest it was built on, \"\" for a new repo; default: the current one) and is refused if the repo moved on, unless force.";
     "ledger.repo_maintainer" Wallet "name, tag, add?" "Add or remove a maintainer of your repository.";
     "ledger.repo_fork" Wallet "from, name" "Fork @owner/name under your @tag.";
     "ledger.repo" Read "name" "A repository under an @tag: its manifest, maintainers and push history.";

@@ -404,8 +404,12 @@ A request is filed like `/r/send` and shown over the app (Approve or Refuse); it
 ARCADE whatever chain the app is on. A push carries `files` (base64: packs, each followed by its index, then the
 manifest last, 3.8 MB at most); the manifest names a new pack by `name` (its checksum) with empty `pack`/`idx`
 ids, which the arcade fills in, and every pack it names must be on the chain or in the push. `merge: <number>`
-makes the push a pull request's merge (the merge record moves the repository). The work runs in the background:
-records wait for the wallet's coins, a push for its manifest's block, then the push record.
+makes the push a pull request's merge (the merge record moves the repository). From ARCADE rules version 4 a push
+names its `base`, the manifest it was built on (64 hex, `""` for a new repository; left out, the manifest's `prev`,
+else the repository's manifest when the request is made), and `force: true` replaces whatever is there: without force, a push whose base
+the repository has moved on from is refused (the request fails with the reason, or the record is invalid if another
+push landed first). The work runs in the background: records wait for the wallet's coins, a push for its manifest's
+block, then the push record. The socket command is `ledger.repo_push {name, manifest, base?, force?}` (same rules).
 
 **Signing as another @tag** (socket requests): `"as": "@tag"` on `ledger.*`, `a.*` and `arc.blob_publish*` signs and
 pays with the key that holds that tag on ARCADE: one of the wallet's own, or a key imported for the ARCADE chain with
@@ -418,7 +422,8 @@ the record, so it waits until the key has a free coin for each.
 what the repository's manifest doesn't reach yet, publishes it (any size: a pack over 3.5 MB, one big file, goes as
 parts joined by a file manifest blob, `{"arcade": "file", ...}`, which the arcade's git reads join back), then the
 manifest and the push record; a push that isn't a fast-forward needs `--force`, and the first push to a name under
-your own tag creates it. Settings: `ARCADE_SOCK`/`git config arcade.sock`, `ARCADE_AS`/`arcade.as` (sign as a tag).
+your own tag creates it. The record names the manifest the push read first, so (rules version 4) a push that another
+one beat to the chain is refused instead of rolling it back: fetch and push again, or force. Settings: `ARCADE_SOCK`/`git config arcade.sock`, `ARCADE_AS`/`arcade.as` (sign as a tag).
 
 **Arcades that borrow the ARCADE chain** (it isn't installed, so no ledger or blobs are kept) answer `/r/git/*` and
 `/git/*` by asking an arcade that lends the chain (core RPC method `arcade_git [path, query]` →

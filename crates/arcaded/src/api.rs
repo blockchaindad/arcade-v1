@@ -469,7 +469,7 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         // The ledger on the ARCADE chain (§15 step 7).
         "ledger.announce" => crate::arcledger::announce(node),
         "ledger.profile" => crate::arcledger::profile(node, &req),
-        "ledger.repo_push" => crate::arcledger::repo_push(node, &s("name").ok_or("name required")?, &s("manifest").ok_or("manifest required")?),
+        "ledger.repo_push" => crate::arcledger::repo_push(node, &s("name").ok_or("name required")?, &s("manifest").ok_or("manifest required")?, s("base").as_deref(), req["force"] == true),
         "ledger.repo_maintainer" => crate::arcledger::repo_maintainer(node, &s("name").ok_or("name required")?, &s("tag").ok_or("tag required")?, req["add"] != false),
         "ledger.repo_fork" => crate::arcledger::repo_fork(node, &s("from").ok_or("from required")?, &s("name").ok_or("name required")?),
         "ledger.item_open" => crate::arcledger::item_open(node, &req),

@@ -1054,6 +1054,15 @@ after its block-1,100 retarget.
   the ledger; texts are blobs. Reviews and merges are the owner's and maintainers'; authors close their own; a merge
   moves the repository to the merged manifest. `scripts/github-import.py` brings a GitHub repository's issues, pull
   requests, comments and reviews, each keeping its GitHub number, author and time.
+  **Rules version 4 (ARCADE #10):** a push names the manifest it was built on (REPO op 7: name ‖ manifest ‖ base ‖
+  flags, bit 0 force; base is zeros for a repository's first push), and the ledger refuses it (an invalid record, as
+  any refused record) when base isn't the repository's manifest at that point of the chain, unless forced; a forced
+  push replaces as before. Below version 4's height op 7 is unknown and refused, as it always was; op 1 pushes (no
+  base) stay valid at every height. Arcades send op 7 from that height (`ledger.repo_push` fills `base` with the
+  repository's manifest now when the caller gives none; the Git app's request takes its manifest's `prev`;
+  `git-publish.py` and `git-remote-arcade` send the manifest they read, `--force` / `git push --force` force). This
+  stops a push built from an out-of-date copy silently rolling another one back (2026-11-16: a mirror's second push,
+  36 s after the first, put `main` back).
 - **Light confirmation (11)**, rules version 3: block and coins segments list with more than a tenth of the draw
   weight (the first offer of an arcade over 10% lists it) and replicas of them register only after
   `CHALLENGE_WINDOW` = 100 blocks; fraud proofs and reveal demands reach them meanwhile (the watcher asks the poster

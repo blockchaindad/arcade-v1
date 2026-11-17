@@ -130,6 +130,11 @@ pub fn rules_v4(net: &Net, height: u64) -> bool {
     net.rules_at(height) >= 4
 }
 
+/// The first height where [`rules_v4`] holds, if any (a network's rules versions rise with height).
+pub fn rules_v4_from(net: &Net) -> Option<u64> {
+    net.rules.iter().find(|(v, _)| *v >= 4).map(|(_, h)| *h)
+}
+
 /// The most runs a block's proof of time may come in from rules version 2 (a time keeper serving the 8 lowest
 /// candidates of a height; the 8th candidate's proof is 8 runs).
 pub const MAX_POT_RUNS: usize = 8;
@@ -227,6 +232,10 @@ mod tests {
     fn a_block_carries_the_rules_version_of_its_height() {
         let net = Net { rules: &[(1, 0), (2, 5_000), (3, 9_000)], ..TESTNET };
         assert_eq!((net.rules_at(0), net.rules_at(4_999), net.rules_at(5_000), net.rules_at(10_000)), (1, 1, 2, 3));
+        assert_eq!(rules_v4_from(&net), None);
+        let v4 = Net { rules: &[(3, 0), (4, 700)], ..TESTNET };
+        assert_eq!(rules_v4_from(&v4), Some(700));
+        assert!(!rules_v4(&v4, 699) && rules_v4(&v4, 700) && rules_v4(&v4, 10_000));
         // Every version scheduled on the real networks is one this arcade knows.
         for n in [MAINNET, TESTNET] {
             assert!(n.rules.iter().all(|(v, _)| *v <= RULES_KNOWN));
