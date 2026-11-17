@@ -208,7 +208,7 @@ impl Catalog {
         if !self.net.listed.contains(&e.chain.as_str()) {
             return Err(no("catalog entry: not a listed chain"));
         }
-        if !segment::FAMILIES.contains(&e.family) {
+        if !segment::family_at(&self.net, e.family, height) {
             return Err(no("catalog entry: no such family"));
         }
         if !segment::whole_ranges(e.first, e.last) {
@@ -305,7 +305,7 @@ impl Catalog {
         let mut sorted: Vec<&CatalogEntry> = entries.iter().collect();
         sorted.sort_by(|a, b| line_of(a).cmp(&line_of(b)).then(a.first.cmp(&b.first)));
         for e in sorted {
-            if !self.net.listed.contains(&e.chain.as_str()) || !segment::FAMILIES.contains(&e.family) || !segment::whole_ranges(e.first, e.last) {
+            if !self.net.listed.contains(&e.chain.as_str()) || !segment::family_at(&self.net, e.family, 0) || !segment::whole_ranges(e.first, e.last) {
                 return Err(no("genesis catalog: not a listed chain, family or whole ranges"));
             }
             let least = (e.last - e.first + 1).checked_mul(segment::ROW).and_then(|table| table.checked_add(self.full));
@@ -576,6 +576,43 @@ pub(crate) mod tests {
             assert!(light_family(&NET4, f, 10));
             assert!((0..1_000_000).step_by(997).all(|h| !light_family(&MAINNET, f, h) || raw));
         }
+    }
+
+    #[test]
+    fn the_dogefeed_family_is_taken_from_rules_version_4_only() {
+        const NET4: Net = Net { rules: &[(3, 0), (4, 10)], ..TESTNET };
+        let of = |net: &Net, family: u8| {
+            let mut e = entry_on(net, &secret(1), "doge", 0, 0, just_full(1), 1);
+            e.family = family;
+            e.sig = block::sign(&secret(1), &e.message(net));
+            e
+        };
+        let unknown = || no("catalog entry: no such family");
+        let offer = |c: &mut Catalog, e: &CatalogEntry, h: u64| {
+            let before = c.clone();
+            let r = c.apply(&[Item::CatalogEntry(e.clone())], h, &held());
+            if r.is_err() {
+                assert_eq!(*c, before);
+            }
+            r
+        };
+        // Below version 4 (and on mainnet, which has none): refused as an unknown family is (13 is one).
+        let d = of(&NET4, segment::FAMILY_DOGEFEED);
+        assert_eq!(offer(&mut Catalog::new(NET4, FULL), &d, 9), Err(unknown()));
+        assert_eq!(offer(&mut Catalog::new(NET4, FULL), &of(&NET4, 13), 9), Err(unknown()));
+        assert_eq!(offer(&mut Catalog::new(MAINNET, FULL), &of(&MAINNET, segment::FAMILY_DOGEFEED), 500_000), Err(unknown()));
+        assert!(Catalog::new(NET4, FULL).list_at_genesis(&[d.clone()]).is_err(), "nor in block 0's list");
+        // From version 4: taken as any family; an unknown family and collections (11, kept, not listed) still aren't.
+        let mut c = Catalog::new(NET4, FULL);
+        offer(&mut c, &d, 10).unwrap();
+        assert!(c.waiting(&d.segment(&NET4)).is_some() || c.get(&d.segment(&NET4)).is_some());
+        assert_eq!(offer(&mut Catalog::new(NET4, FULL), &of(&NET4, 13), 10), Err(unknown()));
+        assert_eq!(offer(&mut Catalog::new(NET4, FULL), &of(&NET4, segment::FAMILY_COLLECTIONS), 10), Err(unknown()));
+        // The families before version 4 are taken at every height, as before.
+        for f in [0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10] {
+            assert!((0..20).all(|h| segment::family_at(&NET4, f, h)) && segment::family_at(&MAINNET, f, 0), "family {f}");
+        }
+        assert!(!segment::family_at(&NET4, segment::FAMILY_DOGEFEED, 9) && segment::family_at(&NET4, segment::FAMILY_DOGEFEED, 10));
     }
 
     #[test]

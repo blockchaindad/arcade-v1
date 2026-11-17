@@ -274,7 +274,7 @@ fn take(rec: Record) -> bool {
 fn check_entry(s: &Settings, e: &CatalogEntry) -> bool {
     let least = (e.last - e.first + 1).checked_mul(arcade_arc::segment::ROW).and_then(|t| t.checked_add(s.segment_bytes));
     s.net.listed.contains(&e.chain.as_str())
-        && arcade_arc::segment::FAMILIES.contains(&e.family)
+        && arcade_arc::segment::family_at(&s.net, e.family, 0)
         && arcade_arc::segment::whole_ranges(e.first, e.last)
         && least.is_some_and(|l| e.bytes >= l)
         && block::verify(&e.poster, &e.message(&s.net), &e.sig)
