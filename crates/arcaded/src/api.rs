@@ -20,7 +20,30 @@ pub fn serve(node: Arc<Node>, path: std::path::PathBuf) {
 
 fn handle(node: Arc<Node>, s: UnixStream) {
     let mut w = s.try_clone().unwrap();
-    for line in BufReader::new(s).lines().map_while(Result::ok) {
+    let mut lines = BufReader::new(s).lines();
+    while let Some(Ok(line)) = lines.next() {
+        // Services over the mesh (crate::svcmesh): a helper keeps this connection; an ask with "stream" answers in
+        // several lines, the last the usual {ok, result}.
+        if let Ok(req) = serde_json::from_str::<Value>(&line) {
+            if req["cmd"] == "svc.attach" {
+                return crate::svcmesh::attach(node, &mut lines, w, &req);
+            }
+            if req["cmd"] == "svc.ask" && req["stream"] == true {
+                let mut ww = match w.try_clone() {
+                    Ok(x) => x,
+                    Err(_) => return,
+                };
+                let r = crate::svcmesh::ask_cmd(&node, &req, Some(&mut |v: Value| writeln!(ww, "{v}").map_err(|e| e.to_string())));
+                let reply = match r {
+                    Ok(v) => json!({"ok": true, "result": v}),
+                    Err(e) => json!({"ok": false, "error": e}),
+                };
+                if writeln!(w, "{reply}").is_err() {
+                    break;
+                }
+                continue;
+            }
+        }
         let reply = match serde_json::from_str::<Value>(&line) {
             Ok(req) => match dispatch(&node, &req) {
                 Ok(v) => json!({"ok": true, "result": v}),
@@ -107,6 +130,12 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         }
         "mesh.udp" => Ok(crate::udpsvc::status(node)),
         "mesh.relay" => Ok(crate::relaysvc::status(node)),
+        "svc.offers" => crate::svcmesh::list_offers(node, req),
+        "svc.services" => Ok(crate::svcmesh::services()),
+        "svc.ask" => crate::svcmesh::ask_cmd(node, req, None),
+        "svc.pay" => crate::svcmesh::pay(node, req),
+        "svc.paid" => crate::svcmesh::paid(node, req),
+        "svc.attach" => Err("svc.attach is for the API socket only (it keeps the connection)".into()),
         "llm.status" => Ok(crate::llmsvc::status(node)),
         "llm.set" => crate::llmsvc::set(node, &req),
         "llm.scan" => crate::llmsvc::scan(node, &req),

@@ -680,6 +680,7 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
             "node" => Some(include_str!("shims/node.js")),
             "state" => Some(include_str!("shims/state.js")),
             "llm" => Some(include_str!("shims/llm.js")),
+            "svc" => Some(include_str!("shims/svc.js")),
             "escrow" => Some(include_str!("shims/escrow.js")),
             "swap" => Some(include_str!("shims/swap.js")),
             "market" => Some(include_str!("shims/market.js")),

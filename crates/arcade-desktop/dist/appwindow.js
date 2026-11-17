@@ -85,7 +85,57 @@
 
   // Shared models (arcade.llm, docs/LLM.md): the app spends this wallet's model credit only after a yes, once a window.
   let llmYes = false;
+  // Services over the mesh (arcade.svc, docs/SVC.md): asking in the player's name, and managing this computer's
+  // helper, each after a yes once a window and service; each payment and new key on its own card.
+  const svcAskYes = {}, svcLocalYes = {};
+  let svcMe = null;
   const doors = {
+    async svc(m) {
+      const service = String(m.service || "");
+      if (!/^[a-z0-9-]{1,32}$/.test(service)) throw new Error("service: 1-32 of a-z, 0-9 and -");
+      if (m.op === "offers") return { offers: await api("svc.offers", { service }) };
+      if (m.op === "ask") {
+        const to = String(m.to || "");
+        if (!/^[0-9a-f]{64}$/.test(to)) throw new Error("to: an arcade's node id");
+        if (!svcAskYes[service]) {
+          const yes = await oneCard(() => card(`Let ${appName} use ${service} at other arcades?`, [
+            `${appName} asks to send requests to ${service} services on the mesh in your name (your ARCADE address), so a seller can charge them to the credit you bought there.`,
+            "It can't move your coins or buy credit without asking."], "Allow"));
+          if (!yes) throw new Error("Cancelled.");
+          svcAskYes[service] = true;
+        }
+        const r = await api("svc.ask", { to, service, body: m.body || {}, timeout: Math.min(1200, Math.max(1, Number(m.timeout) || 600)) });
+        return { last: r.last, answers: r.answers };
+      }
+      if (m.op === "local") {
+        const body = m.body && typeof m.body === "object" ? m.body : {};
+        const what = String(body.what || "");
+        if (!svcLocalYes[service]) {
+          const yes = await oneCard(() => card(`Let ${appName} manage your ${service} helper?`, [
+            `${appName} asks to read and change the settings of the ${service} helper running on this computer, and to use it as you.`,
+            "Each payment and each new key still asks on its own card."], "Allow"));
+          if (!yes) throw new Error("Cancelled.");
+          svcLocalYes[service] = true;
+        }
+        if (what === "buy") {
+          const amount = Number(body.amount);
+          if (!(amount > 0)) throw new Error("amount: ARCADE to pay");
+          const yes = await oneCard(() => card(`Pay ${amount} ARCADE?`, [
+            `${appName} asks to buy ${amount} ARCADE of ${service} credit from ${String(body.seller || "").slice(0, 16)}, paid from your ARCADE wallet.`,
+            "The seller credits it once the payment is in a block."], "Pay"));
+          if (!yes) throw new Error("Cancelled.");
+        }
+        if (what === "key_new") {
+          const yes = await oneCard(() => card("Make a key for programs on this computer?", [
+            `${appName} asks to make a key that lets programs on this computer use ${service} with your credit.`], "Make key"));
+          if (!yes) throw new Error("Cancelled.");
+        }
+        if (!svcMe) svcMe = (await api("status")).node_id;
+        const r = await api("svc.ask", { to: svcMe, service, body, timeout: 1200 });
+        return { result: r.last };
+      }
+      throw new Error("svc ops are offers, ask and local");
+    },
     async llm(m) {
       if (m.op === "offers") {
         const list = await api("llm.offers");

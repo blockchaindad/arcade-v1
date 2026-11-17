@@ -1,0 +1,50 @@
+# Services over the mesh (`svc`)
+
+A general channel for programs on this computer to offer a service to other arcades and to ask theirs. Arcaded only
+carries it; it knows nothing about what a service does. The first user will be the AI marketplace's helper
+(arcade-models), moving the marketplace out of arcaded. Code: `crates/arcaded/src/svcmesh.rs`.
+
+## A helper (the service's side)
+
+Open the API socket and send `{"cmd": "svc.attach", "service": "<name>"}`. The name is 1-32 characters of a-z, 0-9
+and `-`. The connection then stays open:
+
+- **arcaded writes** `{"ok": true, "result": {service, node, pay_to, tag}}` first (this arcade's node id, its ARCADE
+    address and @tag), then:
+  - `{"in": {id, from, who, tag, body}}` for each request. `from` is the asking arcade's node id. `who` is the
+    asker's ARCADE address, proved by a grant its wallet signed for this service at this arcade (null when it has
+    no ARCADE wallet), and `tag` is that address's @tag.
+  - `{"cancel": {id, why}}` when the asker's link goes down.
+  - `{"offered": bool}` or `{"error": ...}` for the helper's own lines.
+- **the helper writes:**
+  - `{"out": {id, ev?, blob?, end?, err?}}`, any number per request. `blob` is base64 bytes, split into 48 KiB
+    frames on the wire. The last answer carries `end: true` or `err`.
+  - `{"offer": {...}}`: its offer, at most 16 KiB. This arcade signs it with its node key and spreads it over the
+    mesh, again every 10 minutes while the helper stays attached. `{"offer": null}` withdraws it.
+
+There is one helper per service name. When the helper's connection closes, its open requests get "the service
+stopped", and its offer is withdrawn at once.
+
+## Commands
+
+| command | perm | what |
+|---|---|---|
+| `svc.offers {service?}` | Read | every arcade's offer: service, arcade, tag, public name, pay_to, linked, offer |
+| `svc.services` | Read | the helpers attached here |
+| `svc.ask {to, service, body, timeout?, stream?}` | Local | ask a service at an arcade (this one too). Returns `{last, answers: [{ev, blob?}]}`. With `"stream": true` on the socket, one line per answer as it comes, then `{ok, result: {last}}`. |
+| `svc.pay {to, amount, memo}` | Wallet | ARCADE to an address, with a memo of up to 80 bytes |
+| `svc.paid {txid, memo?}` | Read | whether it is in a block (`in_block`), what it `paid` this arcade's address, and whether `memo_found` |
+
+**Reaching an arcade:** an ask reaches it by its public name, a relay, or a UDP introduction, waiting up to 25 s.
+It may take up to 20 minutes, with at most 3 minutes between answers.
+
+## Wire
+
+Frames are `{"t": "sv", ...}`; older arcades ignore the kind.
+
+- `offer {s, o, at, tag, name, pay_to, body, sig}`, flooded and kept 30 minutes.
+- `q {id, seq, end}` plus a piece of the request (zlib JSON `{service, body, grant}`, 48 KiB pieces), over crvia.
+- `a {id, seq, end, ev?, err?}` plus a piece of answer bytes.
+
+A grant is a Core-style signmessage, by the asker's ARCADE address, of
+`arcade-svc grant <service> <arcade> <address> <expires>`. It lasts a year at most.
