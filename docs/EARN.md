@@ -130,16 +130,18 @@ then it can't post or attest catalog entries: it depends on arcades with draw we
 
 ### Chains
 
-Only the network's **listed** chains (`params.rs`, `listed`; adding one is a rules version):
+Only the network's **listed** chains (`params.rs`, `Net::listed_at`: `listed`, plus `listed_v4` from the rules version 4
+height; adding one is a rules version):
 
 | Network | Listed |
 |---|---|
-| Testnet (`arctest`) | arctest, pep, peptest, doge, dgb, dgbtest, flop, wjk, kot, ltc, ltctest, btc |
+| Testnet (`arctest`) | arctest, pep, peptest, doge, dgb, dgbtest, flop, wjk, kot, ltc, ltctest, btc; **from rules version 4** also shic, bel, lky, jkc |
 | Mainnet (`arc`) | arc, pep, peptest, doge, dgb, flop, wjk, kot, ltc, btc |
 
-Coins & Chains also offers Shibacoin (shic), Bellscoin (bel), Luckycoin (lky) and Junkcoin (jkc): they are **not paid on
-either network** today, and their Earn ARCADE line says so instead of a switch that reads on (issue #6). The ARCADE
-chain itself is always sealed while it runs here; it has no switch.
+Shibacoin (shic), Bellscoin (bel), Luckycoin (lky) and Junkcoin (jkc) are paid on the **testnet from the rules version 4
+height** (issue #6): before it their Earn ARCADE line says "not paid on this network" instead of a switch that reads on,
+and at it the line flips (it reads the next block's height), segments of them are offered, sealed and can earn. On
+mainnet they are not paid. The ARCADE chain itself is always sealed while it runs here; it has no switch.
 
 ### Families
 

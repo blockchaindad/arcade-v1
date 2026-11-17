@@ -96,8 +96,11 @@ pub struct Net {
     pub tag: &'static [u8],
     /// Block 0's time (seconds since 1970, UTC). `None` until the testnet's date is set.
     pub genesis_time: Option<u64>,
-    /// The listed chains (§2.3), by V1.0's keys: only their segments can be in the catalog.
+    /// The listed chains (§2.3), by V1.0's keys: only their segments can be in the catalog. Consensus reads them at a
+    /// height, through [`Net::listed_at`].
     pub listed: &'static [&'static str],
+    /// The chains listed from rules version 4 on ([`rules_v4`], ARCADE issue #6), on top of `listed`.
+    pub listed_v4: &'static [&'static str],
     /// Target seconds between blocks, as the difficulty follows the clock: [`BLOCK_SECONDS`]. Only a local
     /// test chain (`--arc-local` settings, `block_seconds`) sets less, so its tests see many epochs and audit
     /// periods in minutes.
@@ -181,6 +184,18 @@ impl Net {
     pub fn rules_at(&self, height: u64) -> u32 {
         self.rules.iter().rev().find(|(_, from)| *from <= height).map_or(1, |(v, _)| *v)
     }
+
+    /// The listed chains (§2.3) for the block at `height`: `listed`, and `listed_v4` where [`rules_v4`] holds. A catalog
+    /// entry is judged at its block's height; views ask for the next block's.
+    pub fn listed_at(&self, height: u64) -> impl Iterator<Item = &'static str> + '_ {
+        let more: &'static [&'static str] = if rules_v4(self, height) { self.listed_v4 } else { &[] };
+        self.listed.iter().chain(more).copied()
+    }
+
+    /// Whether `chain` (V1.0's key) is listed for the block at `height`.
+    pub fn is_listed_at(&self, chain: &str, height: u64) -> bool {
+        self.listed_at(height).any(|c| c == chain)
+    }
 }
 
 pub const MAINNET: Net = Net {
@@ -193,6 +208,9 @@ pub const MAINNET: Net = Net {
     // 2027-01-01 00:00:00 UTC.
     genesis_time: Some(1_798_761_600),
     listed: &["arc", "pep", "peptest", "doge", "dgb", "flop", "wjk", "kot", "ltc", "btc"],
+    // Mainnet's list is unchanged by rules version 4 (#6 lists Shibacoin, Bellscoin, Luckycoin and Junkcoin on the
+    // testnet only, and mainnet has no version 4 height).
+    listed_v4: &[],
     block_seconds: BLOCK_SECONDS,
     rules: &[(2, 0)],
     audit_period: AUDIT_PERIOD_BLOCKS,
@@ -209,6 +227,8 @@ pub const TESTNET: Net = Net {
     genesis_time: None,
     // The main network's, and the other test chains: small, so cheap to try things on.
     listed: &["arctest", "pep", "peptest", "doge", "dgb", "dgbtest", "flop", "wjk", "kot", "ltc", "ltctest", "btc"],
+    // Rules version 4 (#6): Shibacoin, Bellscoin, Luckycoin and Junkcoin, from its height.
+    listed_v4: &["shic", "bel", "lky", "jkc"],
     block_seconds: BLOCK_SECONDS,
     // Restarted 2026-11-15 (Martin: "restart + carry ledger"): version 3 (blobs, the tenth with its challenge window, on
     // top of version 2's time keepers and writer's share) from block 0. The chain before ran 1 from 0 and 2 from 1,065.
@@ -252,6 +272,26 @@ mod tests {
             assert!(n.rules.iter().all(|(v, _)| *v <= RULES_KNOWN));
             assert!(n.rules.windows(2).all(|w| w[0].0 < w[1].0 && w[0].1 < w[1].1));
         }
+    }
+
+    #[test]
+    fn shibacoin_bellscoin_luckycoin_and_junkcoin_are_listed_from_rules_version_4_on_the_testnet() {
+        let four = ["shic", "bel", "lky", "jkc"];
+        let v4 = Net { rules: &[(3, 0), (4, 700)], ..TESTNET };
+        for c in four {
+            assert!(!v4.is_listed_at(c, 0) && !v4.is_listed_at(c, 699), "{c} below the v4 height");
+            assert!(v4.is_listed_at(c, 700) && v4.is_listed_at(c, 10_000), "{c} from the v4 height");
+        }
+        assert_eq!(v4.listed_at(699).collect::<Vec<_>>(), TESTNET.listed);
+        assert_eq!(v4.listed_at(700).count(), TESTNET.listed.len() + 4);
+        // The chains listed before stay listed at every height.
+        assert!(TESTNET.listed.iter().all(|c| v4.is_listed_at(c, 0) && v4.is_listed_at(c, 700)));
+        // Mainnet's list doesn't change, even at a version 4 height.
+        let main4 = Net { rules: &[(2, 0), (4, 700)], ..MAINNET };
+        for c in four {
+            assert!(!MAINNET.is_listed_at(c, u64::MAX) && !main4.is_listed_at(c, 700) && !main4.is_listed_at(c, u64::MAX));
+        }
+        assert_eq!(main4.listed_at(700).collect::<Vec<_>>(), MAINNET.listed);
     }
 
     #[test]
