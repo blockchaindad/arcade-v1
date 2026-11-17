@@ -496,6 +496,12 @@ fn ledger_indexers() -> [Arc<dyn arcade_chaindb::Indexer>; 2] {
     [Arc::new(arcade_ledger::engine::LedgerIndexer), Arc::new(arcade_ledger::index::ProfileIndexer)]
 }
 
+/// The ARCADE chain's other indexes as the ledger home (HOMECHAIN.md phase 3): posts, acts and messages. Not in the
+/// snapshot (Pepecoin testnet keeps those as history), so added beside the ledger and walked over the stored blocks.
+fn home_indexers() -> [Arc<dyn arcade_chaindb::Indexer>; 1] {
+    [Arc::new(arcade_ledger::messages::MessageIndexer)]
+}
+
 /// Carry the snapshot into the store's ledger (only rows not there yet) and note it there.
 fn carry_in(db: &ChainDb, p: &ChainParams) -> Result<(), String> {
     let Some((c, want, snap)) = SNAPSHOT.lock().unwrap().clone().filter(|x| x.0 == p.chain_no) else { return Ok(()) };
@@ -1264,7 +1270,11 @@ pub fn define_text(node: &Arc<Node>, text: &str) -> Result<(), String> {
         let _changing = CHANGING.lock().unwrap();
         run(node, def)?;
     } else {
-        eprintln!("arc: the ARCADE test chain {} (block 0 {genesis}) can be installed in Chains & Coins", net.key);
+        // The home chain (HOMECHAIN.md phase 3, Martin 2026-11-17): installed by itself, on a new arcade and on one
+        // updating from a release before, and it stays.
+        install(node)?;
+        eprintln!("arc: the ARCADE test chain {} (block 0 {genesis}) installed: it is the home chain", net.key);
+        let _ = node.app.event("chains", &format!("installed {}: it is the home chain (@tags, profiles, posts and messages live there)", def.params.name));
     }
     Ok(())
 }
@@ -1279,7 +1289,7 @@ pub fn install(node: &Arc<Node>) -> Result<(), String> {
     let def = DEF.get().ok_or("this arcade knows no ARCADE chain")?;
     let _changing = CHANGING.lock().unwrap();
     if svc().is_some() {
-        return Err(format!("{} is already installed", def.params.name));
+        return Ok(()); // installed already (by itself, as the home chain)
     }
     if REMOVING.load(Ordering::Relaxed) {
         return Err(format!("{} is still being removed; try again in a moment", def.params.name));
@@ -1294,6 +1304,10 @@ pub fn install(node: &Arc<Node>) -> Result<(), String> {
 /// Coins on it are not lost: they are on the chain, and the wallet's keys stay.
 pub fn remove(node: &Arc<Node>) -> Result<(), String> {
     let def = DEF.get().ok_or("this arcade knows no ARCADE chain")?;
+    // The home chain stays (HOMECHAIN.md phase 3): @tags, profiles, posts and messages are read and written there.
+    if !LOCAL.load(Ordering::Relaxed) {
+        return Err(format!("{} is the home chain (your @tag, profile, posts and messages live there), so it can't be removed", def.params.name));
+    }
     let _changing = CHANGING.lock().unwrap();
     let svc = SVC.write().unwrap().take().ok_or_else(|| format!("{} is not installed", def.params.name))?;
     // Under the chain's lock: a block being taken in right now is in before, or never.
@@ -1415,6 +1429,31 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
     let ledger_names: Vec<&'static str> = ledger.iter().map(|ix| ix.name()).collect();
     for ix in ledger {
         node.chain.add_indexer(p.chain_no, ix).map_err(db_err)?;
+    }
+    let home_names: Vec<&'static str> = home_indexers().iter().map(|ix| ix.name()).collect();
+    for ix in home_indexers() {
+        node.chain.add_indexer(p.chain_no, ix).map_err(db_err)?;
+    }
+    {
+        // Walked over the blocks stored before it was added (a short pass: the chain is young), in the background.
+        let n = node.clone();
+        std::thread::Builder::new()
+            .name("arc-home-index".into())
+            .spawn(move || {
+                for name in home_names {
+                    loop {
+                        match n.chain.backfill(p, name, 500) {
+                            Ok(0) => break,
+                            Ok(_) => std::thread::sleep(std::time::Duration::from_millis(30)),
+                            Err(e) => {
+                                eprintln!("arc: the {name} index stopped catching up: {e}");
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+            .map_err(|e| e.to_string())?;
     }
     if stale {
         carry_in(&node.chain, p)?;

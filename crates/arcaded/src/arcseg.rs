@@ -575,10 +575,25 @@ fn prune_sealed(node: &Node, p: &'static ChainParams, first: u64, last: u64) -> 
     let c = p.chain_no;
     let mut freed = 0;
     let bs: Vec<u32> = (first..=last).filter_map(|h| Some(node.chain.header(c, &node.chain.hash_at(c, h as u32).ok()??).ok()??.b)).filter(|b| *b != 0).collect();
-    for chunk in bs.chunks(1000) {
-        freed += node.chain.prune_blocks(p, chunk).unwrap_or(0);
-    }
+    freed += prune_gently(node, p, &bs).0;
     freed
+}
+
+/// Blocks pruned in commits short enough to leave the chain's write lock to the others between them: tip sync, the
+/// coin-cache flush, the HTTP readers. 1,000 Litecoin blocks in one commit (millions of rows on a 766 GB file) held
+/// it for minutes, back to back, and the JB20B's website hung behind it (2026-11-17). Stops early when the arcade is
+/// stopping (the rest stays as plain copies). (bytes freed, whether all went).
+pub fn prune_gently(node: &Node, p: &ChainParams, bs: &[u32]) -> (u64, bool) {
+    const BLOCKS_PER_COMMIT: usize = 25;
+    let mut freed = 0;
+    for chunk in bs.chunks(BLOCKS_PER_COMMIT) {
+        if arcade_chaindb::db::STOPPING.load(std::sync::atomic::Ordering::Relaxed) {
+            return (freed, false);
+        }
+        freed += node.chain.prune_blocks(p, chunk).unwrap_or(0);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    (freed, true)
 }
 
 /// Where Earn ARCADE stands for a coin: sealed up to which height of how many.
