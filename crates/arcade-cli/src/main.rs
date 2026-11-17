@@ -164,7 +164,7 @@ fn system_service(sock: &std::path::Path) -> bool {
 
 /// `arcade stop`: the clean stop (caches written, then the service exits). Not a restart.
 fn stop_request() -> Value {
-    json!({"cmd": "node.stop"})
+    json!({"cmd": "service.stop"})
 }
 
 /// How to start the service again: the system one, the user one, or (installed without a systemd user
@@ -620,7 +620,7 @@ mod tests {
     fn stop_asks_for_the_clean_stop_and_nothing_else() {
         assert!(HELP.contains("arcade stop"));
         let r = stop_request();
-        assert_eq!(r["cmd"], "node.stop");
+        assert_eq!(r["cmd"], "service.stop");
         assert_eq!(r.as_object().unwrap().len(), 1, "no program, no path, no extra flag");
     }
 

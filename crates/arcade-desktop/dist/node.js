@@ -48,11 +48,19 @@
   function stops() { return ["node-stop", "o-stop"].map($).filter(Boolean); }
 
   async function stopNode() {
-    if (!confirm("Stop the node? It writes its caches first, the same as arcade stop, then exits.")) return;
+    // The browser talks to cookie /rpc, which cannot call service.stop. Over a tunnel that
+    // would also be the wrong machine. The app sends it on the service socket.
+    if (IN_BROWSER) {
+      openSettings();
+      say("o-node-msg", "Stop is only from the Arcade app on this computer. A browser can't stop the node.", true);
+      return;
+    }
+    if (!confirm("Stop the node? It writes its caches first, the same as arcade stop, then exits. It stays stopped until you press Start.")) return;
     for (const b of stops()) { b.dataset.stopping = "1"; b.disabled = true; b.textContent = "Stopping…"; }
     try {
-      await api("node.stop");
-      say("o-node-msg", "Stopping: writing the coin caches, then the service exits.");
+      await api("service.stop");
+      setRunning(false);
+      say("o-node-msg", "Stopping: writing the coin caches, then the service exits. It stays stopped until you press Start.");
     } catch (e) {
       for (const b of stops()) { b.dataset.stopping = ""; b.disabled = false; b.textContent = "Stop"; }
       say("o-node-msg", e.message || String(e), true);
@@ -62,7 +70,7 @@
   async function startNode() {
     if (IN_BROWSER) {
       openSettings();
-      say("o-node-msg", "This page is served by the node, so it can't start itself. Open the Arcade app, or run: systemctl --user start arcaded", true);
+      say("o-node-msg", "This page is served by the node, so it can't start itself. Open the Arcade app and press Start.", true);
       return;
     }
     try {
@@ -75,10 +83,10 @@
   }
 
   async function openTerm() {
+    if (IN_BROWSER) return;
     try {
-      if (IN_BROWSER) await api("node.terminal");
-      else await invoke("open_cli");
-      say("o-node-msg", "Opened a terminal running the arcade CLI.");
+      await invoke("open_cli");
+      say("o-node-msg", "Opened a terminal with the arcade CLI on its PATH.");
     } catch (e) {
       say("o-node-msg", e.message || String(e), true);
     }
@@ -152,8 +160,10 @@
   function paintChains() {
     const sel = $("o-chain");
     const cur = sel.value;
-    const choices = chains.filter((c) => !c.installed);
-    sel.replaceChildren(...choices.map((c) => h("option", { value: c.key }, c.name + (c.queued ? ` (queued #${c.queued})` : ""))));
+    // Queued chains are not a choice here. Installing one would send drive=home and clear
+    // the drive already chosen for it. They are shown, read-only, under the form.
+    const choices = chains.filter((c) => !c.installed && !c.queued);
+    sel.replaceChildren(...choices.map((c) => h("option", { value: c.key }, c.name)));
     if (choices.some((c) => c.key === cur)) sel.value = cur;
   }
 
@@ -173,7 +183,40 @@
     return drives;
   }
 
-  async function paintMoves() {
+  const MODE_NAME = { full: "Full", shared: "Shared", chain: "Blockchain only", light: "Light" };
+
+  function paintQueued(places) {
+    const box = $("o-queued");
+    if (!box) return;
+    const waiting = chains.filter((c) => c.queued && !c.installed);
+    if (!waiting.length) {
+      box.replaceChildren(h("p", { class: "opt" }, "Nothing is waiting to be installed."));
+      return;
+    }
+    const byKey = new Map((places || []).map((p) => [p.key, p]));
+    box.replaceChildren(...waiting.map((c) => {
+      const st = byKey.get(c.key) || {};
+      const place = st.place || {};
+      const onDrive = place.drive ? (place.drive === "home" ? "this arcade's drive" : place.drive) : "its saved drive";
+      const mode = MODE_NAME[c.queued_mode] || c.queued_mode || "Full";
+      const ix = Array.isArray(c.queued_with) && c.queued_with.length ? c.queued_with.join(", ") : "no indexes";
+      const b = h("button", { type: "button", class: "small" }, "Remove from queue");
+      b.onclick = async () => {
+        if (!confirm(`Take ${c.name} out of the install queue? It will not be installed, and the drive chosen for it is cleared.`)) return;
+        b.disabled = true;
+        try {
+          await api("chains.unqueue", { key: c.key });
+          say("o-node-msg", `${c.name} was taken out of the install queue.`);
+          refreshInstall();
+        } catch (e) { b.disabled = false; say("o-node-msg", e.message || String(e), true); }
+      };
+      return h("div", { class: "addrow" },
+        h("div", {}, h("b", {}, `${c.name} · queued #${c.queued}`), h("small", {}, `${mode} · ${ix} · ${onDrive}${place.dir ? " · " + place.dir : ""}`)),
+        b);
+    }));
+  }
+
+  async function paintMoves(places) {
     const box = $("o-moves");
     if (box.contains(document.activeElement)) return;
     const installed = chains.filter((c) => c.installed && !c.home && !c.arcade);
@@ -181,10 +224,10 @@
       box.replaceChildren(h("p", { class: "opt" }, "No extra chain is installed here yet. The home chain stays on this arcade's drive."));
       return;
     }
+    const byKey = new Map((places || []).filter((p) => p.installed).map((p) => [p.key, p]));
     const rows = [];
     for (const c of installed) {
-      let st = null;
-      try { st = await api("chains.status", { key: c.key }); } catch { continue; }
+      const st = byKey.get(c.key);
       if (!st || !st.place) continue;
       const name = st.name || c.name;
       const onDrive = st.place.drive === "home" ? "this arcade's drive" : (st.place.drive || "another drive");
@@ -223,13 +266,20 @@
     try { list = await api("chains.list"); } catch { return; }
     if (!Array.isArray(list)) return;
     chains = list;
+    // One chains.status for every chain the panel shows. Not one call per chain.
+    let places = [];
+    try {
+      const all = await api("chains.status");
+      places = (all && all.chains) || [];
+    } catch { places = []; }
     if (!formBusy()) {
       await loadDrives();
       paintChains();
       paintDrive();
       showFor(chains.find((c) => c.key === $("o-chain").value));
     }
-    await paintMoves();
+    paintQueued(places);
+    await paintMoves(places);
   }
 
   if ($("o-chain")) $("o-chain").onchange = () => showFor(chains.find((c) => c.key === $("o-chain").value));

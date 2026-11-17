@@ -189,6 +189,18 @@ pub fn request_stop() {
     STOP_ASKED.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Written by `service.stop`. While it is here, the desktop must not start arcaded again
+/// (on Windows the window asks every few seconds, and that would undo Stop). Start, and the
+/// Windows login task, delete it. Distinct from `arcaded.stop`, which asks a running service to exit.
+pub fn owner_stopped_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join("arcaded.stopped")
+}
+
+pub fn mark_owner_stopped(home: &std::path::Path) {
+    let _ = std::fs::create_dir_all(home);
+    let _ = std::fs::write(owner_stopped_path(home), b"stopped\n");
+}
+
 extern "C" fn on_stop_signal(_: libc::c_int) {
     // A second SIGTERM / Ctrl-C while the caches are being written: leave at once (the next
     // start winds the tip back, as before this flush existed). _exit is async-signal-safe.

@@ -216,7 +216,13 @@ mod tests {
         let (_one, t) = crate::http::tests::node();
         let k = create(&t.node, "admin", &["admin".into(), "wallet".into(), "read".into()], 0).unwrap();
         let k = k["key"].as_str().unwrap();
-        for cmd in ["node.stop", "node.terminal", "wallet.phrase"] {
+        // service.stop is not a command on this path at all (socket only). node.stop is gone.
+        for cmd in ["service.stop", "node.stop"] {
+            let err = allow(&t.node, Some(k), &json!({"cmd": cmd})).unwrap_err();
+            assert_eq!(err.0, 404, "{cmd}");
+            assert!(err.1.contains("unknown command"), "{cmd}: {}", err.1);
+        }
+        for cmd in ["node.terminal", "wallet.phrase"] {
             let err = allow(&t.node, Some(k), &json!({"cmd": cmd})).unwrap_err();
             assert_eq!(err.0, 403, "{cmd}");
             assert!(err.1.contains("this computer"), "{cmd}: {}", err.1);

@@ -400,15 +400,15 @@
   <section id="options" class="tab">
     <h1>Options</h1>
     <h2 id="o-node">Node</h2>
-    <p class="opt">Start and stop this arcade, open its terminal, and choose a chain to keep here. Stop writes the caches first, the same as <code>arcade stop</code>. Start brings it back the way the installer did. These stay on this computer: another arcade, and an API key, cannot use them.</p>
+    <p class="opt">Start and stop this arcade, open its terminal, and choose a chain to keep here. Stop writes the caches first, the same as <code>arcade stop</code>, and the node stays stopped until you press Start. Start brings it back the way the installer did. These stay on this computer: a browser, another arcade, and an API key cannot use them.</p>
     <div class="row">
       <button type="button" class="primary" id="o-start" hidden>Start</button>
       <button type="button" id="o-stop">Stop</button>
-      <button type="button" id="o-term">Open a terminal</button>
+      <button type="button" class="app-only" id="o-term">Open a terminal</button>
     </div>
     <p class="msg" id="o-node-msg"></p>
     <h3>Install a chain</h3>
-    <p class="opt">The same choices as <code>arcade chain add</code>: which chain, full, blockchain only or light, the indexes, and which drive. Nothing is installed until you ask.</p>
+    <p class="opt">The same choices as <code>arcade chain add</code>: which chain, full, blockchain only or light, the indexes, and which drive. Nothing is installed until you ask. A chain already waiting is listed under it, not here, so this form can't move its drive.</p>
     <div class="row">
       <select id="o-chain" title="Which chain"></select>
     </div>
@@ -418,6 +418,8 @@
       <select id="o-drive" title="Which drive"></select>
       <button type="button" class="primary" id="o-install">Install</button>
     </div>
+    <h3>Waiting to install</h3>
+    <div id="o-queued"></div>
     <h3>Where an installed chain is stored</h3>
     <p class="opt">Move a chain the same way as <code>arcade chain move</code>. Its sync pauses while the file is copied, then goes on from the new drive.</p>
     <div id="o-moves"></div>
