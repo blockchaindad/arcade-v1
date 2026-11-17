@@ -126,8 +126,8 @@ pub const BLOB_WINDOW: u64 = 30 * 24 * 3600;
 pub const RULES_KNOWN: u32 = 4;
 
 /// Whether rules version 4 applies to the block at `height` (testnet only so far; the height is set in the release
-/// that ships it, about a day ahead): Shibacoin, Bellscoin, Luckycoin and Junkcoin listed and the collections and
-/// dogefeed journal families paid (#6); a repository push names the manifest it was based on (#10); draw weight from a
+/// that ships it, about a day ahead): Shibacoin, Bellscoin, Luckycoin and Junkcoin listed and the
+/// dogefeed journal family paid (#6; collections stays unpaid: its index isn't built the same on every arcade); a repository push names the manifest it was based on (#10); draw weight from a
 /// replica's first passed audit (#11); index catalog entries confirmed by a tenth of the draw weight (#14); the draw
 /// seed's proof of time in up to [`MAX_POT_RUNS`] runs (#20).
 pub fn rules_v4(net: &Net, height: u64) -> bool {

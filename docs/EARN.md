@@ -155,9 +155,18 @@ A coin kept in full is cut into these families (`arcseg::families`):
 | coins (what each block spends) | 9 | always, made from the blocks |
 | ord, ledger, profiles, messages, names, tokens, maps, tags | 1 to 8 | only when the index's journals run here **from the index's start**: an index taken in as a copy isn't sealed or offered until it is rebuilt |
 | blobs | 10 | the ARCADE chain only |
+| dogefeed (D://, Dogecoin only) | 12 | **rules version 4 (testnet) only**, from its activation height; journals from the index's start, as above |
 
-Indexes with **no journal family** are never sealed and never paid: **addresses, collections, dogefeed** (runes and
-dunes when they come). `arc.earn` lists them under `unpaid_indexes`.
+Indexes with **no journal family** are never sealed and never paid: **addresses, collections** (runes and dunes when
+they come). `arc.earn` lists them under `unpaid_indexes`, and dogefeed too where version 4 doesn't apply (mainnet, or
+the testnet below the version 4 height).
+
+**Rules version 4 (testnet):** the dogefeed index journals each block as family 12 and is sealed, listed and paid like
+the other index families. Its journals run from the index's start only when it was built here from block 6,300,000
+with this release or later: an arcade that already had the index (it has no journals for the heights before) must
+remove and rebuild it to earn from it. Collections keeps number 11 but stays unpaid: it is read by a background pass
+outside the block's commit, from transaction bodies an arcade may not hold, so no two arcades are sure to have the
+same journal.
 
 ### Listing
 

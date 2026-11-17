@@ -2875,13 +2875,18 @@ fn earn_view(node: &Node, p: &'static ChainParams) -> Result<Value, String> {
     // On by default for a coin kept in full; a coin kept otherwise can't be sealed, and one the network doesn't list
     // isn't paid: both show off.
     let on = paid && crate::arcseg::earn_on(node, key) && node.mode_of(key).as_deref() == Some("full");
-    // The indexes kept here that are never sealed: no journal family (addresses, collections, dogefeed), or journals
-    // that don't run from the index's start (an index taken in as a copy).
-    let fams = crate::arcseg::families(node, p);
+    // The indexes kept here that are never sealed: no journal family (addresses, collections), one the catalog doesn't
+    // take yet (dogefeed before rules version 4), or journals that don't run from the index's start (an index taken in
+    // as a copy).
+    let listing = crate::arcseg::listing_at();
+    let fams = listing.map(|(net, at)| crate::arcseg::families(node, p, &net, at)).unwrap_or_default();
     let unpaid: Vec<Value> = crate::chains::indexes_of(node, p)
         .into_iter()
         .filter_map(|ix| match crate::arcseg::index_family(&ix) {
             None => Some(json!({"index": ix, "why": "not paid on this network: it has no journal family to seal"})),
+            Some(f) if listing.is_some_and(|(net, at)| !arcade_arc::segment::family_at(&net, f, at)) => {
+                Some(json!({"index": ix, "why": "not paid on this network yet: its journal family is listed from rules version 4"}))
+            }
             Some(f) if paid && !fams.contains(&f) => Some(json!({"index": ix, "why": "not sealed: its journals don't run here from the index's start (an index taken in as a copy)"})),
             _ => None,
         })
