@@ -140,12 +140,10 @@ jobs:
           Copy-Item (Join-Path $mpir.FullName 'LICENSE') "$name\bin\MPIR-LICENSE.txt"
           Copy-Item crates\arcade-desktop\icons\icon.png,crates\arcade-desktop\icons\icon.ico $name
           Copy-Item scripts\install.ps1,scripts\uninstall.ps1 "$name\scripts\"
+          # A double-click way in at the top of the folder without the installer program (Martin 2026-11-17).
+          Copy-Item scripts\windows\Install-PowerShell.cmd $name
           git rev-parse HEAD | Set-Content "$name\COMMIT" -Encoding ascii -NoNewline
-          if (Test-Path "$name.zip") { Remove-Item "$name.zip" -Force }
-          Compress-Archive -Path $name -DestinationPath "$name.zip"
-          $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
-          [IO.File]::WriteAllText("$pwd\$name.zip.sha256", "$hash  $name.zip`n")
-          Get-ChildItem "$name.zip*" | Format-Table Name,Length
+          # Zipped after the installer is built (next step), so the zip carries it as Install.exe.
 
       - name: One-click installer (Setup.exe)
         shell: pwsh
@@ -161,6 +159,19 @@ jobs:
           $hash = (Get-FileHash "$name-setup.exe" -Algorithm SHA256).Hash.ToLower()
           [IO.File]::WriteAllText("$pwd\$name-setup.exe.sha256", "$hash  $name-setup.exe`n")
           Get-ChildItem "$name-setup.exe*" | Format-Table Name,Length
+
+      - name: Zip (with the installer inside)
+        shell: pwsh
+        run: |
+          # The zip's folder opens on Install.exe (Martin 2026-11-17: an installer at the top of the zip), beside
+          # Install-PowerShell.cmd. The installer was built from the folder before this copy, so it doesn't carry itself.
+          $name = 'arcade-v1-windows-x86_64'
+          Copy-Item "$name-setup.exe" "$name\Install.exe"
+          if (Test-Path "$name.zip") { Remove-Item "$name.zip" -Force }
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
+          [IO.File]::WriteAllText("$pwd\$name.zip.sha256", "$hash  $name.zip`n")
+          Get-ChildItem "$name.zip*" | Format-Table Name,Length
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -205,5 +216,5 @@ jobs:
             gh release create "$TAG" "${files[@]}" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
               "${pre[@]}" \
               --title "Arcade V1.0 $TAG" \
-              --notes "Prebuilt downloads: Linux (x86_64, aarch64) and Windows 10/11 x64. Linux: curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install.sh | bash  —  Windows: see README, Install on Windows."
+              --notes "**Windows 10/11 x64:** download **arcade-v1-windows-x86_64-setup.exe** and double-click it. Or download the zip, unpack it, and run **Install.exe** (or Install-PowerShell.cmd) from its folder.  **Linux** (x86_64, aarch64): curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install.sh | bash"
           fi

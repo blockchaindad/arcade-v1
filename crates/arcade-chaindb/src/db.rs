@@ -542,6 +542,9 @@ fn ix_key(c: u16, name: &str) -> Vec<u8> {
 /// cache that is lost, winding the tip back again at the next start).
 pub static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// How long a stop waits for one chain's batch to finish before leaving that chain's coin cache unwritten.
+pub const STOP_BATCH_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The directory name of a chain's own file: its key (`chains/doge/chain.mdbx`), or `c<number>`
 /// for a chain number no params know (tests).
 pub fn chain_dir_name(c: u16) -> String {
@@ -991,7 +994,7 @@ impl ChainDb {
         self.legacy.clone()
     }
 
-    fn batch_of(&self, s: &Store) -> Arc<std::sync::Mutex<()>> {
+    pub(crate) fn batch_of(&self, s: &Store) -> Arc<std::sync::Mutex<()>> {
         self.batches.lock().unwrap().entry(s.id()).or_default().clone()
     }
 
@@ -1021,12 +1024,38 @@ impl ChainDb {
     /// Stopping: wait for a batch being connected to commit (or roll back), then write every
     /// coin cache, then sync every file (an error there comes back as chain u16::MAX). Nothing connects afterwards (STOPPING is set first by the caller).
     pub fn flush_all_for_stop(&self) -> Vec<(u16, Result<()>)> {
+        self.flush_all_for_stop_within(STOP_BATCH_WAIT)
+    }
+
+    /// [`flush_all_for_stop`], waiting at most `wait` for each chain's batch: a chain whose batch is still busy then
+    /// (a thread stuck inside one long step held it for hours on the JB20B, 2026-11-17, and the stop never ended) is
+    /// left unflushed. Its next start winds its tip back to the coins written (as a second stop signal did by hand).
+    pub fn flush_all_for_stop_within(&self, wait: std::time::Duration) -> Vec<(u16, Result<()>)> {
         let mut out = Vec::new();
         for c in 0..=255u16 {
             if !self.coins_settled(c) {
                 let lock = self.batch_of(&self.store(c));
-                let _batch = lock.lock().unwrap_or_else(|e| e.into_inner());
-                out.push((c, self.flush_coins(c)));
+                let t = std::time::Instant::now();
+                let mut said = false;
+                let batch = loop {
+                    match lock.try_lock() {
+                        Ok(g) => break Some(g),
+                        Err(std::sync::TryLockError::Poisoned(e)) => break Some(e.into_inner()),
+                        Err(std::sync::TryLockError::WouldBlock) if t.elapsed() < wait => {
+                            // Named, so a stop that takes long says what it waits on.
+                            if !said && t.elapsed() > std::time::Duration::from_secs(10) {
+                                eprintln!("arcaded: stopping: waiting for chain {c}'s batch to finish (at most {}s)", wait.as_secs());
+                                said = true;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(100))
+                        }
+                        Err(std::sync::TryLockError::WouldBlock) => break None,
+                    }
+                };
+                match batch {
+                    Some(_batch) => out.push((c, self.flush_coins(c))),
+                    None => out.push((c, Err(other(format!("its batch was still busy after {}s: left for the next start to wind back", wait.as_secs()))))),
+                }
             }
         }
         // The files are written without a flush per commit: put them on disk now, or the next

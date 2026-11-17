@@ -81,7 +81,8 @@ pub fn create_wallet(node: &Node, phrase: Option<&str>) -> Result<Value, String>
     let tag = if restored { crate::claims::find_own_tag(node, true) } else { None };
     // Test coins for the first handle come by themselves: asked for now, so they are
     // usually here by the time a handle is picked (a restored wallet may have some).
-    if tag.is_none() {
+    // On ARCADE as the home chain (crate::claims::claim_home) the node faucet's ARCADE pays the claim instead.
+    if tag.is_none() && !crate::arcsvc::runs(crate::claims::claim_home(node)) {
         if let Ok((k, _)) = node.app.tag_key(p, 0) {
             let script = arcade_wallet::keys::p2pkh_script_for(&arcade_wallet::secp256k1::PublicKey::from_slice(&hex::decode(&k.pubkey).unwrap()).unwrap());
             if crate::claims::coins(node, &script).is_empty() {
@@ -89,6 +90,8 @@ pub fn create_wallet(node: &Node, phrase: Option<&str>) -> Result<Value, String>
             }
         }
     }
+    // And this arcade's 1 ARCADE from the node faucet (crate::arcfaucet), asked now rather than at the next round.
+    crate::arcfaucet::node_gift_ask(node);
     Ok(json!({"phrase": if restored { Value::Null } else { json!(words) }, "restored": restored, "tag": tag}))
 }
 
@@ -507,13 +510,10 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         }
         "faucet.arc" => {
             // A website signs a user in and names their ARCADE address; without one, this wallet's.
+            // (The user faucet: for a website's users only. An arcade's own wallet has the node faucet.)
             match s("address").filter(|a| !a.is_empty()) {
                 Some(a) => crate::arcfaucet::ask(node, &a),
-                None => {
-                    let ap = crate::arcsvc::defined().ok_or("this arcade doesn't know the ARCADE chain")?;
-                    let (k, _) = node.app.tag_key(ap, 0).map_err(|e| e.to_string())?;
-                    crate::arcfaucet::ask(node, &k.address)
-                }
+                None => Err("faucet.arc tops up a website user's ARCADE address: name it (address). This arcade's own wallet gets its ARCADE from the node faucet (faucet.arc_status)".into()),
             }
         }
         "faucet.arc_status" => Ok(crate::arcfaucet::status(node)),

@@ -112,8 +112,8 @@ cmds! {
     "start.status" Read "" "Getting started: wallet made, handle (claimed or being claimed), test coins asked for or here, synced.";
     "tag.list" Read "" "Your tag claims and their progress.";
     "faucet.ask" Wallet "index?, tag?" "Ask the mesh for test coins.";
-    "faucet.arc" Wallet "address?" "Ask the mesh to top an ARCADE address up to 0.05 ARCADE (once per address a day; a website calls it when a user signs in). Without address: this wallet's.";
-    "faucet.arc_status" Read "" "The ARCADE top-up asks this arcade knows and how many it paid today.";
+    "faucet.arc" Wallet "address" "The user faucet: ask the mesh to top a website user's ARCADE address up to 0.05 ARCADE, in two coins (once per address a day; a website calls it when a user signs in). This arcade's own wallet gets 1 ARCADE once from the node faucet instead.";
+    "faucet.arc_status" Read "" "The ARCADE top-up asks this arcade knows and how many it paid today; node_faucet: node-gift asks, gifts paid today, nodes known paid, and this arcade's own gift.";
     // Messaging
     "msg.me" Read "" "Your messaging key, fingerprint and whether it is published.";
     "msg.stats" Public "" "How many message candidates, posts, acts and machine records the home chain holds.";
