@@ -1148,3 +1148,24 @@ fn a_home_folder_left_by_a_move_away_does_not_stop_the_move_home() {
     assert!(!f.db.placed_elsewhere(c) && !to.exists());
     assert_eq!(dump_chain(&f.db, c), before, "the moved copy came home, not the stale file");
 }
+
+/// One chain's damaged own file doesn't stop the databases opening (ARCADE issue #18): it is set aside as
+/// chain.mdbx.corrupt-<time>, the chain reads as empty, and it can be written again.
+#[test]
+fn a_damaged_chain_file_is_set_aside_not_fatal() {
+    let Fixture { _dir: dir, db, p, g } = fixture();
+    let c = p.chain_no;
+    let own = db.own_path(c);
+    assert!(db.has_own_file(c));
+    drop(db);
+    std::fs::write(&own, vec![0xA5u8; 1 << 16]).unwrap();
+    let db = ChainDb::open(dir.path().join("chain.mdbx")).expect("opens with the damaged file set aside");
+    assert!(!db.has_own_file(c) && !own.exists(), "the damaged file is out of the way");
+    let aside: Vec<_> = std::fs::read_dir(own.parent().unwrap()).unwrap().flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("chain.mdbx.corrupt-")).collect();
+    assert_eq!(aside.len(), 1, "kept, not deleted");
+    assert_eq!(std::fs::read(aside[0].path()).unwrap(), vec![0xA5u8; 1 << 16]);
+    assert!(dump_chain(&db, c).iter().all(|(_, rows)| rows.is_empty()), "the chain starts over empty");
+    db.connect_blocks(p, &[g]).unwrap();
+    assert!(db.has_own_file(c), "and syncs again into a new file");
+}

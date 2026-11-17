@@ -277,6 +277,8 @@ struct State {
     agreed: Mutex<BTreeMap<String, Agreement>>,
     /// lender host name -> (when looked up, its address), for counting lenders by address
     resolved: Mutex<BTreeMap<String, (u64, Option<std::net::IpAddr>)>>,
+    /// chain key -> lender host -> (named the agreed block when last compared, when)
+    named: Mutex<BTreeMap<String, BTreeMap<String, (bool, u64)>>>,
 }
 
 static ST: LazyLock<State> = LazyLock::new(State::default);
@@ -286,12 +288,60 @@ fn recent_fails(addr: &str) -> usize {
     ST.health.lock().unwrap().get(addr).map(|h| h.fails.iter().filter(|t| **t >= cut).count()).unwrap_or(0)
 }
 
+/// The lenders answers are taken from: `all_lenders` without those that can't be trusted to
+/// answer for the chain this arcade follows, hosts that named the agreed block first.
+///
+/// Left out: a lender whose host named another block than the one most hosts (and this arcade)
+/// named when lenders were last compared, until it names that block again; and a lender that
+/// stopped far behind the others (`stalled`), until it catches up. Lenders not compared yet are
+/// still used, after the agreed ones: one lender alone is a caution (yellow), not a refusal.
+pub fn lenders(node: &Node, p: &ChainParams) -> Vec<String> {
+    let all = all_lenders(node, p);
+    let hosts: BTreeMap<String, String> = lender_host_list(node, p, &all).into_iter().collect();
+    let named = ST.named.lock().unwrap().get(p.key).cloned().unwrap_or_default();
+    let said = |a: &str| hosts.get(a).and_then(|h| named.get(h)).map(|x| x.0);
+    let tips = lender_tips(node, p);
+    let ours = state(node, p.key).and_then(|st| st["tip"].as_u64()).unwrap_or(0);
+    let reference = tips_reference(&tips.values().copied().collect::<Vec<_>>(), ours);
+    let mut v: Vec<String> = all.into_iter().filter(|a| said(a) != Some(false) && !tips.get(a).is_some_and(|t| stalled(p.key, *t, reference))).collect();
+    // Stable: the agreed first, the order of `all_lenders` kept within each.
+    v.sort_by_key(|a| said(a) != Some(true));
+    v
+}
+
+/// Each lender's tip: the one it told last, else the one its offer carries.
+fn lender_tips(node: &Node, p: &ChainParams) -> BTreeMap<String, u64> {
+    let told = ST.tips.lock().unwrap().get(p.key).cloned().unwrap_or_default();
+    let mut out = BTreeMap::new();
+    for (_, addr, kind, h) in node.offers_for(p.key) {
+        if kind == "cr" {
+            out.insert(addr.clone(), told.get(&addr).map(|x| x.0).unwrap_or(h));
+        }
+    }
+    for (id, h) in node.cr_offerers(p.key) {
+        let via = crate::crvia::name(&id);
+        out.insert(via.clone(), told.get(&via).map(|x| x.0).unwrap_or(h));
+    }
+    out
+}
+
+/// Keep which hosts named `hash` (the block most hosts named, or this arcade's) at a comparison
+/// and which named another; hosts that didn't answer keep what they said before.
+fn note_named(key: &str, ag: &Agreement, hash: Hash256) {
+    let mut m = ST.named.lock().unwrap();
+    let e = m.entry(key.to_string()).or_default();
+    for (host, h) in &ag.answers {
+        e.insert(host.clone(), (*h == hash, ag.at));
+    }
+}
+
 /// Arcades lending a chain's Core node: fewest recent failures first, then quickest; a lender
-/// with 3 failures in the last 10 minutes is skipped.
+/// with 3 failures in the last 10 minutes is skipped. Every one, also those `lenders` leaves
+/// out: lenders are compared from this list, so one that disagreed can be found agreeing again.
 ///
 /// A lender whose mesh link is up is also offered over that link (crvia), after the ones we
 /// can dial: the way to one we can't (behind a NAT, linked over UDP only).
-pub fn lenders(node: &Node, p: &ChainParams) -> Vec<String> {
+fn all_lenders(node: &Node, p: &ChainParams) -> Vec<String> {
     let mut v: Vec<String> = Vec::new();
     for (_, addr, kind, _) in node.offers_for(p.key) {
         if kind == "cr" && !v.contains(&addr) {
@@ -633,13 +683,13 @@ fn lender_host_list(node: &Node, p: &ChainParams, ls: &[String]) -> Vec<(String,
 
 /// Lenders of a chain on different hosts.
 fn lender_hosts(node: &Node, p: &ChainParams) -> usize {
-    lender_host_list(node, p, &lenders(node, p)).into_iter().map(|x| x.1).collect::<BTreeSet<_>>().len()
+    lender_host_list(node, p, &all_lenders(node, p)).into_iter().map(|x| x.1).collect::<BTreeSet<_>>().len()
 }
 
 /// One lender on each host, up to AGREE_ASK hosts: (lender, host).
 fn one_per_host(node: &Node, p: &ChainParams) -> Vec<(String, String)> {
     let mut seen = BTreeSet::new();
-    lender_host_list(node, p, &lenders(node, p)).into_iter().filter(|x| seen.insert(x.1.clone())).take(AGREE_ASK).collect()
+    lender_host_list(node, p, &all_lenders(node, p)).into_iter().filter(|x| seen.insert(x.1.clone())).take(AGREE_ASK).collect()
 }
 
 /// What lenders named as the block at `height` (asked at `at`): (host, hash) per lender that
@@ -879,15 +929,61 @@ fn trust_level(rec: &mut Value, hosts: usize, own_rules: bool, tips_note: Option
     }
 }
 
-/// Lenders' tips told at about the same time that are more than 3 blocks apart.
-fn tips_split(key: &str) -> Option<String> {
+/// Lenders' tips told at about the same time that are further apart than the chain allows
+/// (see `tips_apart`; `ours`: this arcade's tip of the borrowed chain).
+fn tips_split(key: &str, ours: u64) -> Option<String> {
     let told: Vec<(u64, u64)> = ST.tips.lock().unwrap().get(key).map(|m| m.values().copied().collect()).unwrap_or_default();
     // Only tips told at about the same time can disagree: one told a while ago is behind
     // because the chain went on, not because its lender is on another chain.
     let newest = told.iter().map(|x| x.1).max().unwrap_or(0);
     let tips: Vec<u64> = told.iter().filter(|x| x.1 + TIPS_TOGETHER >= newest).map(|x| x.0).collect();
-    match (tips.iter().min(), tips.iter().max()) {
-        (Some(a), Some(b)) if b - a > 3 => Some(format!("lenders disagree on the tip: {a} to {b}")),
+    tips_apart(key, &tips, ours)
+}
+
+/// About how many seconds a block of the chain takes, only to size the tip gaps below:
+/// 60 s unless the chain is known to be faster or slower.
+fn nominal_block_secs(key: &str) -> u64 {
+    match key {
+        "btc" => 600,
+        "ltc" | "ltctest" | "ltcregtest" | "arc" => 150,
+        "dgb" | "dgbtest" => 15,
+        _ => 60,
+    }
+}
+
+/// How many blocks apart lenders' tips told together may be: about two minutes of the chain's
+/// blocks (offers cross the mesh at different speeds), never under 3. DigiByte's 15 s blocks
+/// put honest lenders 4-6 blocks apart routinely; 3 blocks there was yellow most of the time.
+fn tips_slack(key: &str) -> u64 {
+    (120 / nominal_block_secs(key)).max(3)
+}
+
+/// How far below the reference tip a lender has stopped rather than fallen a little behind:
+/// about an hour of the chain's blocks, never under 10. Such a lender knows none of the newest
+/// payments, so it cannot speak against them; it is listed as far behind, not compared.
+fn stalled_gap(key: &str) -> u64 {
+    (3600 / nominal_block_secs(key)).max(10)
+}
+
+/// The tip lenders' tips are measured against: ours, which follows the chain's headers, but
+/// never above the highest lender's (a tip above every lender is not ours to trust alone).
+fn tips_reference(tips: &[u64], ours: u64) -> u64 {
+    tips.iter().max().map_or(ours, |&m| if ours == 0 { m } else { ours.min(m) })
+}
+
+/// Whether a lender at `tip` has stopped far below the others (see `stalled_gap`).
+fn stalled(key: &str, tip: u64, reference: u64) -> bool {
+    tip + stalled_gap(key) < reference
+}
+
+/// "lenders disagree on the tip: a to b" when the tips of lenders still following the chain
+/// are more than `tips_slack` apart. A lender far behind (`stalled`) is left out: it has
+/// stopped, it is not on another chain. A lender far ahead stays in.
+fn tips_apart(key: &str, tips: &[u64], ours: u64) -> Option<String> {
+    let reference = tips_reference(tips, ours);
+    let live: Vec<u64> = tips.iter().copied().filter(|&t| !stalled(key, t, reference)).collect();
+    match (live.iter().min(), live.iter().max()) {
+        (Some(a), Some(b)) if b - a > tips_slack(key) => Some(format!("lenders disagree on the tip: {a} to {b}")),
         _ => None,
     }
 }
@@ -898,7 +994,8 @@ fn refresh_trust(node: &Node, p: &ChainParams) {
     let mut rec = trust_rec(node, p.key);
     let before = rec.clone();
     let hosts = lender_hosts(node, p);
-    if let Some(ev) = trust_level(&mut rec, hosts, crate::arcborrow::is(p), tips_split(p.key), p.name, arcade_app::now()) {
+    let ours = state(node, p.key).and_then(|st| st["tip"].as_u64()).unwrap_or(0);
+    if let Some(ev) = trust_level(&mut rec, hosts, crate::arcborrow::is(p), tips_split(p.key, ours), p.name, arcade_app::now()) {
         let _ = node.app.event("borrow", &ev);
     }
     if rec != before {
@@ -1514,6 +1611,7 @@ fn step(node: &Node, p: &'static ChainParams, watch: &HashSet<Vec<u8>>, run: &Ru
         }
         let ag = agree_now(node, p)?;
         let pk = ag.pick(None).ok_or_else(|| format!("no lender of {} named its block {}", p.name, ag.height))?;
+        note_named(key, &ag, pk.hash);
         floor_at(why, pk.height, pk.hash, Some((pk, ag.at)))
     };
     let Some(tip) = tip else { return start_floor("first start") };
@@ -1528,6 +1626,7 @@ fn step(node: &Node, p: &'static ChainParams, watch: &HashSet<Vec<u8>>, run: &Ru
         let ours = stored_header(node, p, ag.height).map(|x| x.0);
         if let Some(pk) = ag.pick(ours) {
             compared = true;
+            note_named(key, &ag, pk.hash);
             if ours.is_some() {
                 let mut rec = trust_rec(node, key);
                 let before = rec.clone();
@@ -1702,8 +1801,9 @@ fn coinscan(node: &Node, p: &'static ChainParams, w: &[Watched]) -> Result<Scan,
                 blocks.clear();
             }
             let ag = named.get(&c.height);
-            let bh = match ag.and_then(|a| a.pick(None).map(|pk| (pk, a.at))) {
-                Some((pk, at)) => {
+            let bh = match ag.and_then(|a| a.pick(None).map(|pk| (pk, a.at, a))) {
+                Some((pk, at, a)) => {
+                    note_named(p.key, a, pk.hash);
                     if pk.split {
                         let mut rec = trust_rec(node, p.key);
                         trust_compared(&mut rec, &pk, None, p.name, at);
@@ -2091,6 +2191,8 @@ pub fn status(node: &Node, key: &str) -> Option<Value> {
     let st = state(node, p.key).unwrap_or(json!({}));
     let tip = st["tip"].as_u64().unwrap_or(0);
     let mut lenders_v: Vec<Value> = Vec::new();
+    // The name each entry of lenders_v goes by in `lenders` (its address, or its mesh link's).
+    let mut names: Vec<String> = Vec::new();
     let offers = node.offers_for(p.key);
     let told = ST.tips.lock().unwrap().get(p.key).cloned().unwrap_or_default();
     let mut seen = BTreeSet::new();
@@ -2101,6 +2203,7 @@ pub fn status(node: &Node, key: &str) -> Option<Value> {
         if crate::crvia::linked(&id) && seen.insert(via.clone()) {
             let t = told.get(&via).map(|x| x.0).unwrap_or(h);
             let (rtt, last) = ST.health.lock().unwrap().get(&via).map(|x| (Some(x.rtt_ms), Some(x.last_err.clone()).filter(|s| !s.is_empty()))).unwrap_or((None, None));
+            names.push(via.clone());
             lenders_v.push(json!({"node": &id[..id.len().min(16)], "addr": format!("mesh link to {}", &id[..id.len().min(16)]), "via": true, "tip": t, "rtt_ms": rtt, "fails": recent_fails(&via), "last_error": last}));
         }
     }
@@ -2114,16 +2217,29 @@ pub fn status(node: &Node, key: &str) -> Option<Value> {
         }
         let fails = recent_fails(&addr);
         let (rtt, last) = ST.health.lock().unwrap().get(&addr).map(|x| (Some(x.rtt_ms), Some(x.last_err.clone()).filter(|s| !s.is_empty()))).unwrap_or((None, None));
+        names.push(addr.clone());
         lenders_v.push(json!({"node": &id[..id.len().min(16)], "addr": addr, "tip": t, "rtt_ms": rtt, "fails": fails, "last_error": last}));
     }
     // Only tips told at about the same time can disagree: one told a while ago is behind
     // because the chain went on, not because its lender is on another chain.
     let newest = fresh.iter().map(|x| x.1).max().unwrap_or(0);
     let tips: Vec<u64> = fresh.iter().filter(|x| x.1 + TIPS_TOGETHER >= newest).map(|x| x.0).collect();
-    let mismatch = match (tips.iter().min(), tips.iter().max()) {
-        (Some(a), Some(b)) if b - a > 3 => Some(format!("lenders disagree on the tip: {a} to {b}")),
-        _ => None,
-    };
+    let mismatch = tips_apart(p.key, &tips, tip);
+    // Lenders that stopped far below the others: shown as such, left out of the comparison.
+    let all: Vec<u64> = lenders_v.iter().filter_map(|l| l["tip"].as_u64()).collect();
+    let reference = tips_reference(&all, tip);
+    let used: BTreeSet<String> = lenders(node, p).into_iter().collect();
+    let named = ST.named.lock().unwrap().get(p.key).cloned().unwrap_or_default();
+    let hosts: BTreeMap<String, String> = lender_host_list(node, p, &names).into_iter().collect();
+    for (l, a) in lenders_v.iter_mut().zip(&names) {
+        if l["tip"].as_u64().is_some_and(|t| stalled(p.key, t, reference)) {
+            l["behind"] = json!(true);
+        }
+        if hosts.get(a).and_then(|h| named.get(h)).is_some_and(|x| !x.0) {
+            l["disagreed"] = json!(true);
+        }
+        l["used"] = json!(used.contains(a));
+    }
     // Before the chain's first look at its lenders (still starting) there is no record yet: count
     // the lender hosts now, so the dot shows from the start.
     let t = match trust_rec(node, p.key) {
@@ -2696,6 +2812,47 @@ fn scan_any(node: &Node, p: &'static ChainParams, addrs: &[String]) -> Result<(S
 
 #[cfg(test)]
 mod tests {
+    use super::{stalled, tips_apart, tips_slack};
+
+    #[test]
+    fn a_lender_stopped_far_behind_is_not_a_disagreement() {
+        // Pepecoin, 16 Nov: four lenders at the tip, one stopped about 6,850 blocks behind.
+        let tips = [1_296_303, 1_296_303, 1_296_303, 1_289_457, 1_289_457];
+        assert_eq!(tips_apart("pep", &tips, 1_296_303), None);
+        assert!(stalled("pep", 1_289_457, 1_296_303));
+        assert!(!stalled("pep", 1_296_281, 1_296_303));
+        // A few blocks behind is still compared: caution as before.
+        assert!(tips_apart("pep", &[1_296_303, 1_296_296], 1_296_303).is_some());
+        // A lender far AHEAD of us and the others is never left out.
+        assert!(tips_apart("pep", &[1_296_303, 1_296_303, 1_310_000], 1_296_303).is_some());
+        // Our tip above every lender: measured from the highest lender, so they are still compared.
+        assert!(tips_apart("pep", &[1_290_000, 1_290_010], 1_296_303).is_some());
+    }
+
+    #[test]
+    fn a_host_naming_another_block_is_marked_until_it_agrees_again() {
+        use super::{note_named, Agreement, ST};
+        let (a, b) = (arcade_chain::Hash256::from_hex(&"11".repeat(32)).unwrap(), arcade_chain::Hash256::from_hex(&"22".repeat(32)).unwrap());
+        let ag = |x, y| Agreement { height: 5, at: 1, answers: vec![("h1".into(), a), ("h2".into(), x), ("h3".into(), y)] };
+        note_named("test-named", &ag(a, b), a);
+        let m = || ST.named.lock().unwrap().get("test-named").cloned().unwrap();
+        assert_eq!(m()["h3"].0, false);
+        assert_eq!(m()["h2"].0, true);
+        // h3 names the agreed block again: used again.
+        note_named("test-named", &ag(a, a), a);
+        assert_eq!(m()["h3"].0, true);
+    }
+
+    #[test]
+    fn digibyte_tips_a_minute_apart_agree() {
+        // DigiByte, 16 Nov: 15 s blocks, lenders told 4 blocks apart.
+        assert_eq!(tips_slack("dgb"), 8);
+        assert_eq!(tips_apart("dgb", &[24_575_848, 24_575_852], 24_575_878), None);
+        assert!(tips_apart("dgb", &[24_575_840, 24_575_852], 24_575_852).is_some());
+        // Minute (and slower) chains keep the old 3-block limit.
+        assert_eq!(tips_slack("pep"), 3);
+        assert_eq!(tips_slack("btc"), 3);
+    }
     use super::*;
 
     #[test]

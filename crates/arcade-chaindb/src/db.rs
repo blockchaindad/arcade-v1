@@ -598,6 +598,28 @@ fn write_place(chains: &Path, file: &Path, dir: &Path) -> Result<()> {
     std::fs::rename(&tmp, file).map_err(other)
 }
 
+/// Whether opening a file failed because the file itself is damaged (not a lock, a full disk or permissions, which
+/// must stop the start as before).
+fn is_corrupt(e: &StoreError) -> bool {
+    use libmdbx::Error as M;
+    matches!(e, StoreError::Corrupt { .. } | StoreError::Mdbx(M::Corrupted | M::Panic | M::PageNotFound | M::Invalid | M::WannaRecovery))
+}
+
+/// Move a chain's damaged own file to `chain.mdbx.corrupt-<unix time>` beside it (and drop its lock file, which mdbx
+/// makes again), saying so loudly. The operator removes the copy once it isn't wanted.
+fn set_aside(file: &Path, why: &StoreError) -> Result<std::path::PathBuf> {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let aside = file.with_file_name(format!("chain.mdbx.corrupt-{secs}"));
+    std::fs::rename(file, &aside).map_err(|e| other(format!("{} is damaged ({why}) and couldn't be set aside: {e}", file.display())))?;
+    let _ = std::fs::remove_file(file.with_file_name("chain.mdbx-lck"));
+    eprintln!(
+        "chain files: {} is damaged ({why}): moved to {}; this chain starts over and syncs again, the others are as they were (delete the copy when it isn't wanted)",
+        file.display(),
+        aside.display()
+    );
+    Ok(aside)
+}
+
 /// Whether a file holds anything of chain `c`.
 fn has_rows(s: &Store, c: u16) -> Result<bool> {
     let pre = k_chain(c);
@@ -825,7 +847,17 @@ impl ChainDb {
                 }
                 continue;
             }
-            let s = if self.readonly { Store::open_readonly(&p, &CHAIN_SCHEMA)? } else { Store::open_sync(&p, &CHAIN_SCHEMA, false)? };
+            let opened = if self.readonly { Store::open_readonly(&p, &CHAIN_SCHEMA) } else { Store::open_sync(&p, &CHAIN_SCHEMA, false) };
+            let s = match opened {
+                Ok(s) => s,
+                // One chain's damaged file doesn't keep the arcade from starting (ARCADE issue #18): it is set aside, never
+                // deleted, and the chain starts over empty and syncs again, while every other chain starts as it was.
+                Err(e) if !self.readonly && is_corrupt(&e) => {
+                    set_aside(&p, &e)?;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             files.insert(c, Arc::new(s));
         }
         if !files.is_empty() && !self.readonly {

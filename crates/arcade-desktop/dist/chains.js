@@ -73,7 +73,7 @@
       }
     } else if (borrowed) {
       d.textContent = `${bc.state || "Borrowed"} · from block ${(bc.floor ?? 0).toLocaleString()} · ${bc.coins || 0} coin${bc.coins === 1 ? "" : "s"}${bc.scan ? " · " + bc.scan : ""}`;
-      l.textContent = (bc.lenders || []).length ? "Lenders: " + bc.lenders.map((x) => `${x.addr} (tip ${(x.tip || 0).toLocaleString()}${x.fails ? `, ${x.fails} recent failure${x.fails === 1 ? "" : "s"}` : ""})`).join(" · ") : "No lender right now";
+      l.textContent = (bc.lenders || []).length ? "Lenders: " + bc.lenders.map((x) => `${x.addr} (tip ${(x.tip || 0).toLocaleString()}${x.disagreed ? ", named another block: not used" : x.behind ? ", stopped far behind: not used until it catches up" : ""}${x.fails ? `, ${x.fails} recent failure${x.fails === 1 ? "" : "s"}` : ""})`).join(" · ") : "No lender right now";
       info.append(l);
     } else {
       d.textContent = "Not installed" + (bc.on === false || !globalOn ? " · borrowing off" : bc.lendable ? " · borrowing starts soon" : " · no arcade lends it right now");
@@ -389,6 +389,8 @@
       const reps = e.registration?.replicas || [];
       const next = reps.filter((r) => r.state === "next batch" || r.state === "challenge window");
       if (next.length) notes.push(`${next.length} sealed segment(s) wait to register: the next batch can go in block ${fmtN(Math.max(...next.map((r) => r.batch_at)))} (one batch every ${fmtN(e.pay?.period)} blocks).`);
+      // ARCADE #14: how often sealed segments can register at all, said once even when none waits.
+      else if (e.pay?.period) notes.push(`Sealed segments register one batch an audit period: every ${fmtN(e.pay.period)} blocks, about ${Math.round(e.pay.period * 150 / 86400)} days.`);
       const reg = reps.filter((r) => r.state === "registering");
       if (reg.length) notes.push(`${reg.length} segment(s) registering: proof due by block ${fmtN(reg[0].proof_by)}.`);
       const unl = reps.filter((r) => r.state === "not listed" || r.state === "offered" || r.state === "other root");

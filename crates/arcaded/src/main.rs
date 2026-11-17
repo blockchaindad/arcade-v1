@@ -102,7 +102,7 @@ mod rpc;
 mod sizes;
 mod udpsvc;
 mod relaysvc;
-mod llmsvc;
+mod svcmesh;
 mod turnsvc;
 mod v1copy;
 mod vxshare;
@@ -530,9 +530,9 @@ fn main() {
         std::thread::Builder::new().name("dogefeed keys".into()).spawn(move || dproto::run(n)).unwrap();
     }
     {
-        // Shared models (docs/LLM.md): our offer said to the mesh, top-ups settled.
+        // Services over the mesh (svcmesh): helpers' offers said again while they stay attached.
         let n = node.clone();
-        std::thread::Builder::new().name("llm".into()).spawn(move || llmsvc::run(n)).unwrap();
+        std::thread::Builder::new().name("svc".into()).spawn(move || svcmesh::run(n)).unwrap();
     }
     {
         let n = node.clone();
