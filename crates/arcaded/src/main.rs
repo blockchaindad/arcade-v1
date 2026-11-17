@@ -508,6 +508,7 @@ fn main() {
                         }
                         faucet::pay_asks(&n);
                         arcfaucet::pay(&n);
+                        arcfaucet::welcome_wallet(&n);
                         last = std::time::Instant::now();
                     }
                     claims::advance_all(&n);

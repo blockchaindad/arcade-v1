@@ -75,6 +75,8 @@ pub fn create_wallet(node: &Node, phrase: Option<&str>) -> Result<Value, String>
             }
         }
     }
+    // And the 1 ARCADE welcome (crate::arcfaucet), to like, comment and tip with off the rip.
+    crate::arcfaucet::welcome_wallet(node);
     Ok(json!({"phrase": if restored { Value::Null } else { json!(words) }, "restored": restored, "tag": tag}))
 }
 
