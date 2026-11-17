@@ -9,7 +9,8 @@ carries it; it knows nothing about what a service does. The first user will be t
 Open the API socket and send `{"cmd": "svc.attach", "service": "<name>"}`. The name is 1-32 characters of a-z, 0-9
 and `-`. The connection then stays open:
 
-- **arcaded writes** `{"ok": true, "result": {service, node}}` first, then:
+- **arcaded writes** `{"ok": true, "result": {service, node, pay_to, tag}}` first (this arcade's node id, its ARCADE
+    address and @tag), then:
   - `{"in": {id, from, who, tag, body}}` for each request. `from` is the asking arcade's node id. `who` is the
     asker's ARCADE address, proved by a grant its wallet signed for this service at this arcade (null when it has
     no ARCADE wallet), and `tag` is that address's @tag.

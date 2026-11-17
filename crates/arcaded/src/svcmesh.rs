@@ -123,7 +123,12 @@ pub fn attach(node: Arc<Node>, lines: &mut dyn Iterator<Item = std::io::Result<S
         gen
     };
     let _ = node.app.event("svc", &format!("a helper attached for {service}"));
-    let _ = tx.send(json!({"ok": true, "result": {"service": service, "node": node.id_hex()}}));
+    // Who this arcade is, for the helper: its node id, and the ARCADE address payments come to (and its @tag).
+    let (pay_to, tag) = match crate::arcledger::chain().ok().and_then(|p| crate::arcledger::sender(&node, p).ok()) {
+        Some((a, t, _)) => (Some(a), t),
+        None => (None, None),
+    };
+    let _ = tx.send(json!({"ok": true, "result": {"service": service, "node": node.id_hex(), "pay_to": pay_to, "tag": tag}}));
     let mut ww = match w.try_clone() {
         Ok(x) => x,
         Err(_) => return detach(&node, &service, gen),
