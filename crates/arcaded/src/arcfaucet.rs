@@ -1,5 +1,6 @@
 //! The ARCADE faucet (Martin, 2026-11-15): a user who signs in gets their ARCADE address
-//! topped up to 0.01 ARCADE once a day, so they can publish an a:// profile and use a:// without
+//! topped up to 0.05 ARCADE once a day (0.01 until 2026-11-16: too little for a comment, whose text blob costs about
+//! 0.02), so they can publish an a:// profile, like, comment and tip without
 //! buying coins first. Any arcade on the mesh with spare test ARCADE pays.
 //!
 //! Mesh frame `t:"af"`, a kind of its own (not the welcome protocol's `wl`, which old arcades
@@ -20,9 +21,9 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
-/// What a signed-in user's ARCADE address is topped up to: 0.01 ARCADE.
-pub const TARGET: u64 = 1_000_000;
-/// Top-ups one arcade pays per UTC day (at most 5 ARCADE a day).
+/// What a signed-in user's ARCADE address is topped up to: 0.05 ARCADE (about two comments, or eighty likes).
+pub const TARGET: u64 = 5_000_000;
+/// Top-ups one arcade pays per UTC day (at most 25 ARCADE a day).
 pub const DAILY_CAP: usize = 500;
 /// Of those, for addresses one asking arcade named.
 pub const PER_ASKER: usize = 200;
@@ -90,7 +91,7 @@ fn frame(rec: Value) -> Value {
     json!({"t": "af", "recs": [rec]})
 }
 
-/// Ask the mesh to top `addr` up to 0.01 ARCADE: once per address and UTC day, and only when it
+/// Ask the mesh to top `addr` up to 0.05 ARCADE: once per address and UTC day, and only when it
 /// has less than that (as far as this arcade can see). This arcade may pay its own ask too.
 pub fn ask(node: &Node, addr: &str) -> Result<Value, String> {
     let addr = addr.trim();
@@ -100,7 +101,7 @@ pub fn ask(node: &Node, addr: &str) -> Result<Value, String> {
     script_of(p, addr)?;
     if let Ok(p) = chain() {
         if let Some(have) = balance(node, p, addr).filter(|h| *h + arcade_arc::params::DUST > TARGET) {
-            return Ok(json!({"asked": false, "address": addr, "balance": have, "why": "it has 0.01 ARCADE already"}));
+            return Ok(json!({"asked": false, "address": addr, "balance": have, "why": "it has 0.05 ARCADE already"}));
         }
     }
     let key = day_key("arc_faucet_asked", now);
@@ -113,7 +114,7 @@ pub fn ask(node: &Node, addr: &str) -> Result<Value, String> {
     node.mesh_outbox.lock().unwrap().push(frame(rec));
     asked.push(json!(addr));
     write_list(node, &key, &asked);
-    let _ = node.app.event("faucet", &format!("asked the mesh to top {addr} up to 0.01 ARCADE"));
+    let _ = node.app.event("faucet", &format!("asked the mesh to top {addr} up to 0.05 ARCADE"));
     Ok(json!({"asked": true, "address": addr, "target": TARGET}))
 }
 
@@ -314,7 +315,7 @@ mod tests {
     #[test]
     fn tops_up_to_the_target() {
         assert_eq!(top_up(0), Some(TARGET));
-        assert_eq!(top_up(400_000), Some(600_000));
+        assert_eq!(top_up(400_000), Some(TARGET - 400_000));
         assert_eq!(top_up(TARGET), None);
         assert_eq!(top_up(TARGET * 3), None);
         // Short by less than the smallest output: nothing to send.

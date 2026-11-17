@@ -112,7 +112,7 @@ cmds! {
     "start.status" Read "" "Getting started: wallet made, handle (claimed or being claimed), test coins asked for or here, synced.";
     "tag.list" Read "" "Your tag claims and their progress.";
     "faucet.ask" Wallet "index?, tag?" "Ask the mesh for test coins.";
-    "faucet.arc" Wallet "address?" "Ask the mesh to top an ARCADE address up to 0.01 ARCADE (once per address a day; a website calls it when a user signs in). Without address: this wallet's.";
+    "faucet.arc" Wallet "address?" "Ask the mesh to top an ARCADE address up to 0.05 ARCADE (once per address a day; a website calls it when a user signs in). Without address: this wallet's.";
     "faucet.arc_status" Read "" "The ARCADE top-up asks this arcade knows and how many it paid today.";
     // Messaging
     "msg.me" Read "" "Your messaging key, fingerprint and whether it is published.";
