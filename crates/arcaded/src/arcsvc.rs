@@ -1244,6 +1244,9 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
     // The ledger on ARCADE (§15 step 7): tags, profiles and every arcade record, indexed in the same commit as each block
     // the store takes; an arcade that stored blocks before it had them walks those once, below.
     arcade_ledger::tags::set_expiry(p.chain_no, Some(s.tag_expiry));
+    // Rules version 4 (ARCADE #10): pushes checked against their base from its first height (the rules rise, so
+    // that's where `params::rules_v4` turns true).
+    arcade_ledger::repos::set_base_check_from(p.chain_no, params::rules_v4_from(&net));
     // The home chain's ledger, carried in (§15 step 19) right after block 0, before any record (`carry_in`). A store
     // that has blocks but no note of it built its ledger without the snapshot (its copy made again under an old
     // arcade's app-store flag, or from before the note): its ledger rows go and are made again, the snapshot first,

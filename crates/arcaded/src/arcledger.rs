@@ -226,8 +226,11 @@ fn own_full(node: &Node, name: &str) -> Result<(String, Option<String>), String>
     Ok((full, tag))
 }
 
-/// `ledger.repo_push {name, manifest}`: point `@owner/name` (or `name` under this wallet's tag) at a git manifest blob.
-pub fn repo_push(node: &Node, name: &str, manifest: &str) -> Result<Value, String> {
+/// `ledger.repo_push {name, manifest, base?, force?}`: point `@owner/name` (or `name` under this wallet's tag) at a git
+/// manifest blob. From rules version 4 (ARCADE #10) the record names `base`, the manifest the push was built on ("" for
+/// a new repository; left out, the repository's manifest now), and the ARCADE ledger refuses it when the repository
+/// has moved on since, unless `force`. Below version 4 `base` and `force` aren't sent and the push replaces as before.
+pub fn repo_push(node: &Node, name: &str, manifest: &str, base: Option<&str>, force: bool) -> Result<Value, String> {
     let (full, tag) = own_full(node, name)?;
     let tag = tag.ok_or("claim an @tag on the ARCADE chain first")?;
     let m: [u8; 32] = hex::decode(manifest).ok().and_then(|b| b.try_into().ok()).ok_or("manifest is a blob id (64 hex)")?;
@@ -239,8 +242,32 @@ pub fn repo_push(node: &Node, name: &str, manifest: &str) -> Result<Value, Strin
     if owner != tag && !is_maintainer(node, c, &full, &tag) {
         return Err(format!("@{tag} isn't the owner or a maintainer of @{full}"));
     }
-    let (txid, fee) = send(node, &arcade_ledger::repos::push_payload(&full, &m))?;
-    Ok(json!({"txid": txid, "fee": fee, "repo": format!("@{full}"), "manifest": manifest}))
+    let current = repo_row(node, &full).and_then(|r| hex::decode(r["m"].as_str()?).ok()?.try_into().ok()).unwrap_or(arcade_ledger::repos::NO_BASE);
+    if !push_base_checked(node) {
+        let (txid, fee) = send(node, &arcade_ledger::repos::push_payload(&full, &m))?;
+        return Ok(json!({"txid": txid, "fee": fee, "repo": format!("@{full}"), "manifest": manifest}));
+    }
+    let b = match base.map(str::trim) {
+        None => current,
+        Some("") => arcade_ledger::repos::NO_BASE,
+        Some(x) => hex::decode(x).ok().and_then(|b| b.try_into().ok()).ok_or("base is a manifest blob id (64 hex), or \"\" for a new repository")?,
+    };
+    if !force && b != current {
+        return Err(if current == arcade_ledger::repos::NO_BASE {
+            format!("@{full} doesn't exist yet: its first push names no base (or push with force)")
+        } else {
+            format!("@{full} is at manifest {}, not the base this push was built on: fetch and push again, or force it", hex::encode(current))
+        });
+    }
+    let (txid, fee) = send(node, &arcade_ledger::repos::push_onto_payload(&full, &m, &b, force))?;
+    Ok(json!({"txid": txid, "fee": fee, "repo": format!("@{full}"), "manifest": manifest, "base": hex::encode(b), "force": force}))
+}
+
+/// Whether a push sent now lands where rules version 4 checks its base (the next block's height on).
+pub fn push_base_checked(node: &Node) -> bool {
+    let (Some(net), Ok(p)) = (crate::arcsvc::svc_net(), chain()) else { return false };
+    let next = node.chain.tip(p.chain_no).ok().flatten().map_or(0, |t| t.height as u64 + 1);
+    arcade_arc::params::rules_v4(&net, next)
 }
 
 /// `ledger.repo_maintainer {name, tag, add}` (the owner only).
