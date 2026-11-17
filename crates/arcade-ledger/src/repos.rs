@@ -23,7 +23,8 @@
 //!   built on, zeros for a repository's first push) ‖ flags (u8, bit 0 = force). From the height rules version 4 starts
 //!   ([`set_base_check_from`]) a push whose base isn't the repository's manifest when the record is applied is refused
 //!   unless forced, so a push made from an out-of-date copy can't silently replace a newer one. Below that height op 7
-//!   is unknown (refused, as before version 4). Op 1 pushes stay valid at every height and replace as they always did.
+//!   is unknown (refused, as before version 4). From that height an op 1 push (no base) only makes a new repository;
+//!   onto an existing one it is refused. Below it op 1 pushes replace as they always did.
 
 use crate::tags::TYPE_ANY_DATA;
 use std::collections::BTreeMap;
@@ -292,6 +293,10 @@ pub fn apply_at<S: RepoStore>(s: &mut S, op: &RepoOp, sender_tag: Option<&str>, 
                 return Ok(Err("only the owner and its maintainers push to a repository"));
             }
             let now = s.repo(&f)?;
+            // At version 4 a push onto an existing repository names its base (op 7); op 1 only makes a new one.
+            if v4 && matches!(op, RepoOp::Push { .. }) && now.is_some() {
+                return Ok(Err("from rules version 4 a push to an existing repository names its base (op 7)"));
+            }
             if let RepoOp::PushOnto { base, force: false, .. } = op {
                 let current = now.as_ref().map_or(NO_BASE, |r| r.manifest);
                 if *base != current {
@@ -488,9 +493,15 @@ mod tests {
         assert_eq!(s.repos["alice/demo"], Repo { manifest: m3, fork: None, pushes: 3 });
         // The owner/maintainer check still comes first.
         assert_eq!(apply_at(&mut s, &onto("alice/demo", m4, m3, true), Some("bob"), true), Ok(Err("only the owner and its maintainers push to a repository")));
-        // An op 1 push (no base) stays valid at version 4 and replaces as before.
-        assert_eq!(apply_at(&mut s, &RepoOp::Push { name: "demo".into(), manifest: m4 }, Some("alice"), true), Ok(Ok(())));
-        assert_eq!(s.repos["alice/demo"].manifest, m4);
+        // An op 1 push (no base) onto an existing repository is refused at version 4, taken below it.
+        let plain = |n: &str, m| RepoOp::Push { name: n.into(), manifest: m };
+        assert_eq!(apply_at(&mut s, &plain("demo", m4), Some("alice"), true), Ok(Err("from rules version 4 a push to an existing repository names its base (op 7)")));
+        assert_eq!(s.repos["alice/demo"].manifest, m3);
+        assert_eq!(apply_at(&mut s, &plain("demo", m4), Some("alice"), false), Ok(Ok(())));
+        assert_eq!(s.repos["alice/demo"], Repo { manifest: m4, fork: None, pushes: 4 });
+        // An op 1 push that makes a new repository stays valid at version 4.
+        assert_eq!(apply_at(&mut s, &plain("fresh", m1), Some("alice"), true), Ok(Ok(())));
+        assert_eq!(s.repos["alice/fresh"], Repo { manifest: m1, fork: None, pushes: 1 });
         // A fork's first push is built on the fork's manifest (its source's).
         apply_at(&mut s, &RepoOp::Fork { name: "demo".into(), from: "alice/demo".into() }, Some("carol"), true).unwrap().unwrap();
         assert!(apply_at(&mut s, &onto("demo", m1, NO_BASE, false), Some("carol"), true).unwrap().is_err());

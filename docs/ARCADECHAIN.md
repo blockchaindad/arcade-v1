@@ -1057,8 +1057,8 @@ after its block-1,100 retarget.
   **Rules version 4 (ARCADE #10):** a push names the manifest it was built on (REPO op 7: name ‖ manifest ‖ base ‖
   flags, bit 0 force; base is zeros for a repository's first push), and the ledger refuses it (an invalid record, as
   any refused record) when base isn't the repository's manifest at that point of the chain, unless forced; a forced
-  push replaces as before. Below version 4's height op 7 is unknown and refused, as it always was; op 1 pushes (no
-  base) stay valid at every height. Arcades send op 7 from that height (`ledger.repo_push` fills `base` with the
+  push replaces as before. Below version 4's height op 7 is unknown and refused, as it always was; from that height
+  an op 1 push (no base) only makes a new repository and is refused onto an existing one. Arcades send op 7 from that height (`ledger.repo_push` fills `base` with the
   repository's manifest now when the caller gives none; the Git app's request takes its manifest's `prev`;
   `git-publish.py` and `git-remote-arcade` send the manifest they read, `--force` / `git push --force` force). This
   stops a push built from an out-of-date copy silently rolling another one back (2026-11-16: a mirror's second push,
