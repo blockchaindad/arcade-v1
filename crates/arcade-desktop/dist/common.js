@@ -6,7 +6,12 @@ const $ = (id) => document.getElementById(id);
 const invoke = window.__TAURI__ ? window.__TAURI__.core.invoke : webInvoke;
 // In a browser: notes meant only there (class "web-only") show; in the app they stay hidden.
 const IN_BROWSER = !window.__TAURI__;
-document.addEventListener("DOMContentLoaded", () => document.querySelectorAll(".web-only").forEach((e) => { e.hidden = !IN_BROWSER; }));
+document.addEventListener("DOMContentLoaded", () => {
+  document.querySelectorAll(".web-only").forEach((e) => { e.hidden = !IN_BROWSER; });
+  // A terminal opened from a browser (an SSH tunnel included) would open on the machine that
+  // serves the page. The button is the app's.
+  document.querySelectorAll(".app-only").forEach((e) => { e.hidden = IN_BROWSER; });
+});
 // The arcade's own addresses (http://127.0.0.1:<port>/...) as this window reaches them: in the app,
 // as they are; in a browser, at this page's origin, which is the arcade itself (through an SSH
 // tunnel, or a password-protected entrance on the home network in front of it, docs/WEBUI.md).

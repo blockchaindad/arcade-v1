@@ -633,6 +633,7 @@ async function refreshOnce() {
   loadHome();
   try {
     await refreshHome();
+    if (window.arcadeNodeSeen) window.arcadeNodeSeen(true);
     const tab = document.querySelector(".tab.on").id;
     if (tab === "wallet") await refreshWallet();
     if (tab === "mine") await refreshMine();
@@ -640,6 +641,7 @@ async function refreshOnce() {
     if (tab === "options") { await refreshOptions(); refreshWebUi(); drawAccounts($("o-accs"), $("o-acc-msg"), false); }
   } catch (e) {
     $("conn").textContent = "service not running"; $("conn").className = "pill bad";
+    if (window.arcadeNodeSeen) window.arcadeNodeSeen(false);
   }
 }
 

@@ -79,7 +79,12 @@
     const row = (c) => h("button", { class: c.key === chain?.key ? "on" : "", onclick: () => pick(c) }, coinEl(c), h("span", {}, c.name));
     m.replaceChildren(...chains.filter((c) => c.installed || c.borrowed).map(row));
   }
-  function pick(c) { remember(); chain = c; close(); paintSelector(); sum = SUMS[c.key]?.v || null; go("home", null, false); announce(); }
+  function pick(c) {
+    remember();
+    // Drop the chain you left before the new one is shown, so a late status can't paint it.
+    if (!chain || chain.key !== c.key) stopSyncWatch();
+    chain = c; close(); paintSelector(); sum = SUMS[c.key]?.v || null; go("home", null, false); announce();
+  }
   // Every tab follows the picked chain.
   function announce() { window.dispatchEvent(new CustomEvent("arcade:chain", { detail: chain })); }
   function close() { $("cs-menu").hidden = true; $("cs-btn").setAttribute("aria-expanded", "false"); }
@@ -240,7 +245,114 @@
       } catch {}
     }, delay);
   }
+  // The overview's sync bar follows the chain picked in the header. A generation drops a late
+  // answer for the chain you just left, so it can't paint over the one you switched to.
+  // One chains.status at a time, and only while this overview is on screen: every 4s until the
+  // chain is caught up, then every 20s in case it falls behind again.
+  const SYNC = {};
+  let syncGen = 0, syncKey = null;
+  const overviewOpen = () => page === "home" && $("explorer").classList.contains("on") && !document.hidden && !!chain;
+  function stopSyncWatch() { syncKey = null; syncGen++; }
+  function settled(st) {
+    if (!st || st.queued) return false;
+    if (st.state === "paused") return false;
+    if (st.move && st.move.finished == null && st.move.phase) return false;
+    if (st.installed === false) return true;
+    const stages = (st.stages || []).filter((s) => !s.info);
+    if (stages.some((s) => Number(s.pct) < 100)) return false;
+    if (typeof st.overall === "number" && st.overall < 99.95) return false;
+    const state = String(st.state || "");
+    if (/^(syncing|asking|bootstrapping|following|importing|copying)/.test(state)) return false;
+    return true;
+  }
+  function syncPct(st) {
+    if (typeof st.overall === "number") return st.overall;
+    const s = (st.stages || []).filter((x) => !x.info);
+    return s.length ? s.reduce((a, x) => a + Number(x.pct || 0), 0) / s.length : 0;
+  }
+  function syncCard(key, st) {
+    const card = h("div", { class: "x-stat x-sync", "data-key": key });
+    fillSync(card, key, st);
+    return card;
+  }
+  // Shown the moment a chain is picked, before its status is back: the name is already that chain's.
+  function pendingSync(key) {
+    const name = chains.find((c) => c.key === key)?.name || key;
+    return h("div", { class: "x-stat x-sync", "data-key": key },
+      h("div", { class: "x-sync-h" }, h("span", { class: "k" }, name), h("span", { class: "pct" }, "…")),
+      h("div", { class: "x-sync-state" }, "Checking this chain…"),
+      h("div", { class: "bar main" }, h("i", { style: "width:0%" })));
+  }
+  function syncSlot(key) {
+    const known = SYNC[key];
+    if (known && settled(known)) return null;
+    return known ? syncCard(key, known) : pendingSync(key);
+  }
+  function fillSync(card, key, st) {
+    const pct = Math.max(0, Math.min(100, syncPct(st)));
+    const name = st.name || chains.find((c) => c.key === key)?.name || key;
+    const behind = st.behind ? (chains.find((c) => c.key === st.behind)?.name || st.behind) : "";
+    const head = st.queued ? `Queued #${st.queued}${behind ? ` behind ${behind}` : ""}` : (st.state || "syncing");
+    const stages = (st.stages || []).map((s) => {
+      const p = Number(s.pct) || 0;
+      const per = s.unit === "rows" ? "rows/s" : "blocks/s";
+      // A finished stage has no live rate. "measuring…" is only while it is still moving and has a count.
+      const rateNum = s.rate == null ? "" : `${s.rate >= 10 ? Math.round(s.rate).toLocaleString("en-US") : Number(s.rate).toFixed(1)} ${per}`;
+      const rate = rateNum || (!s.info && s.rate == null && s.at != null && p < 100 ? "measuring…" : "");
+      const right = s.info ? (s.detail || "") : p >= 100 ? `done${rate ? ` · ${rate}` : ""}` : `${p.toFixed(1)}%${rate ? ` · ${rate}` : ""}${s.at != null ? ` · ${fmt(s.at)} of ${fmt(s.of)}` : ""}`;
+      const li = h("li", { class: (p >= 100 ? "done" : p > 0 ? "run" : "wait") + (s.current ? " now" : "") + (s.info ? " info" : "") },
+        h("div", { class: "sh" }, h("span", { class: "sn" }, s.current ? `${s.name} (now)` : s.name), h("span", { class: "sd" }, right)),
+        h("div", { class: "bar" }, h("i", { style: `width:${Math.max(0, Math.min(100, p))}%` })));
+      if (!s.info && s.detail) li.append(h("div", { class: "x-sync-detail" }, s.detail));
+      return li;
+    });
+    card.replaceChildren(
+      h("div", { class: "x-sync-h" }, h("span", { class: "k" }, name), h("span", { class: "pct" }, st.queued && st.installed === false ? "queued" : `${pct.toFixed(pct >= 10 ? 0 : 1)}%`)),
+      h("div", { class: "x-sync-state" }, head),
+      h("div", { class: "bar main" }, h("i", { style: `width:${pct}%` })),
+      stages.length ? h("ol", { class: "stages" }, stages) : "");
+  }
+  function placeSync(key, st) {
+    const row = document.querySelector("#x-view .x-stats");
+    if (!row || !chain || chain.key !== key || page !== "home") return false;
+    let card = row.querySelector(".x-sync");
+    if (settled(st)) { card?.remove(); return true; }
+    if (!card || card.dataset.key !== key) {
+      card?.remove();
+      card = syncCard(key, st);
+      const height = row.querySelector(":scope > .x-stat:not(.x-sync)");
+      if (height) height.after(card); else row.prepend(card);
+      return true;
+    }
+    fillSync(card, key, st);
+    return true;
+  }
+  function watchSync(key) {
+    if (!chain || chain.key !== key || syncKey === key) return;
+    syncKey = key;
+    const mine = ++syncGen;
+    const step = async () => {
+      if (mine !== syncGen) return;
+      if (!overviewOpen() || chain.key !== key) {
+        if (syncKey === key && mine === syncGen) syncKey = null;
+        return;
+      }
+      let st = null;
+      try { st = await api("chains.status", { key }); } catch { st = null; }
+      // Switched chains while this was in flight: do not touch the bar, and do not ask again.
+      if (mine !== syncGen || !chain || chain.key !== key) return;
+      if (st) { SYNC[key] = st; placeSync(key, st); }
+      if (mine !== syncGen || !overviewOpen() || chain.key !== key) return;
+      setTimeout(step, st && !settled(st) ? 4000 : 20000);
+    };
+    step();
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && overviewOpen()) watchSync(chain.key);
+  });
+
   async function vHome() {
+    watchSync(chain.key);
     const key = chain.key, kept = SUMS[key];
     if (!kept) {
       await summaryOf(key);
@@ -252,13 +364,17 @@
     if (!SUMS[key].v.mesh_pending) MESH_TRIES[key] = 0;
     sum = SUMS[key].v;
     const tok = sum.protocol ? sum.protocol.toUpperCase() : "";
-    const st = [
-      ["Height", fmt(sum.tip), sum.tip_time ? `last block ${ago(sum.tip_time)}` : ""],
-      ["Mempool", `${fmt(sum.mempool.count)} tx`, sum.mempool.bytes ? `${fmt(sum.mempool.bytes)} bytes` : "waiting for a block"],
-      has("ord") && ["Inscriptions", fmt(sum.inscriptions), "ord index"],
-      has("tokens") && [`${tok} tokens`.trim(), fmt(sum.ticks), "deployed ticks"],
-      has("names") && ["Names", fmt(sum.names?.[0] ?? 0), sum.names ? `json ${fmt(sum.names[1])} · doge2023 ${fmt(sum.names[2])}` : ""],
-      has("maps") && ["Maps", fmt(sum.maps), "first claim wins"],
+    const stat = (k, v, s) => h("div", { class: "x-stat" }, h("div", { class: "k" }, k), h("div", { class: "v" }, v), h("div", { class: "s" }, s));
+    // Height, then this chain's sync (hidden once it has caught up), then the rest. The bar is
+    // only the chain picked in the header: SYNC is keyed, and a switch replaces the view at once.
+    const cards = [
+      stat("Height", fmt(sum.tip), sum.tip_time ? `last block ${ago(sum.tip_time)}` : ""),
+      syncSlot(chain.key),
+      stat("Mempool", `${fmt(sum.mempool.count)} tx`, sum.mempool.bytes ? `${fmt(sum.mempool.bytes)} bytes` : "waiting for a block"),
+      has("ord") ? stat("Inscriptions", fmt(sum.inscriptions), "ord index") : null,
+      has("tokens") ? stat(`${tok} tokens`.trim(), fmt(sum.ticks), "deployed ticks") : null,
+      has("names") ? stat("Names", fmt(sum.names?.[0] ?? 0), sum.names ? `json ${fmt(sum.names[1])} · doge2023 ${fmt(sum.names[2])}` : "") : null,
+      has("maps") ? stat("Maps", fmt(sum.maps), "first claim wins") : null,
     ].filter(Boolean);
     const lower = [
       has("tokens") && sect(`${tok} tokens`.trim(), "tokens", tokTable(sum.tokens || [])),
@@ -269,7 +385,7 @@
       sum.borrowed ? h("p", { class: "x-note" }, chain.installed
         ? `This arcade is still catching up on ${chain.name} (block ${fmt(sum.syncing_at)}): the newest blocks and the mempool come from a lender meanwhile.`
         : `${chain.name} is borrowed here, not installed: its blocks and the mempool come from a lender.`) : "",
-      h("div", { class: "x-stats" }, st.map(([k, v, s]) => h("div", { class: "x-stat" }, h("div", { class: "k" }, k), h("div", { class: "v" }, v), h("div", { class: "s" }, s)))),
+      h("div", { class: "x-stats" }, cards),
       h("div", { class: has("ord") ? "x-cols" : "x-cols one" },
         sect("Latest blocks", "blocks", blockRows(sum.blocks)),
         has("ord") ? sect("Latest inscriptions", "inscriptions", insGrid(sum.latest || [])) : ""),
@@ -787,7 +903,14 @@
     const want = `${chain.key}|${page}|${arg ?? ""}`;
     if (want !== showing) {
       const label = (SECTIONS.find(([k]) => k === (DETAIL_PARENT[page] || page)) || [, "Overview"])[1];
-      $("x-view").replaceChildren(backBar(), h("div", { class: "x-empty x-loading" }, `Loading ${chain.name} · ${label}…`));
+      const kids = [backBar(), h("div", { class: "x-empty x-loading" }, `Loading ${chain.name} · ${label}…`)];
+      // The bar switches with the header chain before the rest of the overview is back.
+      if (page === "home") {
+        watchSync(chain.key);
+        const card = syncSlot(chain.key);
+        if (card) kids.push(h("div", { class: "x-stats" }, card));
+      }
+      $("x-view").replaceChildren(...kids);
       showing = want;
     }
     try {
@@ -818,6 +941,7 @@
     if (a === null && DETAIL_PARENT[page] && chain && LAST[`${chain.key}|${p}`] != null) a = LAST[`${chain.key}|${p}`];
     if (keep) remember();
     page = p; arg = a;
+    if (p !== "home") stopSyncWatch();
     if (chain && !DETAIL_PARENT[p]) LAST[`${chain.key}|${p}`] = a;
     render(); window.scrollTo({ top: 0 });
   }

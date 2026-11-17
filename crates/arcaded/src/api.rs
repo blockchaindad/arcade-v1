@@ -25,6 +25,18 @@ fn handle(node: Arc<Node>, s: UnixStream) {
         // Services over the mesh (crate::svcmesh): a helper keeps this connection; an ask with "stream" answers in
         // several lines, the last the usual {ok, result}.
         if let Ok(req) = serde_json::from_str::<Value>(&line) {
+            // Socket only, before dispatch, so cookie /rpc and API keys never see it. The marker
+            // is written first: a window that refreshes while the caches flush must not start
+            // another arcaded. Start (and the Windows login task) are what clear it.
+            if req["cmd"] == "service.stop" {
+                crate::mark_owner_stopped(&node.home);
+                crate::request_stop();
+                let reply = json!({"ok": true, "result": "stopping: writing the coin caches, then exiting"});
+                if writeln!(w, "{reply}").is_err() {
+                    break;
+                }
+                continue;
+            }
             if req["cmd"] == "svc.attach" {
                 return crate::svcmesh::attach(node, &mut lines, w, &req);
             }
@@ -104,6 +116,10 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
     match req["cmd"].as_str().unwrap_or("") {
         // The link that opens the desktop app's window in a browser (crate::webui; `arcade web`).
         "ui.link" => crate::webui::link(node, node.http_port.get().copied().unwrap_or(8420)),
+        // A terminal for the owner, on this computer. The program is a shell with the arcade CLI
+        // on PATH; the request names nothing to run. Stop is not here: service.stop is answered
+        // only on the socket, above dispatch, so this path (cookie /rpc, API keys) cannot call it.
+        "node.terminal" => crate::localterm::open(),
         "status" => {
             let tip = node.chain.tip(c).map_err(|e| e.to_string())?;
             use arcade_ledger::index;
@@ -738,12 +754,24 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
             Ok(json!({"measured": m, "chains": crate::chains::list(node)}))
         }
         "chains.status" => {
+            // No key: one reply for the Options panel (where each installed chain sits, and where
+            // a queued chain was placed). The explorer asks for one key and gets that chain's stages.
+            if s("key").is_none() {
+                return Ok(crate::chaindrive::places(node));
+            }
             let key = s("key").ok_or("key required")?;
             let mut st = crate::chains::status(node, &key)?;
             // Where its file is, and a move to another drive (crate::chaindrive).
             if let Some(p) = crate::chains::find(&key).filter(|_| st["installed"] != false && st.is_object()) {
                 st["place"] = crate::chaindrive::place(node, p.chain_no);
                 st["move"] = crate::chaindrive::status(p.key);
+            }
+            // Queued installs have no stages yet. The explorer's bar still needs the place in line.
+            if st.is_object() {
+                let canon = st["key"].as_str().unwrap_or(key.as_str());
+                let pos = crate::chains::queued_at(node, canon);
+                let behind = pos.and_then(|_| crate::chains::installing_now(node)).map(|p| p.key);
+                crate::chains::attach_queue(&mut st, pos, behind);
             }
             Ok(st)
         }

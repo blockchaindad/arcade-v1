@@ -1,6 +1,8 @@
 fn main() {
     // The app's own commands, so each window gets only those its capability grants
     // (capabilities/): content windows get none.
-    tauri_build::try_build(tauri_build::Attributes::new().app_manifest(tauri_build::AppManifest::new().commands(&["api", "open_app", "open_content", "save_file"])))
+    tauri_build::try_build(tauri_build::Attributes::new().app_manifest(tauri_build::AppManifest::new().commands(&[
+        "api", "open_app", "open_content", "save_file", "node_start", "open_cli",
+    ])))
         .expect("tauri build");
 }

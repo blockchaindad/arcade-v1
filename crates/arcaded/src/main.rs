@@ -6,6 +6,7 @@
 //!           [--http-port N|0] [--http-bind ADDR] [--site DIR] [--stun-port N|0]
 
 mod accountsvc;
+mod localterm;
 mod webui;
 mod rulecheck;
 mod updater;
@@ -180,6 +181,24 @@ static RESTART_ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 pub fn request_restart() {
     RESTART_ASKED.store(true, std::sync::atomic::Ordering::SeqCst);
     STOP_ASKED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The same clean stop as SIGTERM and `arcade stop`: the stop thread writes every chain's coin
+/// cache, then exits. It does not restart. An update sets the restart flag separately.
+pub fn request_stop() {
+    STOP_ASKED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Written by `service.stop`. While it is here, the desktop must not start arcaded again
+/// (on Windows the window asks every few seconds, and that would undo Stop). Start, and the
+/// Windows login task, delete it. Distinct from `arcaded.stop`, which asks a running service to exit.
+pub fn owner_stopped_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join("arcaded.stopped")
+}
+
+pub fn mark_owner_stopped(home: &std::path::Path) {
+    let _ = std::fs::create_dir_all(home);
+    let _ = std::fs::write(owner_stopped_path(home), b"stopped\n");
 }
 
 extern "C" fn on_stop_signal(_: libc::c_int) {

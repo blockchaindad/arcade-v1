@@ -239,14 +239,15 @@ cmds! {
     "chains.peers" Read "key" "A chain's P2P address book: nodes known, working in the last day, resting after failures; the working ones and the next to try.";
     "mesh.overview" Public "" "The arcade mesh at a glance: every arcade linked or heard lately, its operator, and per chain what it lends, the chain copies it can make (and why not), the index copies it offers, how far it walks ord, and whether its ledger fingerprint matches ours.";
     "chains.list" Public "" "Every chain V1.0 knows, installed or not, with sizes reported by arcades.";
-    "chains.status" Public "key" "One chain's staged progress.";
+    "chains.status" Public "key?" "One chain's staged progress. With no key: where each installed chain sits and where a queued chain was placed, in one reply (the Options panel).";
     "chains.offers" Public "" "Chains other arcades offer over the mesh.";
     "chains.sizes" Admin "" "Measure this arcade's disk use per chain now.";
-    "chains.add" Admin "key, mode?, with?, drive?" "Install a chain (mode full, shared or chain; with = indexes; drive from chains.drives, else this arcade's own). One install at a time: while another chain is still being installed it waits in a queue (queued, position).";
+    "chains.add" Admin "key, mode?, with?, drive?" "Install a chain (mode full, shared, chain or light; with = indexes; drive from chains.drives, else this arcade's own). One install at a time: while another chain is still being installed it waits in a queue (queued, position). A chain already waiting returns that place in line and does not change its drive; move a queued or installed chain with chains.move.";
     "chains.queue" Public "" "Chains waiting to be installed, next first (position, key, name, mode, with), and the chain being installed now that they wait behind.";
     "chains.unqueue" Admin "key" "Take a chain out of the install queue.";
     "chains.pause" Admin "key" "Pause a chain.";
     "ui.link" Local "" "The link that opens the app's window in a browser (/ui/, with this start's key) and the SSH tunnel command for another computer (docs/WEBUI.md).";
+    "node.terminal" Local "" "Open a terminal on this computer with the arcade CLI on PATH (a shell, not a one-shot command, and nothing is taken from the caller). This computer only (the socket or the cookie). Never an API key, and never another arcade. Stop is service.stop on the socket only, not a command here, so the cookie and an API key cannot call it.";
     "chains.drives" Read "" "Drives a chain's file can go on: this arcade's own, and other mounted disks (free space, whether the arcade can write there).";
     "chains.move" Admin "key, drive" "Move an installed chain's file to another drive (drive from chains.drives; home = this arcade's own). Runs in the background; chains.status shows its progress.";
     "chains.resume" Admin "key" "Resume a chain.";
@@ -364,4 +365,19 @@ pub fn find(name: &str) -> Option<&'static Cmd> {
 
 pub fn help() -> serde_json::Value {
     serde_json::json!(COMMANDS.iter().map(|c| serde_json::json!({"method": c.name, "needs": c.perm.name(), "params": c.params, "summary": c.summary})).collect::<Vec<_>>())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stopping_and_a_terminal_stay_on_this_computer() {
+        // One name, and it is not a dispatch command: cookie /rpc and an API key have nothing to call.
+        assert!(find("service.stop").is_none(), "service.stop stays on the socket, ahead of dispatch");
+        assert!(find("node.stop").is_none(), "node.stop was a second name for the same stop");
+        let c = find("node.terminal").unwrap();
+        assert_eq!(c.perm, Perm::Local);
+        assert!(c.params.is_empty(), "the terminal takes nothing from the caller");
+    }
 }

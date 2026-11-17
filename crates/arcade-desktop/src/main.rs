@@ -19,6 +19,44 @@ fn home() -> std::path::PathBuf {
     base.join("arcade")
 }
 
+/// `arcaded.stopped` in the data folder. Stop writes it; Start deletes it. While it exists the
+/// window must not start the service (a refresh every few seconds would undo Stop).
+fn stopped_marker(home: &std::path::Path) -> std::path::PathBuf {
+    home.join("arcaded.stopped")
+}
+
+fn owner_stopped(home: &std::path::Path) -> bool {
+    stopped_marker(home).is_file()
+}
+
+fn mark_owner_stopped(home: &std::path::Path) {
+    let _ = std::fs::create_dir_all(home);
+    let _ = std::fs::write(stopped_marker(home), b"stopped\n");
+}
+
+fn clear_owner_stopped(home: &std::path::Path) {
+    let _ = std::fs::remove_file(stopped_marker(home));
+}
+
+/// What to do when the service socket is down. Stop never starts it. A refresh doesn't either,
+/// once Stop has left the marker.
+#[derive(Debug, PartialEq)]
+enum WhenDown {
+    StayStopped,
+    Start,
+    ReportDown,
+}
+
+fn when_socket_is_down(cmd: &str, home: &std::path::Path) -> WhenDown {
+    if cmd == "service.stop" {
+        return WhenDown::StayStopped;
+    }
+    if owner_stopped(home) {
+        return WhenDown::ReportDown;
+    }
+    WhenDown::Start
+}
+
 /// What an app window's own code (appwindow.js, and the trade.js and media.js it loads) asks the arcade: the doors it
 /// answers for its app (storage, rooms, rings, messages, contacts, groups, trades, prizes, inscribing, and the wallet
 /// requests its cards put to the player), and the public reads it shows. An app window holds a stranger's page in a
@@ -50,10 +88,26 @@ fn api(window: tauri::WebviewWindow, req: Value) -> Value {
     if !window_may(window.label(), cmd) {
         return json!({"ok": false, "error": format!("{cmd} is not for this window")});
     }
-    let sock = home().join("arcaded.sock");
+    let home = home();
+    // Before the request, so a refresh that lands while the caches flush already sees it.
+    if cmd == "service.stop" {
+        mark_owner_stopped(&home);
+    }
+    let sock = home.join("arcaded.sock");
     let mut s = match UnixStream::connect(&sock) {
         Ok(s) => s,
-        Err(e) => return json!({"ok": false, "error": format!("the arcade service is not running ({}: {e})", sock.display())}),
+        Err(e) => {
+            return match when_socket_is_down(cmd, &home) {
+                // The node is already down. The marker is in place; do not start it.
+                WhenDown::StayStopped => json!({"ok": true, "result": "stopping: writing the coin caches, then exiting"}),
+                // Owner stopped it, or (on this build) there is no auto-start. Report it.
+                // Windows runs the installer order only for WhenDown::Start, and only while
+                // the marker is absent (windows_start_plan).
+                WhenDown::Start | WhenDown::ReportDown => {
+                    json!({"ok": false, "error": format!("the arcade service is not running ({}: {e})", sock.display())})
+                }
+            };
+        }
     };
     if writeln!(s, "{req}").is_err() {
         return json!({"ok": false, "error": "could not talk to the arcade service"});
@@ -216,7 +270,7 @@ mod tests {
             assert!(window_may("app-00ff", cmd), "{cmd}");
         }
         // The rest is the main window's.
-        for cmd in ["wallet.phrase", "wallet.send", "wallet.create", "wallet.import", "options.set", "apps.launch", "status", ""] {
+        for cmd in ["wallet.phrase", "wallet.send", "wallet.create", "wallet.import", "options.set", "apps.launch", "status", "service.stop", "node.terminal", ""] {
             assert!(!window_may("app-00ff", cmd), "{cmd}");
             assert!(window_may("main", cmd), "{cmd}");
         }
@@ -260,6 +314,69 @@ mod tests {
         // Hung or a helper process: nothing (WebView2 recovers; the X still closes the window).
         assert_eq!(after_process_failed("app-00ff", Gone::Other), Healing::Nothing);
         assert_eq!(after_process_failed("main", Gone::Other), Healing::Nothing);
+    }
+
+    #[test]
+    fn only_the_main_window_starts_the_node_or_opens_a_terminal() {
+        assert!(owner_window("main"));
+        for label in ["app-00ff", "content-00ff", "other", "Main"] {
+            assert!(!owner_window(label), "{label}");
+        }
+    }
+
+    #[test]
+    fn start_uses_the_installed_service_and_does_not_enable_it() {
+        assert_eq!(plan_start(std::path::Path::new("/var/lib/arcade")), StartHow::Systemctl { user: false });
+        let dir = std::env::temp_dir().join(format!("arcade-desktop-start-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(plan_start(&dir), StartHow::Systemctl { user: true });
+        let script = dir.join("start-arcaded.sh");
+        std::fs::write(&script, "").unwrap();
+        assert_eq!(plan_start(&dir), StartHow::Script(script));
+        std::fs::remove_dir_all(&dir).unwrap();
+        // A missing unit is the only reason to start the binary beside the app. A failed start is not.
+        assert!(unit_missing("Unit arcaded.service not found."));
+        assert!(unit_missing("Failed to start arcaded.service: Unit arcaded.service not found."));
+        assert!(!unit_missing("arcaded.service: start operation timed out"));
+        assert!(!unit_missing(""));
+    }
+
+    /// After service.stop the window must not run the login task. Start is what allows it again.
+    #[test]
+    fn after_service_stop_the_window_does_not_call_schtasks_until_start() {
+        let dir = std::env::temp_dir().join(format!("arcade-desktop-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("arcaded-hidden.vbs"), "").unwrap();
+        std::fs::write(dir.join("arcaded.exe"), "").unwrap();
+        mark_owner_stopped(&dir);
+        assert_eq!(when_socket_is_down("chains.status", &dir), WhenDown::ReportDown);
+        assert!(windows_start_plan(&dir, Some(&dir)).is_empty(), "a refresh must not run schtasks");
+        assert_eq!(when_socket_is_down("service.stop", &dir), WhenDown::StayStopped);
+        clear_owner_stopped(&dir);
+        assert_eq!(when_socket_is_down("chains.status", &dir), WhenDown::Start);
+        let plan = windows_start_plan(&dir, Some(&dir));
+        assert_eq!(plan[0].0, "schtasks");
+        assert_eq!(plan[0].1, ["/Run", "/TN", "Arcade V1.0"]);
+        assert_eq!(plan[1].0, "wscript");
+        assert_eq!(plan[1].1[0], "//B");
+        assert!(plan[1].1[1].ends_with("arcaded-hidden.vbs"));
+        assert!(plan[2].0.ends_with("arcaded.exe"));
+        assert_eq!(plan[2].1, vec!["--home".to_string(), dir.display().to_string()]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_terminal_is_a_shell_with_the_cli_directory_first_on_path() {
+        let dir = std::path::Path::new(if cfg!(windows) { r"C:\Arcade" } else { "/usr/local/bin" });
+        let path = path_with_dir(dir);
+        assert!(path.to_string_lossy().starts_with(dir.to_string_lossy().as_ref()));
+        for (bin, args) in terminal_launches() {
+            assert!(!args.iter().any(|a| a == "-c" || a.to_string_lossy().contains("phrase")), "{bin}");
+            assert!(args.iter().any(|a| a == "bash" || a == "cmd"), "{bin} should open a shell");
+            assert!(!args.iter().any(|a| a.to_string_lossy().contains("arcade")), "{bin} must not run the CLI");
+        }
     }
 
     #[test]
@@ -434,6 +551,210 @@ fn allow_media(w: &tauri::WebviewWindow) {
     });
 }
 
+/// The main window is the owner's. App windows hold someone else's page; content windows hold an inscription.
+fn owner_window(label: &str) -> bool {
+    label == "main"
+}
+
+/// How Start brings arcaded back: the unit or script the installer wrote, not a fresh enable.
+#[derive(Debug, PartialEq, Eq)]
+enum StartHow {
+    /// `systemctl start` (system) or `systemctl --user start`. Start, not enable: a node turned
+    /// off at boot stays that way.
+    Systemctl { user: bool },
+    /// install-linux.sh's script, when there is no systemd user session.
+    Script(std::path::PathBuf),
+}
+
+fn plan_start(home: &std::path::Path) -> StartHow {
+    if home.starts_with("/var/lib/arcade") {
+        StartHow::Systemctl { user: false }
+    } else if home.join("start-arcaded.sh").is_file() {
+        StartHow::Script(home.join("start-arcaded.sh"))
+    } else {
+        StartHow::Systemctl { user: true }
+    }
+}
+
+/// Windows Start, in the installer's order: the login task, then its hidden script, then
+/// `arcaded.exe --home` with this arcade's home (never a guessed one). Empty while the owner
+/// has stopped the node, so nothing here runs schtasks. The Windows build runs this plan;
+/// here it is what the stop test checks.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn windows_start_plan(home: &std::path::Path, exe_dir: Option<&std::path::Path>) -> Vec<(String, Vec<String>)> {
+    if owner_stopped(home) {
+        return Vec::new();
+    }
+    let mut steps = vec![("schtasks".into(), vec!["/Run".into(), "/TN".into(), "Arcade V1.0".into()])];
+    if let Some(dir) = exe_dir {
+        let vbs = dir.join("arcaded-hidden.vbs");
+        if vbs.is_file() {
+            steps.push(("wscript".into(), vec!["//B".into(), vbs.display().to_string()]));
+        }
+        let exe = dir.join("arcaded.exe");
+        if exe.is_file() {
+            steps.push((exe.display().to_string(), vec!["--home".into(), home.display().to_string()]));
+        }
+    }
+    steps
+}
+
+fn unit_missing(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("not found") || e.contains("does not exist") || e.contains("no such file")
+}
+
+fn command_output(cmd: &mut std::process::Command) -> Result<(), String> {
+    match cmd.output() {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let msg = err.trim();
+            Err(if msg.is_empty() { format!("exit {}", out.status) } else { msg.to_string() })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err("not found".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// The arcade CLI beside this app, else on PATH. One path, never a command line.
+fn cli_path() -> Result<std::path::PathBuf, String> {
+    let name = if cfg!(windows) { "arcade.exe" } else { "arcade" };
+    if let Ok(exe) = std::env::current_exe() {
+        let beside = exe.with_file_name(name);
+        if beside.is_file() {
+            return Ok(beside);
+        }
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        if let Some(p) = std::env::split_paths(&path).map(|d| d.join(name)).find(|p| p.is_file()) {
+            return Ok(p);
+        }
+    }
+    Err("the arcade CLI isn't installed next to the app, or on PATH".into())
+}
+
+fn path_ok(p: &std::path::Path) -> bool {
+    let s = p.as_os_str().to_string_lossy();
+    !s.is_empty() && !s.chars().any(|c| c.is_control() || matches!(c, '&' | '|' | ';' | '<' | '>' | '^' | '$' | '`'))
+}
+
+/// Start arcaded the way the installer did: its user service, its system service, or its start script.
+/// The binary beside the app is only a fallback when that unit isn't installed.
+#[tauri::command]
+fn node_start(window: tauri::WebviewWindow) -> Result<String, String> {
+    if !owner_window(window.label()) {
+        return Err("only this arcade's own window can start the node".into());
+    }
+    let home = home();
+    // Start is the owner's ask to run, so the stopped marker goes first. A refresh must not do this.
+    clear_owner_stopped(&home);
+    if UnixStream::connect(home.join("arcaded.sock")).is_ok() {
+        return Ok("The node is already running.".into());
+    }
+    match plan_start(&home) {
+        StartHow::Script(p) => {
+            let mut c = std::process::Command::new("sh");
+            c.arg(&p);
+            command_output(&mut c)?;
+        }
+        StartHow::Systemctl { user } => {
+            let mut c = std::process::Command::new("systemctl");
+            if user {
+                c.arg("--user");
+            }
+            c.args(["start", "arcaded"]);
+            if let Err(e) = command_output(&mut c) {
+                if !unit_missing(&e) && e != "not found" {
+                    return Err(e);
+                }
+                let name = if cfg!(windows) { "arcaded.exe" } else { "arcaded" };
+                let bin = std::env::current_exe().map_err(|err| err.to_string())?.with_file_name(name);
+                if !bin.is_file() {
+                    return Err(e);
+                }
+                std::process::Command::new(&bin).arg("--home").arg(&home).spawn().map_err(|err| err.to_string())?;
+            }
+        }
+    }
+    Ok("Started. It comes back the same way the installer starts it.".into())
+}
+
+/// A terminal in the owner's session (this window has the display): a shell, with the arcade
+/// CLI's directory first on PATH. Nothing the page sends is run. The child is reaped.
+#[tauri::command]
+fn open_cli(window: tauri::WebviewWindow) -> Result<(), String> {
+    if !owner_window(window.label()) {
+        return Err("only this arcade's own window can open a terminal".into());
+    }
+    let cli = cli_path()?;
+    if !path_ok(&cli) {
+        return Err("the arcade CLI's path can't be opened in a terminal".into());
+    }
+    let dir = cli.parent().ok_or("the arcade CLI's path can't be opened in a terminal")?;
+    let path = path_with_dir(dir);
+    let mut tried = Vec::new();
+    for (bin, args) in terminal_launches() {
+        match std::process::Command::new(bin).args(&args).env("PATH", &path).spawn() {
+            Ok(mut child) => match child.try_wait() {
+                Ok(Some(_)) => tried.push(bin),
+                _ => {
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                    return Ok(());
+                }
+            },
+            Err(_) => tried.push(bin),
+        }
+    }
+    Err(format!("no terminal program found ({}); open a terminal and run arcade", tried.join(", ")))
+}
+
+fn path_with_dir(dir: &std::path::Path) -> std::ffi::OsString {
+    let mut p = dir.as_os_str().to_os_string();
+    if let Some(old) = std::env::var_os("PATH") {
+        p.push(if cfg!(windows) { ";" } else { ":" });
+        p.push(old);
+    }
+    p
+}
+
+/// A shell that stays open. The CLI is on PATH, not the command (that prints help and exits).
+fn terminal_launches() -> Vec<(&'static str, Vec<std::ffi::OsString>)> {
+    let mut v = Vec::new();
+    #[cfg(unix)]
+    {
+        let bash = |flag: &str| vec![std::ffi::OsString::from(flag), std::ffi::OsString::from("bash")];
+        let dash = || vec![std::ffi::OsString::from("--"), std::ffi::OsString::from("bash")];
+        v.push(("x-terminal-emulator", bash("-e")));
+        v.push(("gnome-terminal", dash()));
+        v.push(("konsole", bash("-e")));
+        v.push(("xfce4-terminal", bash("-e")));
+        v.push(("mate-terminal", dash()));
+        v.push(("kgx", dash()));
+        v.push(("alacritty", bash("-e")));
+        v.push(("kitty", bash("-e")));
+        v.push(("wezterm", vec![std::ffi::OsString::from("start"), std::ffi::OsString::from("--"), std::ffi::OsString::from("bash")]));
+        v.push(("xterm", bash("-e")));
+    }
+    #[cfg(windows)]
+    {
+        v.push(("wt", vec![std::ffi::OsString::from("--"), std::ffi::OsString::from("cmd")]));
+        v.push((
+            "cmd",
+            vec![
+                std::ffi::OsString::from("/c"),
+                std::ffi::OsString::from("start"),
+                std::ffi::OsString::from("Arcade CLI"),
+                std::ffi::OsString::from("cmd"),
+                std::ffi::OsString::from("/k"),
+            ],
+        ));
+    }
+    v
+}
+
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
@@ -464,7 +785,7 @@ fn main() {
                 make_sure_it_closes(w);
             }
         })
-        .invoke_handler(tauri::generate_handler![api, open_app, open_content, save_file])
+        .invoke_handler(tauri::generate_handler![api, open_app, open_content, save_file, node_start, open_cli])
         .run(tauri::generate_context!())
         .expect("error while running the Arcade app");
 }
