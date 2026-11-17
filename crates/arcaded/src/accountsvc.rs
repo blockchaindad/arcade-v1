@@ -318,8 +318,6 @@ pub fn sign_in(node: &Node, tag: &str, password: &str, from: Option<&str>) -> Re
     // Make the tag key known (slot 0) so the wallet and messages see it at once.
     let _ = node.app.tag_key(p, 0);
     let _ = node.app.event("wallet", &format!("signed in as @{tag} (from {host})"));
-    // 0.01 ARCADE a day for a:// (crate::arcfaucet).
-    crate::arcfaucet::ask_for_wallet(node);
 
     let imports = bring_imports(node, &host, &tag, password).unwrap_or_else(|e| json!({"error": e}));
     let mailbox = bring_mailbox(node, &host, &login, &mk).unwrap_or_else(|e| json!({"error": e}));
