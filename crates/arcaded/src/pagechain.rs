@@ -72,6 +72,12 @@ use std::sync::Mutex;
 static KEPT: Mutex<Vec<(String, String, std::sync::Arc<(String, String, Vec<u8>)>)>> = Mutex::new(Vec::new());
 const KEPT_MOST: usize = 64 << 20;
 
+/// A page kept as if an arcade on the mesh had sent it (for tests of how it is served).
+#[cfg(test)]
+pub(crate) fn keep_for_test(p: &ChainParams, id: &str, content_type: &str, bytes: &[u8]) {
+    KEPT.lock().unwrap().push((p.key.to_string(), id.to_string(), std::sync::Arc::new((content_type.to_string(), String::new(), bytes.to_vec()))));
+}
+
 /// An arcade inscription's (content type, sha256, bytes) on chain `p`: from this arcade's ledger
 /// when it keeps it, else from an arcade on the mesh that does (checked against its sha256).
 pub fn content(node: &Node, p: &'static ChainParams, id: &str) -> Result<std::sync::Arc<(String, String, Vec<u8>)>, String> {
@@ -133,6 +139,12 @@ fn tx_by_id(node: &Node, p: &'static ChainParams, txid: &arcade_chain::Hash256) 
 /// What an inscription's first transaction says of it (the head of its manifest, engine::manifest):
 /// (content length, SHA-256, content type). Read from transactions checked against their txids.
 pub fn first_chunk(node: &Node, p: &'static ChainParams, itx: &str) -> Result<(u64, [u8; 32], String), String> {
+    arcade_ledger::content::first_piece_head(&first_tx(node, p, itx)?.payload)
+}
+
+/// An inscription's first transaction read as the arcade ledger reads it (its sender and payload), from
+/// transactions checked against their txids.
+fn first_tx(node: &Node, p: &'static ChainParams, itx: &str) -> Result<arcade_ledger::extract::ArcadeTx, String> {
     let h = arcade_chain::Hash256::from_hex(itx).map_err(|_| "no inscription txid to check the bytes against".to_string())?;
     let tx = tx_by_id(node, p, &h)?;
     let mut prev = Vec::new();
@@ -141,11 +153,26 @@ pub fn first_chunk(node: &Node, p: &'static ChainParams, itx: &str) -> Result<(u
         let o = pt.outputs.get(i.prevout.vout as usize).ok_or("bad prevout")?;
         prev.push(arcade_ledger::extract::Prevout { value: o.value, script: o.script_pubkey.clone() });
     }
-    let payload = match arcade_ledger::extract::extract(&tx, &prev, p) {
-        Some(Ok(a)) => a.payload,
-        _ => return Err("the inscription's transaction is not a readable arcade transaction".into()),
-    };
-    arcade_ledger::content::first_piece_head(&payload)
+    match arcade_ledger::extract::extract(&tx, &prev, p) {
+        Some(Ok(a)) => Ok(a),
+        _ => Err("the inscription's transaction is not a readable arcade transaction".into()),
+    }
+}
+
+/// Whether an app card another arcade sends is what the chain says of its inscription: the card's
+/// first transaction was sent by `creator` (the ledger's creator: every piece of an inscription comes
+/// from one sender) and its manifest JSON is `json` (as far as the first piece holds it). Err when
+/// the transactions can't be read here (no lender answers, or the chain isn't borrowed or kept); a
+/// transaction that is read but isn't an inscription's first piece is not the card's (false).
+pub fn card_matches(node: &Node, p: &'static ChainParams, itx: &str, creator: &str, json: &str) -> Result<bool, String> {
+    let h = arcade_chain::Hash256::from_hex(itx).map_err(|_| "not a txid".to_string())?;
+    // Read first, so a transaction that can't be had is "not checked", never "not the card's".
+    tx_by_id(node, p, &h)?;
+    Ok(match first_tx(node, p, itx) {
+        Ok(a) => a.sender == creator && arcade_ledger::content::first_piece_json_matches(&a.payload, json).unwrap_or(false),
+        Err(e) if e.contains("not a readable arcade transaction") => false,
+        Err(e) => return Err(e),
+    })
 }
 
 /// A page read (GET /r/...) on chain `p`: this arcade's own when it keeps the chain's ledger,

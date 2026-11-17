@@ -69,13 +69,14 @@ cmds! {
     "mesh.relay" Read "" "Relayed links: whether this arcade relays links for others, its month's traffic limit and cap on links, what it has passed this month and today, the links it passes now, and this arcade's own links through relays.";
     "mesh.relay_set" Admin "on?, limit_gb?, max_links?, price_per_gb?, free_mb?, pay_to?, pay_on?, pay_cap?" "Relay mesh links between arcades that can't reach each other (end-to-end encrypted: the relay sees only sealed bytes). Off by default; limit_gb is the month's traffic limit (default 50), max_links the links passed at once (default 32); price_per_gb (ARCADE, default 0: free) and free_mb (a month per arcade, default 100) are the usage fee, paid to pay_to (any ARCADE address; default this arcade's wallet, and no price without one). pay_on and pay_cap (ARCADE a month, default 1) let this arcade pay relays that charge.";
     "llm.status" Admin "" "Shared models, selling side: the model server's address, the models shared and their prices (ARCADE per million tokens in and out), requests at once, longest reply, refunds, what the server has now, and what was earned.";
-    "llm.set" Admin "on?, url?, key?, models?, prices?, at_once?, max_out?, refunds?, own_free?" "Share this computer's model server (any OpenAI-compatible one: vLLM, llama.cpp, Ollama, LM Studio) with the mesh for ARCADE. prices = {model: {in, out}} in ARCADE per million tokens (0 or none: free).";
-    "llm.scan" Admin "url?, key?" "The models a model server has (the one set, or one given before saving it).";
+    "llm.set" Admin "on?, servers? [{url, key?}] | url?, key?, models?, prices?, at_once?, max_out?, refunds?, own_free?" "Share this computer's model server (any OpenAI-compatible one: vLLM, llama.cpp, Ollama, LM Studio) with the mesh for ARCADE. prices = {model: {in, out}} in ARCADE per million tokens (0 or none: free); a speech model (OpenAI audio/speech, e.g. a CSM voice server) is priced by `in` per million characters. Several servers: servers = [{url, key}].";
+    "llm.scan" Admin "servers? | url?, key?" "The models a model server has (the one set, or one given before saving it).";
     "llm.offers" Read "" "Every model on offer across the mesh: seller, @tag, prices (ARCADE per million tokens), busy, whether linked, this arcade's record of the seller and last known credit there.";
     "llm.balance" Read "seller" "This wallet's credit at a seller (node id or @tag), its address to pay and the memo.";
     "llm.topup" Local "seller, amount" "Buy model credit at a seller: pays amount ARCADE to its address with this wallet's memo; credited once the payment is in a block.";
     "llm.refund" Local "seller" "Ask a seller to pay this wallet's unused credit back.";
     "llm.chat" Local "model?, seller?, messages, max_tokens?, temperature?" "One reply from a shared model, paid from this wallet's credit at the seller (model \"name@seller\" or a bare name: ours, else one with credit, else free, else cheapest).";
+    "llm.speak" Local "model?, seller?, input, voice?, response_format?" "Speech from a shared voice model (text to speech), paid from this wallet's credit at the seller by the characters read; the audio comes back as base64.";
     "llm.auto" Local "on?, floor?, amount?, daily_cap?" "Auto top-up: buy amount ARCADE of credit again when it falls under floor at a seller, at most daily_cap a day. Off by default.";
     "llm.keys" Read "" "Keys for OpenAI programs (/openai/v1 on this computer), without their secrets.";
     "llm.key_new" Local "name?" "A new sk-arcade- key for OpenAI programs (shown once); base URL http://127.0.0.1:<port>/openai/v1.";
@@ -97,11 +98,12 @@ cmds! {
     // Wallet
     "wallet.create" Local "phrase?" "Create a wallet (or restore one from 12 words). Returns the new words once.";
     "wallet.phrase" Local "" "The wallet's 12 words.";
-    "wallet.keys" Read "chain?" "Your addresses on a chain, their @tags and balances. balance follows the mempool (confirmed coins less those a waiting transaction spends, plus waiting outputs to you); confirmed is the blocks' figure; free the confirmed coins spendable now (not spent by a waiting transaction, mature, no inscription); pending / pending_coins what is arriving; waiting and dropped this wallet's transactions in the mempool and those that left it without a block.";
+    "wallet.keys" Read "chain?" "Your addresses on a chain, their @tags and balances (on SegWit chains each address type's address and balance under kinds; balance counts every type). balance follows the mempool (confirmed coins less those a waiting transaction spends, plus waiting outputs to you); confirmed is the blocks' figure; free the confirmed coins spendable now (not spent by a waiting transaction, mature, no inscription); pending / pending_coins what is arriving; waiting and dropped this wallet's transactions in the mempool and those that left it without a block.";
+    "wallet.addr_kind" Wallet "chain, kind?" "The address type the Wallet shows on a chain (legacy, p2sh-p2wpkh, p2wpkh, p2tr; remembered per chain) and the types it offers; kind: remember that one.";
     "dd.wallet" Read "chain?" "Your DigiDollar on DigiByte (chain dgb, the default, or dgbtest): address (DD.../TD...), cents, coins, borrowed, whole (false when only coins from the borrow floor on can be seen).";
     "dd.coins" Read "chain?, pubkey" "The DigiDollar address and coins (txid, vout, cents, height) of any DigiByte key (33-byte hex), as dd.wallet shows this wallet's: for a website whose accounts sign in their browsers.";
     "dd.send" Local "chain?, to, cents, send?" "Send DigiDollars (cents, $1 to $100,000 per send) to a DD.../TD... address, with DGB from the same wallet for the fee (0.35 DGB/kB, at least 0.1, at most 0.5 DGB); send: true broadcasts, otherwise it's only built and shown.";
-    "wallet.send" Local "chain?, to, amount, from?, send?" "Pay amount (satoshis) on a chain (home, installed or borrowed) from this wallet (from: one of its addresses or an imported wallet's; otherwise the own address with the most), signed here; send: true broadcasts, otherwise it's only built and shown with its fee (and a warning when the address could be meant for another chain).";
+    "wallet.send" Local "chain?, to, amount, from?, kind?, all_kinds?, send?" "Pay amount (satoshis) on a chain (home, installed or borrowed) from this wallet (from: one of its addresses or an imported wallet's; otherwise the own address with the most), signed here; kind: the address type it's sent from, change back to it (default: from's type, else the one the Wallet shows); all_kinds: also spend the wallet's other address types' coins; send: true broadcasts, otherwise it's only built and shown with its fee (and a warning when the address could be meant for another chain).";
     "wallet.link" Wallet "chain, wif, tag" "Link another wallet to your @tag (signed by both keys).";
     "wallet.unlink" Wallet "chain, address, tag" "Remove a linked wallet.";
     "wallet.links" Read "chain" "Your linked wallets on a chain.";
@@ -133,6 +135,7 @@ cmds! {
     "msg.send" Message "to, text?, file?" "Send a private message to a @tag, address or key; file = {name, type, data (base64)}.";
     "msg.delete" Message "id" "Stop showing a message here (the chain keeps it).";
     "msg.announce" Wallet "" "Publish your messaging key now if it isn't on chain.";
+    "profile.publish_addresses" Wallet "send?" "List this wallet's own addresses (Pepecoin mainnet, Dogecoin, each other coin installed here) on your @tag's profile, keeping the rest of it; no private key is pasted. send: true broadcasts, otherwise it's only built and shown with its fee and total cost.";
     "contacts.list" Read "" "Your contacts.";
     "contacts.save" Message "key, name?, address?, notes?" "Add or change a contact (by messaging key).";
     "contacts.delete" Message "key" "Remove a contact.";
@@ -201,6 +204,7 @@ cmds! {
     "ledger.item_state" Wallet "repo, number, state, manifest?" "Close, reopen or merge an issue or pull request.";
     "ledger.items" Read "repo, number?" "A repository's issues and pull requests with their comments and reviews.";
     "arc.earn" Admin "chain, on?" "The Earn ARCADE switch for a chain kept here in full (docs/EARN.md), and where it stands: sealing, the catalog, replicas waiting to register, this arcade's turn and next payout.";
+    "arc.earning" Read "" "Whether this arcade earns ARCADE: a light (green, yellow, grey, red) and why, pay built up, audits, the next payout turn, and the account paid.";
     "ord.chunks" Public "from?, chain?" "Ord fingerprint chunks (as other arcades compare them).";
     "name" Public "name?, chain?" "A name claim, or counts.";
     "map" Public "map?, chain?" "A map claim, or counts.";
@@ -259,6 +263,7 @@ cmds! {
     "chains.remove" Admin "key" "Remove a chain and its data.";
     "chains.copy_status" Public "key?" "Core-data copies (cb) linked arcades offer for installed chains, the fetch and import in progress, and whether a chain's coin set is trusted from a copy or verified.";
     "chains.copy_start" Admin "key, what?" "Bootstrap a chain from the best copy offered: what = coins (the coin set; missing blocks are fetched from the network and stored, default) or all (the copy's blocks too).";
+    "chains.copy_from_dir" Admin "key, dir" "Bootstrap a chain once from a Core datadir on this computer (dir: the folder holding blocks/ and chainstate/, e.g. an old arcade's Dogecoin Core), instead of a copy fetched over the mesh. Read in place and never written; refused while that Core runs (stop it first), if pruned, or of another chain. Taken in as an all copy (headers checked by proof of work, every coin against our blocks), trusted until re-checked from the blocks in the background. This arcade keeps its own database afterwards: the folder can be removed later.";
     "chains.copy_cancel" Admin "key" "Stop fetching a copy (its pieces are deleted) or decline the offer: the chain syncs the usual way.";
     "chains.refill" Admin "key, from?, to?, sources?" "Fetch back block bodies lost here (pruned, and no sealed copy answers for them) between from and to (default: the whole chain), 50 at a time: a batch is taken only when at least sources (default 2, at most 5) independent sources (different node ids and IP addresses: arcades holding the blocks, arcades lending their Core, coin P2P peers) sent the same bytes, each block matching our header, merkle root and stored txids. Runs in the background; see chains.refill_status.";
     "chains.refill_status" Public "key?" "Block refills (chains.refill): state, heights from/to/at, lost bodies found, restored, batches that couldn't be agreed, and the sources that agreed last.";
@@ -288,7 +293,7 @@ cmds! {
     "borrow.status" Read "" "Borrowed coins: the switches, and per chain its lenders, tip, floor, tip mismatch and your balance.";
     "borrow.set" Admin "on, chain?" "Turn borrowing on or off: for every coin (no chain) or for one chain (off removes its borrowed data).";
     "borrow.coins" Read "chain" "Your coins on a borrowed chain (from blocks read since the floor, and the lender's coin scan).";
-    "borrow.send" Local "chain, to, amount, from?, send?" "Pay amount (satoshis) on a borrowed chain, signed here; send: true broadcasts to every lender, otherwise only built and shown.";
+    "borrow.send" Local "chain, to, amount, from?, kind?, all_kinds?, send?" "Pay amount (satoshis) on a borrowed chain, signed here (kind, all_kinds: as wallet.send); send: true broadcasts to every lender, otherwise only built and shown.";
     // Mining
     "mine.start" Admin "threads?" "Mine the home chain: only at the tip (synced with a coin peer, no higher height known); until then it waits and mine.status says why.";
     "mine.stop" Admin "" "Stop mining.";

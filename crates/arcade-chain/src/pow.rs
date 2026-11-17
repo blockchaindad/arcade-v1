@@ -146,6 +146,11 @@ impl U256 {
         (!carry).then_some(U256(r))
     }
 
+    /// self - o (None if o is larger).
+    pub fn checked_sub(self, o: U256) -> Option<U256> {
+        (self >= o).then(|| self.sub(o))
+    }
+
     fn sub(self, o: U256) -> U256 {
         let mut r = [0u64; 4];
         let mut borrow = false;

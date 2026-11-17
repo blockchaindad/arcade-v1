@@ -9,9 +9,15 @@
 //!   signed by its node key and passed on across the mesh (newer only); prices are ARCADE base units per million
 //!   tokens. An offer with no models takes the seller off the list.
 //! - `q {id, seq, end}` + a piece of the request (zlib JSON `{what, grant, ...}`), from a buyer's arcade to the seller
-//!   over a mesh link (crvia). `what` = chat | balance | paid | refund.
+//!   over a mesh link (crvia). `what` = chat | speech | balance | paid | refund.
 //! - `a {id, seq, end, err?, ev}`: the answers: for a chat each OpenAI stream chunk as it comes, then
-//!   `{"arcade": {usage, cost, left}}`; for the others one answer.
+//!   `{"arcade": {usage, cost, left}}`; for speech the audio in the frames' blobs (the first with `ev {type}`, keepalives
+//!   `ev {wait}` while the voice is being made), then the same last event; for the others one answer.
+//!
+//! **Speech** (text to speech, OpenAI `/audio/speech`, e.g. the CSM voice server): a model whose server lists voices
+//! (or names it tts/csm/speech) is offered with `kind: "speech"` and its voices; it is priced by `in` per million
+//! characters of input, reserved in full before and charged only when audio came. A seller may set several model
+//! servers (a chat server and a voice server), each with its own slots.
 //!
 //! **Paying**: credit is prepaid and kept by the seller's arcade, per buyer (the buyer's ARCADE address), for every
 //! model of that seller. A buyer's arcade signs a grant naming the seller's node, its address and an expiry with that
@@ -38,6 +44,8 @@ const PIECE: usize = 48 * 1024;
 const MAX_REQUEST: usize = 8 << 20;
 /// The longest a whole request may take.
 const REQUEST_TIME: Duration = Duration::from_secs(600);
+/// How long a buyer waits for a link to a seller it isn't linked to (a relay open waits 20 s).
+const REACH_WAIT: Duration = Duration::from_secs(25);
 /// The longest between two answers of one request.
 const GAP_TIME: Duration = Duration::from_secs(180);
 /// How long a request waits for a free slot at the seller.
@@ -57,6 +65,14 @@ const PASSED: &[&str] = &[
     "parallel_tool_calls", "response_format", "seed", "presence_penalty", "frequency_penalty", "repetition_penalty", "logit_bias",
     "n", "user", "reasoning_effort", "chat_template_kwargs",
 ];
+/// OpenAI speech request fields passed on to the voice server.
+const SPEECH_PASSED: &[&str] = &["input", "voice", "response_format", "speed", "instructions"];
+/// The longest speech input (OpenAI's own limit).
+const MAX_SPEECH_CHARS: u64 = 4096;
+/// The most audio one speech request brings back.
+const MAX_AUDIO: usize = 64 << 20;
+/// The longest a speech request may take (a voice server may make all the audio before it sends any).
+const SPEECH_TIME: Duration = Duration::from_secs(1200);
 /// Usage rows kept by a seller.
 const USAGE_KEEP: usize = 2000;
 
@@ -82,8 +98,9 @@ pub fn err(e: impl std::fmt::Display) -> String {
 
 // ---------------------------------------------------------------- settings
 
-/// The seller's settings (META "llm"): {on, url, key, models:[id], prices:{id:{in, out}} (ARCADE per million tokens),
-/// at_once, max_out, refunds, own_free}.
+/// The seller's settings (META "llm"): {on, servers:[{url, key}], models:[id], prices:{id:{in, out}} (ARCADE per
+/// million tokens; for a speech model `in` is per million characters), info:{id:{server, kind, voices}} (from the last
+/// scan), at_once (per server), max_out, refunds, own_free}. Before speech, one server was `url` + `key`; still read.
 fn cfg(node: &Node) -> Value {
     read_meta(node, b"llm").unwrap_or(json!({}))
 }
@@ -96,8 +113,27 @@ fn write_meta(node: &Node, k: &[u8], v: &Value) -> Result<(), String> {
     node.app.store.write(|w| w.put(arcade_app::META, k, v.to_string().as_bytes())).map_err(err)
 }
 
+/// A model server's address as kept: http(s), no trailing slash, ending in /v1.
+fn norm_url(u: &str) -> Option<String> {
+    let u = u.trim().trim_end_matches('/');
+    if !(u.starts_with("http://") || u.starts_with("https://")) || u.len() > 300 {
+        return None;
+    }
+    Some(if u.ends_with("/v1") { u.to_string() } else { format!("{u}/v1") })
+}
+
+/// The model servers set (url, key), in order.
+fn servers(c: &Value) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = match c["servers"].as_array() {
+        Some(a) => a.iter().filter_map(|s| Some((norm_url(s["url"].as_str()?)?, s["key"].as_str().unwrap_or("").to_string()))).collect(),
+        None => c["url"].as_str().and_then(norm_url).map(|u| vec![(u, c["key"].as_str().unwrap_or("").to_string())]).unwrap_or_default(),
+    };
+    v.dedup_by(|a, b| a.0 == b.0);
+    v
+}
+
 fn selling(c: &Value) -> bool {
-    c["on"] == true && c["url"].as_str().is_some_and(|u| !u.is_empty()) && c["models"].as_array().is_some_and(|m| !m.is_empty())
+    c["on"] == true && !servers(c).is_empty() && c["models"].as_array().is_some_and(|m| !m.is_empty())
 }
 
 fn at_once(c: &Value) -> usize {
@@ -108,10 +144,21 @@ fn max_out(c: &Value) -> u64 {
     c["max_out"].as_u64().unwrap_or(4096).clamp(16, 131_072)
 }
 
-/// A model's prices here: (in, out) in base units per million tokens.
+/// A model's prices here: (in, out) in base units per million tokens (characters in, for speech).
 fn price_of(c: &Value, model: &str) -> (u64, u64) {
     let p = &c["prices"][model];
     (to_units(p["in"].as_f64().unwrap_or(0.0)), to_units(p["out"].as_f64().unwrap_or(0.0)))
+}
+
+/// "speech" for a text-to-speech model (OpenAI /audio/speech), else "chat".
+fn kind_of(c: &Value, model: &str) -> &'static str {
+    if c["info"][model]["kind"] == "speech" { "speech" } else { "chat" }
+}
+
+/// What a model server's model-list entry is: a speech model lists its voices (CSM voice server), or says so by name.
+fn kind_in_list(m: &Value) -> &'static str {
+    let id = m["id"].as_str().unwrap_or("").to_lowercase();
+    if m["voices"].is_array() || ["tts", "csm", "speech", "kokoro", "orpheus"].iter().any(|w| id.contains(w)) { "speech" } else { "chat" }
 }
 
 /// What `tin` tokens in and `tout` out cost at (in, out), in thousandths of a base unit.
@@ -128,43 +175,88 @@ fn affordable_out(price: (u64, u64), mu: u64, tin: u64) -> Option<u64> {
     Some((left * 1000 / price.1 as u128).min(u64::MAX as u128) as u64)
 }
 
-/// The model server's own address (always the operator's; never one from a request).
-fn server(c: &Value) -> Result<(String, String), String> {
-    let url = c["url"].as_str().map(|u| u.trim().trim_end_matches('/').to_string()).filter(|u| u.starts_with("http://") || u.starts_with("https://")).ok_or("set the model server's address (http://host:port/v1)")?;
-    let url = if url.ends_with("/v1") { url } else { format!("{url}/v1") };
-    Ok((url, c["key"].as_str().unwrap_or("").to_string()))
+/// The model server that has `model` (always one the operator set; never a URL from a request): the one the last
+/// scan found it on, else the first.
+fn server_for(c: &Value, model: &str) -> Result<(String, String), String> {
+    let all = servers(c);
+    let at = c["info"][model]["server"].as_str().unwrap_or("");
+    all.iter().find(|s| s.0 == at).or(all.first()).cloned().ok_or_else(|| "set the model server's address (http://host:port/v1)".to_string())
 }
 
 fn agent(secs: u64) -> ureq::Agent {
     ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(secs)).user_agent("arcade-llm/1.0").build()
 }
 
-/// The models the server says it has.
-fn scan_models(c: &Value) -> Result<Vec<Value>, String> {
-    let (url, key) = server(c)?;
+/// The models one server says it has.
+fn scan_one(url: &str, key: &str) -> Result<Vec<Value>, String> {
     let mut r = agent(15).get(&format!("{url}/models"));
     if !key.is_empty() {
         r = r.set("Authorization", &format!("Bearer {key}"));
     }
-    let v: Value = r.call().map_err(|e| format!("the model server did not answer: {e}"))?.into_json().map_err(|_| "the model server's model list isn't JSON".to_string())?;
+    let v: Value = r.call().map_err(|e| format!("{url} did not answer: {e}"))?.into_json().map_err(|_| format!("{url}'s model list isn't JSON"))?;
     Ok(v["data"].as_array().cloned().unwrap_or_default().into_iter().filter_map(|m| {
         let id = m["id"].as_str()?.to_string();
-        Some(json!({"id": id, "ctx": m["max_model_len"].as_u64().or(m["context_length"].as_u64())}))
+        let kind = kind_in_list(&m);
+        let mut x = json!({"id": id, "ctx": m["max_model_len"].as_u64().or(m["context_length"].as_u64()), "server": url, "kind": kind});
+        if let Some(vs) = m["voices"].as_array() {
+            x["voices"] = json!(vs.iter().filter_map(|s| s.as_str()).take(64).map(|s| s.chars().take(60).collect::<String>()).collect::<Vec<_>>());
+        }
+        Some(x)
     }).collect())
 }
 
-/// `llm.status`: the selling settings, what was earned, and the models the server has now.
+/// The models every server set says it has (an error only when none answered), and what went wrong with the others.
+fn scan_models(c: &Value) -> Result<(Vec<Value>, Vec<String>), String> {
+    let all = servers(c);
+    if all.is_empty() {
+        return Err("set the model server's address (http://host:port/v1)".into());
+    }
+    let (mut found, mut bad) = (Vec::new(), Vec::new());
+    for (url, key) in &all {
+        match scan_one(url, key) {
+            Ok(m) => found.extend(m),
+            Err(e) => bad.push(e),
+        }
+    }
+    if found.is_empty() && !bad.is_empty() {
+        return Err(bad.join("; "));
+    }
+    Ok((found, bad))
+}
+
+/// Keep where each model lives and what it is, from a scan (models not found now keep what was known).
+fn note_info(c: &mut Value, found: &[Value]) {
+    let mut info = c["info"].as_object().cloned().unwrap_or_default();
+    for m in found {
+        if let Some(id) = m["id"].as_str() {
+            info.insert(id.to_string(), json!({"server": m["server"], "kind": m["kind"], "voices": m["voices"]}));
+        }
+    }
+    let shared: BTreeSet<String> = c["models"].as_array().into_iter().flatten().filter_map(|m| m.as_str().map(String::from)).collect();
+    let live: BTreeSet<String> = found.iter().filter_map(|m| m["id"].as_str().map(String::from)).collect();
+    info.retain(|k, _| shared.contains(k) || live.contains(k));
+    c["info"] = Value::Object(info);
+}
+
+/// `llm.status`: the selling settings, what was earned, and the models the servers have now.
 pub fn status(node: &Node) -> Value {
     let c = cfg(node);
+    let all = servers(&c);
     let mut out = json!({
-        "on": c["on"] == true, "url": c["url"].as_str().unwrap_or(""), "has_key": c["key"].as_str().is_some_and(|k| !k.is_empty()),
-        "models": c["models"].clone(), "prices": c["prices"].clone(), "at_once": at_once(&c), "max_out": max_out(&c),
+        "on": c["on"] == true, "servers": all.iter().map(|s| json!({"url": s.0, "has_key": !s.1.is_empty()})).collect::<Vec<_>>(),
+        "url": all.first().map(|s| s.0.as_str()).unwrap_or(""), "has_key": all.first().is_some_and(|s| !s.1.is_empty()),
+        "models": c["models"].clone(), "prices": c["prices"].clone(), "info": c["info"].clone(), "at_once": at_once(&c), "max_out": max_out(&c),
         "refunds": c["refunds"] != false, "own_free": c["own_free"] != false, "selling": selling(&c),
-        "pay_to": crate::arcledger::own_address(node).ok(), "busy": slots().busy(),
+        "pay_to": crate::arcledger::own_address(node).ok(), "busy": busy_all(),
     });
-    if c["url"].as_str().is_some_and(|u| !u.is_empty()) {
+    if !all.is_empty() {
         match scan_models(&c) {
-            Ok(m) => out["found"] = json!(m),
+            Ok((m, bad)) => {
+                out["found"] = json!(m);
+                if !bad.is_empty() {
+                    out["found_error"] = json!(bad.join("; "));
+                }
+            }
             Err(e) => out["found_error"] = json!(e),
         }
     }
@@ -190,21 +282,53 @@ pub fn status(node: &Node) -> Value {
     out
 }
 
+/// The servers a request names: `servers:[{url, key?}]`, or the one `url` + `key?` (as before speech). A key left
+/// out keeps the one kept for that address.
+fn servers_asked(c: &Value, req: &Value) -> Result<Option<Vec<Value>>, String> {
+    let asked: Vec<(String, Option<String>)> = if let Some(a) = req["servers"].as_array() {
+        a.iter().take(8).map(|s| (s["url"].as_str().unwrap_or("").to_string(), s["key"].as_str().map(String::from))).collect()
+    } else if let Some(u) = req["url"].as_str() {
+        vec![(u.to_string(), req["key"].as_str().map(String::from))]
+    } else if let Some(k) = req["key"].as_str() {
+        // Only a new key: for the first server.
+        let mut all = servers(c);
+        if let Some(s) = all.first_mut() {
+            s.1 = k.trim().to_string();
+        }
+        return Ok(Some(all.into_iter().map(|(u, k)| json!({"url": u, "key": k})).collect()));
+    } else {
+        return Ok(None);
+    };
+    let had = servers(c);
+    let mut out = Vec::new();
+    for (u, k) in asked {
+        if u.trim().is_empty() {
+            continue;
+        }
+        let url = norm_url(&u).ok_or_else(|| format!("{}: a model server's address starts with http:// or https://", u.trim()))?;
+        let key = match k.map(|k| k.trim().to_string()).filter(|k| !k.is_empty()) {
+            Some(k) => k,
+            None => had.iter().find(|s| s.0 == url).map(|s| s.1.clone()).unwrap_or_default(),
+        };
+        if !out.iter().any(|x: &Value| x["url"] == url.as_str()) {
+            out.push(json!({"url": url, "key": key}));
+        }
+    }
+    Ok(Some(out))
+}
+
 /// `llm.set`: change the selling settings (only the fields given).
 pub fn set(node: &Node, req: &Value) -> Result<Value, String> {
     let mut c = cfg(node);
     if !c.is_object() {
         c = json!({});
     }
-    if let Some(u) = req["url"].as_str() {
-        let u = u.trim();
-        if !u.is_empty() && !(u.starts_with("http://") || u.starts_with("https://")) {
-            return Err("the model server's address starts with http:// or https://".into());
-        }
-        c["url"] = json!(u);
-    }
-    if let Some(k) = req["key"].as_str() {
-        c["key"] = json!(k.trim());
+    if let Some(s) = servers_asked(&c, req)? {
+        c["servers"] = json!(s);
+        c.as_object_mut().map(|o| {
+            o.remove("url");
+            o.remove("key");
+        });
     }
     for k in ["on", "refunds", "own_free"] {
         if let Some(b) = req[k].as_bool() {
@@ -227,30 +351,31 @@ pub fn set(node: &Node, req: &Value) -> Result<Value, String> {
             let get = |k: &str| v[k].as_f64().or_else(|| v[k].as_str().and_then(|s| s.trim().parse().ok())).unwrap_or(0.0);
             let (i, o) = (get("in"), get("out"));
             if !(0.0..=1_000_000.0).contains(&i) || !(0.0..=1_000_000.0).contains(&o) {
-                return Err(format!("{m}: a price is ARCADE per million tokens, 0 to 1000000"));
+                return Err(format!("{m}: a price is ARCADE per million tokens (characters, for speech), 0 to 1000000"));
             }
             out.insert(m.clone(), json!({"in": i, "out": o}));
         }
         c["prices"] = Value::Object(out);
     }
-    if c["on"] == true {
-        server(&c)?;
+    if c["on"] == true && servers(&c).is_empty() {
+        return Err("set the model server's address (http://host:port/v1)".into());
+    }
+    if let Ok((found, _)) = scan_models(&c) {
+        note_info(&mut c, &found);
     }
     write_meta(node, b"llm", &c)?;
     say_offer(node);
     Ok(status(node))
 }
 
-/// `llm.scan {url?, key?}`: the models a server has (the one set, or the one given, before saving it).
+/// `llm.scan {servers? | url?, key?}`: the models the servers have (the ones set, or the ones given, before saving).
 pub fn scan(node: &Node, req: &Value) -> Result<Value, String> {
     let mut c = cfg(node);
-    if let Some(u) = req["url"].as_str() {
-        c["url"] = json!(u);
+    if let Some(s) = servers_asked(&c, req)? {
+        c["servers"] = json!(s);
     }
-    if let Some(k) = req["key"].as_str() {
-        c["key"] = json!(k);
-    }
-    Ok(json!({"models": scan_models(&c)?}))
+    let (models, bad) = scan_models(&c)?;
+    Ok(json!({"models": models, "errors": bad}))
 }
 
 // ---------------------------------------------------------------- the seller's books
@@ -416,7 +541,11 @@ fn own_offer(node: &Node) -> Value {
     let models: Vec<Value> = if selling(&c) {
         c["models"].as_array().cloned().unwrap_or_default().iter().filter_map(|m| m.as_str()).map(|m| {
             let (i, o) = price_of(&c, m);
-            json!({"id": m, "in": i, "out": o})
+            if kind_of(&c, m) == "speech" {
+                json!({"id": m, "in": i, "out": 0, "kind": "speech", "voices": c["info"][m]["voices"]})
+            } else {
+                json!({"id": m, "in": i, "out": o})
+            }
         }).collect()
     } else {
         Vec::new()
@@ -425,7 +554,7 @@ fn own_offer(node: &Node) -> Value {
     let mut o = json!({
         "t": "lm", "op": "offer", "o": node.id_hex(), "at": now_s(), "tag": tag, "name": crate::meshsvc::public_name(node),
         "pay_to": crate::arcledger::own_address(node).ok(), "models": models, "at_once": at_once(&c), "max_out": max_out(&c),
-        "refunds": c["refunds"] != false, "busy": slots().busy(),
+        "refunds": c["refunds"] != false, "busy": busy_all(),
     });
     arcade_mesh::canon::sign_json(&node.identity, &mut o, &["sig"], b"");
     o
@@ -488,12 +617,13 @@ fn offer_of(node: &Node, seller: &str) -> Option<Value> {
 /// `llm.offers`: every model on offer, with our own record of each seller.
 pub fn list_offers(node: &Node) -> Value {
     let me = node.id_hex();
-    let rec = records().lock().unwrap();
+    let rec = records_loaded(node);
     let out: Vec<Value> = offers(node).into_iter().map(|o| {
         let id = o["o"].as_str().unwrap_or("").to_string();
         let models: Vec<Value> = o["models"].as_array().cloned().unwrap_or_default().into_iter().map(|m| {
             json!({"id": m["id"], "in": coins(m["in"].as_u64().unwrap_or(0)), "out": coins(m["out"].as_u64().unwrap_or(0)),
-                   "free": m["in"].as_u64().unwrap_or(0) == 0 && m["out"].as_u64().unwrap_or(0) == 0})
+                   "free": m["in"].as_u64().unwrap_or(0) == 0 && m["out"].as_u64().unwrap_or(0) == 0,
+                   "kind": if m["kind"] == "speech" { "speech" } else { "chat" }, "voices": m["voices"]})
         }).collect();
         json!({"seller": id, "here": id == me, "tag": o["tag"], "name": o["name"], "models": models, "max_out": o["max_out"], "at_once": o["at_once"],
                "refunds": o["refunds"], "busy": o["busy"], "at": o["at"], "linked": id == me || crate::crvia::linked(&id),
@@ -533,15 +663,21 @@ fn records() -> &'static Mutex<Records> {
     &R
 }
 
-fn with_records<T>(node: &Node, f: impl FnOnce(&mut Records) -> T) -> T {
-    let path = node.home.join("llm-sellers.json");
+/// The records, loaded from disk the first time (after a restart, before any request).
+fn records_loaded(node: &Node) -> std::sync::MutexGuard<'static, Records> {
     let mut r = records().lock().unwrap();
     if !r.loaded {
-        if let Some(saved) = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Records>(&t).ok()) {
+        if let Some(saved) = std::fs::read_to_string(node.home.join("llm-sellers.json")).ok().and_then(|t| serde_json::from_str::<Records>(&t).ok()) {
             *r = saved;
         }
         r.loaded = true;
     }
+    r
+}
+
+fn with_records<T>(node: &Node, f: impl FnOnce(&mut Records) -> T) -> T {
+    let path = node.home.join("llm-sellers.json");
+    let mut r = records_loaded(node);
     let out = f(&mut r);
     if let Ok(t) = serde_json::to_string(&*r) {
         let tmp = node.home.join("llm-sellers.json.new");
@@ -582,9 +718,19 @@ impl Slots {
     }
 }
 
-fn slots() -> &'static Slots {
-    static S: LazyLock<Slots> = LazyLock::new(|| Slots { busy: Mutex::new(0), cv: Condvar::new() });
+fn slot_map() -> &'static Mutex<HashMap<String, std::sync::Arc<Slots>>> {
+    static S: LazyLock<Mutex<HashMap<String, std::sync::Arc<Slots>>>> = LazyLock::new(Default::default);
     &S
+}
+
+/// One set of slots per model server (a voice server and a chat server don't wait for each other).
+fn slots(url: &str) -> std::sync::Arc<Slots> {
+    slot_map().lock().unwrap().entry(url.to_string()).or_insert_with(|| std::sync::Arc::new(Slots { busy: Mutex::new(0), cv: Condvar::new() })).clone()
+}
+
+/// Requests running now, on every server.
+fn busy_all() -> usize {
+    slot_map().lock().unwrap().values().map(|s| s.busy()).sum()
 }
 
 // ---------------------------------------------------------------- serving a chat (the seller's side)
@@ -622,8 +768,7 @@ fn server_body(body: &Value, model: &str, cap: u64) -> Value {
 }
 
 /// Run one chat on our own model server: each stream chunk to `each`; the usage (tokens in, out) it reported.
-fn run_server(c: &Value, body: &Value, each: &mut dyn FnMut(Value) -> Result<(), String>) -> Result<(u64, u64, u64), String> {
-    let (url, key) = server(c)?;
+fn run_server((url, key): &(String, String), body: &Value, each: &mut dyn FnMut(Value) -> Result<(), String>) -> Result<(u64, u64, u64), String> {
     let mut r = agent(GAP_TIME.as_secs()).post(&format!("{url}/chat/completions")).set("Content-Type", "application/json");
     if !key.is_empty() {
         r = r.set("Authorization", &format!("Bearer {key}"));
@@ -678,6 +823,10 @@ fn serve_chat(node: &Node, who: Option<&str>, body: &Value, each: &mut dyn FnMut
     if who.is_some() && !models.contains(&model) {
         return Err(format!("{model} isn't shared here (these are: {})", models.join(", ")));
     }
+    if kind_of(&c, &model) == "speech" {
+        return Err(format!("{model} is a speech model: ask it through audio/speech"));
+    }
+    let srv = server_for(&c, &model)?;
     if !body["messages"].as_array().is_some_and(|m| !m.is_empty() && m.len() <= 2000) {
         return Err("messages: 1 to 2000 of them".into());
     }
@@ -712,7 +861,8 @@ fn serve_chat(node: &Node, who: Option<&str>, body: &Value, each: &mut dyn FnMut
             reserved = r.1;
         }
     }
-    if !slots().take(at_once(&c), SLOT_WAIT) {
+    let slot = slots(&srv.0);
+    if !slot.take(at_once(&c), SLOT_WAIT) {
         if let Some(w) = who {
             with_books(node, |b| {
                 *b.credit.entry(w.to_string()).or_default() += reserved;
@@ -722,8 +872,8 @@ fn serve_chat(node: &Node, who: Option<&str>, body: &Value, each: &mut dyn FnMut
         return Err("the seller's model is busy: try again in a moment".into());
     }
     let started = Instant::now();
-    let ran = run_server(&c, &server_body(body, &model, cap), each);
-    slots().give();
+    let ran = run_server(&srv, &server_body(body, &model, cap), each);
+    slot.give();
     let ms = started.elapsed().as_millis() as u64;
     let (tin, tout, first_ms, ok) = match &ran {
         Ok((i, o, f)) => (*i, *o, *f, true),
@@ -732,27 +882,194 @@ fn serve_chat(node: &Node, who: Option<&str>, body: &Value, each: &mut dyn FnMut
     // Settle: what it cost (an error costs nothing), never more than reserved plus what is left.
     let cost = if ok && who.is_some() { cost_mu(price, tin.max(1), tout) } else { 0 };
     let (charged, left) = match who {
-        Some(w) => with_books(node, |b| {
-            let have = b.credit.entry(w.to_string()).or_default();
-            *have += reserved;
-            let charged = cost.min(*have);
-            *have -= charged;
-            let left = *have;
-            if left == 0 && reserved == 0 && charged == 0 {
-                b.credit.remove(w);
-            }
-            b.usage.push(Use { at: now_s(), who: w.to_string(), model: model.clone(), tin, tout, mu: charged, ms, ok });
-            if b.usage.len() > USAGE_KEEP {
-                let drop = b.usage.len() - USAGE_KEEP;
-                b.usage.drain(..drop);
-            }
-            b.dirty = true;
-            (charged, left)
-        }),
+        Some(w) => settle(node, w, reserved, cost, Use { at: now_s(), who: w.to_string(), model: model.clone(), tin, tout, mu: 0, ms, ok }),
         None => (0, 0),
     };
     ran?;
     Ok(json!({"arcade": {"usage": {"tokens_in": tin, "tokens_out": tout}, "cost": coins(charged / 1000), "cost_mu": charged, "left": coins(left / 1000),
+                         "left_mu": left, "model": model, "first_ms": first_ms, "ms": ms, "seller": node.id_hex()}}))
+}
+
+/// Settle a request: give back what was reserved, take what it cost (never more than the buyer has), log it.
+/// (charged, left), thousandths of a base unit.
+fn settle(node: &Node, w: &str, reserved: u64, cost: u64, mut row: Use) -> (u64, u64) {
+    with_books(node, |b| {
+        let have = b.credit.entry(w.to_string()).or_default();
+        *have += reserved;
+        let charged = cost.min(*have);
+        *have -= charged;
+        let left = *have;
+        if left == 0 && reserved == 0 && charged == 0 {
+            b.credit.remove(w);
+        }
+        row.mu = charged;
+        b.usage.push(row);
+        if b.usage.len() > USAGE_KEEP {
+            let drop = b.usage.len() - USAGE_KEEP;
+            b.usage.drain(..drop);
+        }
+        b.dirty = true;
+        (charged, left)
+    })
+}
+
+// ---------------------------------------------------------------- serving speech (the seller's side)
+
+/// What an audio piece handed on is: the first carries the audio's type; an empty piece with no type is a keepalive
+/// while the server is still making the voice.
+pub type AudioSink<'a> = dyn FnMut(Option<&str>, &[u8]) -> Result<(), String> + 'a;
+
+/// Run one speech request on our own voice server: the audio to `each` as it comes (type first). (bytes, first_ms)
+fn run_speech((url, key): &(String, String), body: &Value, each: &mut AudioSink) -> Result<(u64, u64), String> {
+    enum Got {
+        Head(String),
+        Bytes(Vec<u8>),
+        Fail(String),
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<Got>();
+    let (url, key, body) = (url.clone(), key.clone(), body.to_string());
+    std::thread::Builder::new().name("llm speech".into()).spawn(move || {
+        let mut r = agent(SPEECH_TIME.as_secs()).post(&format!("{url}/audio/speech")).set("Content-Type", "application/json");
+        if !key.is_empty() {
+            r = r.set("Authorization", &format!("Bearer {key}"));
+        }
+        let resp = match r.send_string(&body) {
+            Ok(x) => x,
+            Err(ureq::Error::Status(code, x)) => {
+                let t = x.into_string().unwrap_or_default();
+                let said = serde_json::from_str::<Value>(&t).ok().and_then(|v| v["error"]["message"].as_str().or(v["message"].as_str()).map(String::from)).unwrap_or(t);
+                let _ = tx.send(Got::Fail(format!("the voice server said {code}: {}", said.chars().take(300).collect::<String>())));
+                return;
+            }
+            Err(e) => {
+                let _ = tx.send(Got::Fail(format!("the voice server did not answer: {e}")));
+                return;
+            }
+        };
+        let ct: String = resp.content_type().chars().filter(|c| c.is_ascii_alphanumeric() || "/.+-".contains(*c)).take(60).collect();
+        if tx.send(Got::Head(if ct.is_empty() { "application/octet-stream".into() } else { ct })).is_err() {
+            return;
+        }
+        let mut rd = resp.into_reader().take(MAX_AUDIO as u64 + 1);
+        let mut buf = vec![0u8; PIECE];
+        loop {
+            match rd.read(&mut buf) {
+                Ok(0) => return,
+                Ok(n) => {
+                    if tx.send(Got::Bytes(buf[..n].to_vec())).is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Got::Fail(format!("the voice server's answer broke off: {e}")));
+                    return;
+                }
+            }
+        }
+    }).map_err(err)?;
+    let started = Instant::now();
+    let (mut bytes, mut first_ms, mut ct) = (0u64, 0u64, None::<String>);
+    loop {
+        match rx.recv_timeout(Duration::from_secs(20)) {
+            Ok(Got::Head(t)) => ct = Some(t),
+            Ok(Got::Bytes(b)) => {
+                bytes += b.len() as u64;
+                if bytes > MAX_AUDIO as u64 {
+                    return Err("the voice server's answer is too large".into());
+                }
+                if first_ms == 0 {
+                    first_ms = started.elapsed().as_millis() as u64;
+                }
+                each(ct.take().as_deref(), &b)?;
+            }
+            Ok(Got::Fail(e)) => return Err(e),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if started.elapsed() > SPEECH_TIME {
+                    return Err("the voice server took too long".into());
+                }
+                each(None, &[])?;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    if bytes == 0 {
+        return Err("the voice server sent no audio".into());
+    }
+    Ok((bytes, first_ms))
+}
+
+/// The body for the voice server: the passed fields only and the model.
+fn speech_body(body: &Value, model: &str) -> Value {
+    let mut out = Map::new();
+    for k in SPEECH_PASSED {
+        if let Some(v) = body.get(*k) {
+            out.insert((*k).to_string(), v.clone());
+        }
+    }
+    out.insert("model".into(), json!(model));
+    Value::Object(out)
+}
+
+/// A speech request for `who` (an address, or None: this arcade's own operator): the price of its characters is
+/// reserved, the audio goes to `each`, and it is charged only when audio came. The last event ({"arcade": ...}).
+fn serve_speech(node: &Node, who: Option<&str>, body: &Value, each: &mut AudioSink) -> Result<Value, String> {
+    let c = cfg(node);
+    if !selling(&c) && who.is_some() {
+        return Err("this arcade isn't sharing a model now".into());
+    }
+    let models: Vec<String> = c["models"].as_array().cloned().unwrap_or_default().iter().filter_map(|m| m.as_str().map(String::from)).collect();
+    let model = body["model"].as_str().map(String::from).filter(|m| !m.is_empty())
+        .or_else(|| models.iter().find(|m| kind_of(&c, m) == "speech").cloned()).ok_or("no speech model is shared here")?;
+    if who.is_some() && !models.contains(&model) {
+        return Err(format!("{model} isn't shared here (these are: {})", models.join(", ")));
+    }
+    if kind_of(&c, &model) != "speech" {
+        return Err(format!("{model} isn't a speech model"));
+    }
+    let chars = body["input"].as_str().map(|t| t.trim().chars().count() as u64).unwrap_or(0);
+    if chars == 0 || chars > MAX_SPEECH_CHARS {
+        return Err(format!("input: 1 to {MAX_SPEECH_CHARS} characters"));
+    }
+    let srv = server_for(&c, &model)?;
+    let free_own = who.is_none() && c["own_free"] != false;
+    let price = if free_own { (0, 0) } else { (price_of(&c, &model).0, 0) };
+    let cost = cost_mu(price, chars, 0);
+    let mut reserved = 0u64;
+    if let (Some(w), true) = (who, cost > 0) {
+        reserved = with_books(node, |b| {
+            let have = b.credit.get(w).copied().unwrap_or(0);
+            if have < cost {
+                return Err(format!("not enough credit: {} ARCADE left here, this costs {}", coins(have / 1000), coins(cost.div_ceil(1000))));
+            }
+            *b.credit.get_mut(w).unwrap() -= cost;
+            b.dirty = true;
+            Ok(cost)
+        })?;
+    }
+    let slot = slots(&srv.0);
+    if !slot.take(at_once(&c), SLOT_WAIT) {
+        if let Some(w) = who {
+            with_books(node, |b| {
+                *b.credit.entry(w.to_string()).or_default() += reserved;
+                b.dirty = true;
+            });
+        }
+        return Err("the seller's voice is busy: try again in a moment".into());
+    }
+    let started = Instant::now();
+    let ran = run_speech(&srv, &speech_body(body, &model), each);
+    slot.give();
+    let ms = started.elapsed().as_millis() as u64;
+    let (bytes, first_ms, ok) = match &ran {
+        Ok((b, f)) => (*b, *f, true),
+        Err(_) => (0, 0, false),
+    };
+    let (charged, left) = match who {
+        Some(w) => settle(node, w, reserved, if ok { cost } else { 0 }, Use { at: now_s(), who: w.to_string(), model: model.clone(), tin: chars, tout: 0, mu: 0, ms, ok }),
+        None => (0, 0),
+    };
+    ran?;
+    Ok(json!({"arcade": {"usage": {"characters": chars, "bytes": bytes}, "cost": coins(charged / 1000), "cost_mu": charged, "left": coins(left / 1000),
                          "left_mu": left, "model": model, "first_ms": first_ms, "ms": ms, "seller": node.id_hex()}}))
 }
 
@@ -847,6 +1164,18 @@ fn answer(peer: &str, id: u64, seq: u64, end: bool, ev: Value) {
     let _ = crate::crvia::send(peer, Frame::new(json!({"t": "lm", "op": "a", "id": id, "seq": seq, "end": end, "ev": ev})));
 }
 
+/// Queue a frame for `peer`, waiting while its link's queue is full (audio comes faster than a link sends).
+fn send_wait(peer: &str, f: Frame) -> Result<(), String> {
+    let end = Instant::now() + GAP_TIME;
+    loop {
+        match crate::crvia::send(peer, f.clone()) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.contains("not sending") && Instant::now() < end => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => return Err(format!("the buyer's link: {e}")),
+        }
+    }
+}
+
 fn answer_err(peer: &str, id: u64, seq: u64, e: &str) {
     let _ = crate::crvia::send(peer, Frame::new(json!({"t": "lm", "op": "a", "id": id, "seq": seq, "end": true, "err": e})));
 }
@@ -910,6 +1239,28 @@ fn serve_request(node: &Node, peer: &str, id: u64, req: &Value) {
                 Err(e) => return answer_err(peer, id, seq, &e),
             }
         }
+        "speech" => {
+            let mut seq = 0u64;
+            let r = serve_speech(node, Some(&who), &req["body"], &mut |ct, bytes| {
+                if !crate::crvia::linked(peer) {
+                    return Err("the buyer's link went down".into());
+                }
+                let ev = match ct {
+                    Some(t) => json!({"type": t}),
+                    None if bytes.is_empty() => json!({"wait": true}),
+                    None => Value::Null,
+                };
+                let mut f = Frame::new(json!({"t": "lm", "op": "a", "id": id, "seq": seq, "end": false, "ev": ev}));
+                f.blob = bytes.to_vec();
+                send_wait(peer, f)?;
+                seq += 1;
+                Ok(())
+            });
+            match r {
+                Ok(last) => return answer(peer, id, seq, true, last),
+                Err(e) => return answer_err(peer, id, seq, &e),
+            }
+        }
         w => Err(format!("unknown ask {w}")),
     };
     match out {
@@ -925,21 +1276,37 @@ fn reach(node: &Node, seller: &str) -> Result<(), String> {
     if crate::crvia::linked(seller) {
         return Ok(());
     }
-    let o = offer_of(node, seller).ok_or("that seller has no offer now")?;
-    let name = o["name"].as_str().filter(|n| !n.is_empty()).ok_or("no mesh link to that seller, and it has no public name to dial (it is reached once it links to this arcade or a relay)")?;
-    crate::meshsvc::dial(&node.self_arc(), name.to_string());
-    let end = Instant::now() + Duration::from_secs(15);
+    let o = offer_of(node, seller).ok_or("can't reach that seller: it has no offer now")?;
+    // Every way there at once: its public name, a relay that lists it, a UDP introduction through our links.
+    let name = o["name"].as_str().filter(|n| !n.is_empty()).map(String::from);
+    if let Some(n) = &name {
+        crate::meshsvc::dial(&node.self_arc(), n.clone());
+    }
+    let relayed = crate::relaysvc::want(node, seller);
+    crate::udpsvc::want(seller);
+    let end = Instant::now() + REACH_WAIT;
     while Instant::now() < end {
         if crate::crvia::linked(seller) {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    Err(format!("couldn't link to that seller at {name}"))
+    Err(match (&name, relayed) {
+        (Some(n), _) => format!("can't reach that seller: no link to it at {n} or through a relay yet; try again in a minute"),
+        (None, true) => "can't reach that seller: a relay is linking us; try again in a minute".to_string(),
+        (None, false) => "can't reach that seller yet: it has no public name, no relay we use lists it, and no link of ours introduced it; \
+                          try again in a minute (a seller is easiest to reach with a public name, mesh.name_set)"
+            .to_string(),
+    })
 }
 
 /// Ask `seller` `what` (the grant is added); each answer event but the last to `each`; the last returned.
-fn ask(node: &Node, seller: &str, mut req: Value, each: &mut dyn FnMut(Value) -> Result<(), String>) -> Result<Value, String> {
+fn ask(node: &Node, seller: &str, req: Value, each: &mut dyn FnMut(Value) -> Result<(), String>) -> Result<Value, String> {
+    ask_frames(node, seller, req, REQUEST_TIME, &mut |f| each(f.head["ev"].clone()))
+}
+
+/// As `ask`, with each answer frame whole (its blob too), and the longest the whole may take.
+fn ask_frames(node: &Node, seller: &str, mut req: Value, total: Duration, each: &mut dyn FnMut(&Frame) -> Result<(), String>) -> Result<Value, String> {
     reach(node, seller)?;
     req["grant"] = my_grant(node, seller)?;
     let raw = req.to_string();
@@ -954,7 +1321,7 @@ fn ask(node: &Node, seller: &str, mut req: Value, each: &mut dyn FnMut(Value) ->
         f.blob = p.to_vec();
         crate::crsource::Pipe::send(&mut via, &f)?;
     }
-    let end = Instant::now() + REQUEST_TIME;
+    let end = Instant::now() + total;
     let mut want = 0u64;
     loop {
         let until = (Instant::now() + GAP_TIME).min(end);
@@ -969,7 +1336,7 @@ fn ask(node: &Node, seller: &str, mut req: Value, each: &mut dyn FnMut(Value) ->
         if f.head["end"] == true {
             return Ok(f.head["ev"].clone());
         }
-        each(f.head["ev"].clone())?;
+        each(&f)?;
     }
 }
 
@@ -1023,7 +1390,64 @@ pub fn chat(node: &Node, seller: &str, body: &Value, each: &mut dyn FnMut(Value)
                 }
             }
             // The buyer's own lack of credit is no failure of the seller's.
-            Err(e) if e.starts_with("not enough credit") => s.requests -= 1,
+            // Nor is not reaching it (no link yet): that is the mesh, not the seller.
+            Err(e) if e.starts_with("not enough credit") || e.starts_with("can't reach") => s.requests -= 1,
+            Err(_) => s.failed += 1,
+        }
+    });
+    let last = r?;
+    auto_topup(node, seller, last["arcade"]["left_mu"].as_u64().unwrap_or(u64::MAX), last["arcade"]["cost_mu"].as_u64().unwrap_or(0));
+    Ok(last["arcade"].clone())
+}
+
+/// Speech from `seller` (ours: run here, free for the operator): the audio to `each` as it comes, its type first.
+/// The last event's "arcade".
+pub fn speak(node: &Node, seller: &str, body: &Value, each: &mut AudioSink) -> Result<Value, String> {
+    let started = Instant::now();
+    let mut first_ms = 0u64;
+    let mut sink = |ct: Option<&str>, b: &[u8]| -> Result<(), String> {
+        if b.is_empty() && ct.is_none() {
+            return Ok(()); // a keepalive
+        }
+        if first_ms == 0 {
+            first_ms = started.elapsed().as_millis() as u64;
+        }
+        each(ct, b)
+    };
+    if seller == node.id_hex() {
+        let last = serve_speech(node, None, body, &mut sink)?;
+        return Ok(last["arcade"].clone());
+    }
+    let chars = body["input"].as_str().map(|t| t.trim().chars().count() as u64).unwrap_or(0);
+    if chars == 0 || chars > MAX_SPEECH_CHARS {
+        return Err(format!("input: 1 to {MAX_SPEECH_CHARS} characters"));
+    }
+    let r = ask_frames(node, seller, json!({"what": "speech", "body": body}), SPEECH_TIME, &mut |f| {
+        let ev = &f.head["ev"];
+        if ev["wait"] == true {
+            return Ok(());
+        }
+        sink(ev["type"].as_str(), &f.blob)
+    });
+    let ms = started.elapsed().as_millis() as u64;
+    with_records(node, |rec| {
+        let s = rec.sellers.entry(seller.to_string()).or_default();
+        s.requests += 1;
+        match &r {
+            Ok(last) => {
+                let a = &last["arcade"];
+                // For speech the bill is characters, which we count exactly.
+                s.billed_out += a["usage"]["characters"].as_u64().unwrap_or(0);
+                s.counted_out += chars;
+                s.first_ms += first_ms;
+                s.out_ms += ms;
+                s.spent_mu += a["cost_mu"].as_u64().unwrap_or(0);
+                if let Some(l) = a["left_mu"].as_u64() {
+                    rec.credit.insert(seller.to_string(), l);
+                }
+            }
+            // Nor is not reaching it (no link yet): that is the mesh, not the seller.
+            Err(e) if e.starts_with("not enough credit") || e.starts_with("can't reach") => s.requests -= 1,
             Err(_) => s.failed += 1,
         }
     });
@@ -1197,13 +1621,18 @@ pub fn key_ok(node: &Node, bearer: &str) -> bool {
 
 /// A model name as OpenAI programs use it: "model@seller" (tag, else the node id's first 12), the seller's id.
 fn model_names(node: &Node) -> Vec<(String, String, String)> {
+    model_list(node).into_iter().map(|x| (x.0, x.1, x.2)).collect()
+}
+
+/// As `model_names`, with each model's offer entry.
+fn model_list(node: &Node) -> Vec<(String, String, String, Value)> {
     let mut v = Vec::new();
     for o in offers(node) {
         let id = o["o"].as_str().unwrap_or("").to_string();
         let who = o["tag"].as_str().map(String::from).unwrap_or_else(|| id[..12.min(id.len())].to_string());
         for m in o["models"].as_array().into_iter().flatten() {
             if let Some(mid) = m["id"].as_str() {
-                v.push((format!("{mid}@{who}"), mid.to_string(), id.clone()));
+                v.push((format!("{mid}@{who}"), mid.to_string(), id.clone(), m.clone()));
             }
         }
     }
@@ -1212,7 +1641,14 @@ fn model_names(node: &Node) -> Vec<(String, String, String)> {
 
 /// `GET /openai/v1/models`.
 pub fn openai_models(node: &Node) -> Value {
-    let data: Vec<Value> = model_names(node).into_iter().map(|(name, _, seller)| json!({"id": name, "object": "model", "created": 0, "owned_by": seller})).collect();
+    let data: Vec<Value> = model_list(node).into_iter().map(|(name, _, seller, m)| {
+        let mut x = json!({"id": name, "object": "model", "created": 0, "owned_by": seller});
+        if m["kind"] == "speech" {
+            x["kind"] = json!("speech");
+            x["voices"] = m["voices"].clone();
+        }
+        x
+    }).collect();
     json!({"object": "list", "data": data})
 }
 
@@ -1228,7 +1664,7 @@ pub fn pick(node: &Node, asked: &str) -> Result<(String, String), String> {
     if c.is_empty() {
         return Err(format!("no seller offers {asked} now (GET /openai/v1/models lists what is on offer)"));
     }
-    let credit = records().lock().unwrap().credit.clone();
+    let credit = records_loaded(node).credit.clone();
     let os = offers(node);
     let price = |seller: &str| -> u64 {
         os.iter().find(|o| o["o"] == seller).and_then(|o| o["models"].as_array().and_then(|m| m.iter().find(|m| m["id"] == asked)).map(|m| m["in"].as_u64().unwrap_or(0) + m["out"].as_u64().unwrap_or(0))).unwrap_or(u64::MAX)
@@ -1257,6 +1693,32 @@ pub fn chat_cmd(node: &Node, req: &Value) -> Result<Value, String> {
     })?;
     Ok(json!({"content": content, "reasoning": reasoning, "seller": seller, "model": model, "usage": last["usage"], "cost": last["cost"], "left": last["left"],
               "first_ms": last["first_ms"], "ms": last["ms"]}))
+}
+
+/// `llm.speak {seller?, model, input, voice?, response_format?}`: speech, whole, as base64 (the Models tab's try-it box).
+pub fn speak_cmd(node: &Node, req: &Value) -> Result<Value, String> {
+    use base64::Engine;
+    let (seller, model) = match req["seller"].as_str() {
+        Some(_) => (seller_arg(node, req)?, req["model"].as_str().unwrap_or("").to_string()),
+        None => pick(node, req["model"].as_str().ok_or("model or seller")?)?,
+    };
+    let mut body = json!({"model": model, "input": req["input"], "response_format": req["response_format"].as_str().unwrap_or("wav")});
+    if let Some(v) = req["voice"].as_str() {
+        body["voice"] = json!(v);
+    }
+    let (mut ty, mut audio) = (String::new(), Vec::new());
+    let last = speak(node, &seller, &body, &mut |ct, b| {
+        if let Some(t) = ct {
+            ty = t.to_string();
+        }
+        if audio.len() + b.len() > 24 << 20 {
+            return Err("too long to try here: use the OpenAI door".into());
+        }
+        audio.extend_from_slice(b);
+        Ok(())
+    })?;
+    Ok(json!({"type": ty, "audio": base64::engine::general_purpose::STANDARD.encode(&audio), "seller": seller, "model": model, "usage": last["usage"],
+              "cost": last["cost"], "left": last["left"], "first_ms": last["first_ms"], "ms": last["ms"]}))
 }
 
 /// `llm.usage`: what this arcade sold lately (seller), and its record of the sellers it bought from.
@@ -1329,6 +1791,36 @@ mod tests {
         assert!(grant_ok(&late, &seller).is_err(), "changed expiry");
         let old = json!({"address": address, "expires": 5, "sig": arcade_wallet::keys::signmessage(&sk, MAGIC, &grant_words(&seller, &address, 5))});
         assert!(grant_ok(&old, &seller).is_err(), "ran out");
+    }
+
+    #[test]
+    fn servers_old_and_new_and_where_models_live() {
+        let old = json!({"url": "http://127.0.0.1:18300/v1/", "key": "k"});
+        assert_eq!(servers(&old), vec![("http://127.0.0.1:18300/v1".to_string(), "k".to_string())]);
+        let c = json!({"servers": [{"url": "http://127.0.0.1:18300"}, {"url": "http://127.0.0.1:8096/v1", "key": "v"}, {"url": "ftp://x"}],
+                       "info": {"csm-1b": {"server": "http://127.0.0.1:8096/v1", "kind": "speech"}}});
+        assert_eq!(servers(&c).len(), 2);
+        assert_eq!(server_for(&c, "csm-1b").unwrap(), ("http://127.0.0.1:8096/v1".to_string(), "v".to_string()));
+        assert_eq!(server_for(&c, "qwen").unwrap().0, "http://127.0.0.1:18300/v1");
+        assert_eq!(kind_of(&c, "csm-1b"), "speech");
+        assert_eq!(kind_of(&c, "qwen"), "chat");
+        // A key left out keeps the one kept for that address.
+        let s = servers_asked(&c, &json!({"servers": [{"url": "http://127.0.0.1:8096/v1"}, {"url": "http://127.0.0.1:9000", "key": "n"}]})).unwrap().unwrap();
+        assert_eq!(s[0]["key"], "v");
+        assert_eq!(s[1], json!({"url": "http://127.0.0.1:9000/v1", "key": "n"}));
+        assert!(servers_asked(&c, &json!({"url": "file:///etc"})).is_err());
+    }
+
+    #[test]
+    fn speech_models_are_known_and_only_known_fields_pass() {
+        assert_eq!(kind_in_list(&json!({"id": "csm-1b", "voices": ["narrator"]})), "speech");
+        assert_eq!(kind_in_list(&json!({"id": "my-voice", "voices": []})), "speech");
+        assert_eq!(kind_in_list(&json!({"id": "kokoro-82m"})), "speech");
+        assert_eq!(kind_in_list(&json!({"id": "qwen3.8-flash-next"})), "chat");
+        let b = speech_body(&json!({"model": "x", "input": "hi", "voice": "narrator", "response_format": "wav", "url": "http://evil"}), "csm-1b");
+        assert_eq!(b, json!({"model": "csm-1b", "input": "hi", "voice": "narrator", "response_format": "wav"}));
+        // 1 ARCADE per million characters: 1000 characters cost 0.001 ARCADE.
+        assert_eq!(cost_mu((COIN, 0), 1000, 0), 100_000_000);
     }
 
     #[test]

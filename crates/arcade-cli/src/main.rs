@@ -44,6 +44,7 @@ const HELP: &str = "arcade — Arcade V1.0
   arcade chain sizes                        measure this arcade's chains now; sizes other arcades report
   arcade chain copy status [key]             Core-data copies (cb) offered, fetches in progress, trusted/verified coin sets
   arcade chain copy start <key> [coins|all]  bootstrap from the best copy (coins: coin set only, the default)
+  arcade chain copy start <key> --from-dir <path>   bootstrap once from a Core datadir on this computer (stop that Core first)
   arcade chain copy cancel|verify <key>      stop a fetch (sync it myself) | re-check a copied coin set now
   arcade chain refill <key> [from to [sources]]  fetch back lost block bodies (2+ independent sources must agree)
   arcade chain refill status [key] | cancel <key>   a refill's progress | stop it
@@ -54,6 +55,8 @@ const HELP: &str = "arcade — Arcade V1.0
   arcade chain index add|remove <key> <index>
   arcade ledger [height]         ledger fingerprints vs. other arcades; a block's digest rows
   arcade profile <@tag|address>  a handle's address, balance, published profile and linked wallets
+  arcade profile publish-addresses [--send]  list your own coin addresses on your @tag's profile
+                                 (shows the fee; --send publishes it)
   arcade ord [id|number] [--chain k]       an inscription (or the ord index's state)
   arcade ord chunks [from] [n] [--chain k] dx chunk hashes, as other arcades compare
   arcade name <name> [--chain k]           who holds a name (spec, json, doge2023 readings)
@@ -434,6 +437,8 @@ fn main() {
         ["faucet", "arc", a] => json!({"cmd": "faucet.arc", "address": a}),
         ["events"] => json!({"cmd": "events"}),
         ["mempool"] => json!({"cmd": "mempool"}),
+        ["profile", "publish-addresses"] => json!({"cmd": "profile.publish_addresses"}),
+        ["profile", "publish-addresses", "--send"] => json!({"cmd": "profile.publish_addresses", "send": true}),
         ["profile", who] => json!({"cmd": "profile", "who": who}),
         ["ord"] => json!({"cmd": "ord"}),
         ["ord", "chunks"] => json!({"cmd": "ord.chunks"}),
@@ -460,6 +465,7 @@ fn main() {
         ["chain", "copy", "status"] => json!({"cmd": "chains.copy_status"}),
         ["chain", "copy", "status", k] => json!({"cmd": "chains.copy_status", "key": k}),
         ["chain", "copy", "start", k] => json!({"cmd": "chains.copy_start", "key": k}),
+        ["chain", "copy", "start", k, "--from-dir", d] | ["chain", "copy", "start", k, "all", "--from-dir", d] => json!({"cmd": "chains.copy_from_dir", "key": k, "dir": d}),
         ["chain", "copy", "start", k, w] => json!({"cmd": "chains.copy_start", "key": k, "what": w}),
         ["chain", "copy", "cancel", k] => json!({"cmd": "chains.copy_cancel", "key": k}),
         ["chain", "check-rules", "status"] => json!({"cmd": "chains.check_rules_status"}),

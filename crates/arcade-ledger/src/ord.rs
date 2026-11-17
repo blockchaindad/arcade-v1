@@ -1164,6 +1164,66 @@ pub fn body_of(p: &ChainParams, meta: &Value, get_tx: &dyn Fn(&Hash256) -> Optio
     Ok(body)
 }
 
+/// What an inscription's own transactions say it is, read as the index reads them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FromTxs {
+    pub ctype: String,
+    pub body: Vec<u8>,
+    /// The inscription it borrows its content from, when it names one.
+    pub delegate: Option<String>,
+}
+
+/// An inscription read from its transactions alone. `txs` are its pieces' txids in order as a
+/// record names them (another arcade's word), and `get_tx` gives each one already checked against
+/// its txid. The first must be the id's own transaction (an id is the txid of its first piece and
+/// the envelope's place in it), each later piece must spend the piece before it (how the index
+/// links them), and the countdown must end with the last: whatever the record says, the bytes and
+/// the content type are then the chain's.
+pub fn read_from_txs(p: &ChainParams, id: &str, txs: &[Hash256], get_tx: &dyn Fn(&Hash256) -> Option<Tx>) -> std::result::Result<FromTxs, String> {
+    let iid = parse_iid(id).ok_or("not an inscription id")?;
+    let mut t = [0u8; 32];
+    t.copy_from_slice(&iid[..32]);
+    let (txid, n) = (Hash256(t), be_u32(&iid, 32));
+    if txs.first() != Some(&txid) {
+        return Err("the record's first transaction is not the inscription's own".into());
+    }
+    let fetch = |h: &Hash256| get_tx(h).filter(|x| x.txid == *h).ok_or_else(|| "the inscription's transactions are not available".to_string());
+    let first = fetch(&txid)?;
+    let d = dialect(p);
+    if d == Dialect::Ord {
+        if txs.len() != 1 {
+            return Err("an inscription here is one transaction".into());
+        }
+        let e = crate::ordwit::envelopes(&first).into_iter().nth(n as usize).ok_or("no such envelope")?;
+        let delegate = e.delegate.as_deref().and_then(crate::ordwit::id_value).map(|(t, i)| iid_str(&iid_bytes(&t, i)));
+        return Ok(FromTxs { ctype: String::from_utf8_lossy(e.content_type.as_deref().unwrap_or_default()).into_owned(), body: e.body.unwrap_or_default(), delegate });
+    }
+    if n != 0 {
+        return Err("an inscription here is its first piece's i0".into());
+    }
+    let (_, ct, r) = start(&first.inputs.first().ok_or("no inputs")?.script_sig, d).ok_or("the first piece does not start an inscription")?;
+    let (mut body, mut left, mut tags, mut prev) = (r.body, r.left, r.tags, txid);
+    for h in &txs[1..] {
+        if left == 0 {
+            return Err("the record names more pieces than the inscription has".into());
+        }
+        let tx = fetch(h)?;
+        let in0 = tx.inputs.first().ok_or("no inputs")?;
+        if in0.prevout.txid != prev {
+            return Err("a piece does not spend the piece before it".into());
+        }
+        let r = more(&in0.script_sig, left, d).ok_or("piece unreadable")?;
+        body.extend_from_slice(&r.body);
+        (left, tags, prev) = (r.left, r.tags, *h);
+    }
+    if left != 0 {
+        return Err("the inscription's pieces are not all there".into());
+    }
+    let dkey: &[u8] = if d == Dialect::Pepecoin { b"delegate" } else { b"\x0b" };
+    let delegate = tags.iter().find(|t| t.0 == dkey).and_then(|t| id_from_tag(&t.1));
+    Ok(FromTxs { ctype: String::from_utf8_lossy(&ct).into_owned(), body, delegate })
+}
+
 /// dx chunk hash and births of chunk `n` (None until all 100 blocks are indexed).
 pub fn chunk(db: &ChainDb, p: &ChainParams, n: u32) -> Option<(String, u32)> {
     let base = ord_start(p)? + n * 100;
@@ -1298,6 +1358,66 @@ mod tests {
         m.extend(push(&[0x30; 71]));
         let r2 = more(&m, 1, Dialect::Dogecoin).unwrap();
         assert_eq!((r2.left, r2.body.as_slice()), (0, &b"c"[..]));
+    }
+
+    fn piece(txid: u8, spends: u8, script_sig: Vec<u8>, witness: Vec<Vec<u8>>) -> Tx {
+        Tx {
+            version: 1,
+            time: None,
+            inputs: vec![arcade_chain::TxIn { prevout: OutPoint { txid: Hash256([spends; 32]), vout: 0 }, script_sig, sequence: u32::MAX, witness }],
+            outputs: Vec::new(),
+            lock_time: 0,
+            txid: Hash256([txid; 32]),
+            raw: Vec::new(),
+            hogex: false,
+        }
+    }
+
+    #[test]
+    fn read_from_its_own_transactions() {
+        let doge = &arcade_chain::params::DOGECOIN_MAIN;
+        // Two pieces: "ord", 2, "text/plain", 1, "ab", sig; then the next spends it: 0, "c", sig.
+        let mut s = push(b"ord");
+        s.push(0x52);
+        s.extend(push(b"text/plain"));
+        s.push(0x51);
+        s.extend(push(b"ab"));
+        s.extend(push(&[0x30; 71]));
+        let mut m = vec![0u8];
+        m.extend(push(b"c"));
+        m.extend(push(&[0x30; 71]));
+        let (a, b) = (piece(1, 9, s.clone(), vec![]), piece(2, 1, m.clone(), vec![]));
+        let txs = vec![a.clone(), b.clone(), piece(3, 7, m.clone(), vec![])];
+        let get = |h: &Hash256| txs.iter().find(|t| t.txid == *h).cloned();
+        let (ha, hb, hc) = (Hash256([1; 32]), Hash256([2; 32]), Hash256([3; 32]));
+        let id = format!("{}i0", ha.to_hex());
+        let got = read_from_txs(doge, &id, &[ha, hb], &get).unwrap();
+        assert_eq!((got.ctype.as_str(), got.body.as_slice(), got.delegate), ("text/plain", &b"abc"[..], None));
+        // The record's word changes nothing it can't prove: another first transaction, a piece that
+        // doesn't spend the one before, a piece missing, one too many, another envelope number.
+        assert!(read_from_txs(doge, &format!("{}i0", hb.to_hex()), &[ha, hb], &get).unwrap_err().contains("not the inscription's own"));
+        assert!(read_from_txs(doge, &id, &[ha, hc], &get).unwrap_err().contains("does not spend"));
+        assert!(read_from_txs(doge, &id, &[ha], &get).unwrap_err().contains("not all there"));
+        assert!(read_from_txs(doge, &id, &[ha, hb, hb], &get).unwrap_err().contains("more pieces"));
+        assert!(read_from_txs(doge, &format!("{}i1", ha.to_hex()), &[ha, hb], &get).is_err());
+        // A transaction handed over under another txid is not taken.
+        let wrong = |h: &Hash256| get(h).map(|mut t| { t.txid = Hash256([8; 32]); t });
+        assert!(read_from_txs(doge, &id, &[ha, hb], &wrong).is_err());
+
+        // Ord (witness envelopes): the type and body of envelope n of the id's transaction.
+        let ltc = &arcade_chain::params::LITECOIN_MAIN;
+        let mut env = vec![0x00, 0x63];
+        env.extend(push(b"ord"));
+        env.extend(push(&[1]));
+        env.extend(push(b"image/png"));
+        env.push(0x00);
+        env.extend(push(b"PNG!"));
+        env.push(0x68);
+        let t = piece(4, 9, vec![], vec![env, vec![0xc0; 33]]);
+        let getl = |h: &Hash256| (*h == t.txid).then(|| t.clone());
+        let got = read_from_txs(ltc, &format!("{}i0", t.txid.to_hex()), &[t.txid], &getl).unwrap();
+        assert_eq!((got.ctype.as_str(), got.body.as_slice()), ("image/png", &b"PNG!"[..]));
+        assert!(read_from_txs(ltc, &format!("{}i1", t.txid.to_hex()), &[t.txid], &getl).unwrap_err().contains("no such envelope"));
     }
 
     #[test]

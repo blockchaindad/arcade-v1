@@ -247,6 +247,26 @@ fn other_version(p: &ChainParams) -> Option<u8> {
     }
 }
 
+/// The other chains' addresses an announcement on chain `p` lists, as (chain net, address): the other Pepecoin
+/// network (section 2), Dogecoin (7) and any other coin by name (8; a bare key hash when the name isn't known here).
+/// The explorer's @tag page shows these as "listed in their profile".
+pub fn linked_of(a: &Announcement, p: &ChainParams) -> Vec<(String, String)> {
+    let mut linked: Vec<(String, String)> = Vec::new();
+    if let (Some(h), Some(v)) = (a.other_h160, other_version(p)) {
+        linked.push((if p.net == "test" { "main" } else { "test" }.into(), crate::address::base58check(v, &h)));
+    }
+    if let Some(h) = a.doge_h160 {
+        linked.push(("doge".into(), crate::address::base58check(30, &h)));
+    }
+    for (net, h) in &a.chains {
+        match by_key(net) {
+            Some(np) => linked.push((net.clone(), crate::address::base58check(np.p2pkh_version, h))),
+            None => linked.push((net.clone(), format!("h160:{}", hex::encode(h)))),
+        }
+    }
+    linked
+}
+
 pub struct ProfileIndexer;
 
 impl Indexer for ProfileIndexer {
@@ -276,19 +296,7 @@ impl Indexer for ProfileIndexer {
                 Some(h) if sender_h160.as_deref() == Some(&h[..]) => (atx.sender.clone(), true),
                 _ => (atx.sender.clone(), false),
             };
-            let mut linked: Vec<(String, String)> = Vec::new();
-            if let (Some(h), Some(v)) = (a.other_h160, other_version(p)) {
-                linked.push((if p.net == "test" { "main" } else { "test" }.into(), crate::address::base58check(v, &h)));
-            }
-            if let Some(h) = a.doge_h160 {
-                linked.push(("doge".into(), crate::address::base58check(30, &h)));
-            }
-            for (net, h) in &a.chains {
-                match by_key(net) {
-                    Some(np) => linked.push((net.clone(), crate::address::base58check(np.p2pkh_version, h))),
-                    None => linked.push((net.clone(), format!("h160:{}", hex::encode(h)))),
-                }
-            }
+            let linked = linked_of(&a, p);
             let new = json!({
                 "address": address, "stated": stated, "pubkey": hex::encode(a.pubkey),
                 "fingerprint": fingerprint(&a.pubkey), "name": a.name, "tag": a.tag, "pfp": a.pfp,

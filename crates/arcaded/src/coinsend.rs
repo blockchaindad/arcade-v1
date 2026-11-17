@@ -6,6 +6,7 @@
 use crate::node::Node;
 use arcade_chain::params::ChainParams;
 use arcade_ledger::address::{base58check, bech32, decode_base58check, hash160, p2pkh_script, p2wpkh_script, script_for_address};
+use arcade_wallet::keys::{kinds_for, AddrKind};
 use arcade_wallet::secp256k1::PublicKey;
 use arcade_wallet::tx::Utxo;
 use serde_json::{json, Value};
@@ -62,6 +63,180 @@ pub fn key_scripts(p: &ChainParams, pk: &PublicKey) -> Vec<(String, Vec<u8>)> {
     }
 }
 
+// ---------------- address kinds ----------------
+
+/// Public keys of the address kinds other than Legacy, by (Legacy key, kind): the same words,
+/// coin type and slot give the same keys, so they are worked out once (they are public).
+static KIND_PUBKEYS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<(String, AddrKind), PublicKey>>> = std::sync::LazyLock::new(Default::default);
+
+/// The public key of each address kind chain `p` offers for tag slot `k` (Legacy: the tag key
+/// itself), menu order. Kinds whose key can't be worked out (no wallet) are left out.
+pub fn kind_pubkeys(node: &Node, p: &ChainParams, k: &arcade_app::TagKey) -> Vec<(AddrKind, PublicKey)> {
+    let Some(legacy) = hex::decode(&k.pubkey).ok().and_then(|b| PublicKey::from_slice(&b).ok()) else { return Vec::new() };
+    let kinds = kinds_for(p);
+    let missing: Vec<AddrKind> = {
+        let m = KIND_PUBKEYS.lock().unwrap();
+        kinds.iter().copied().filter(|&kd| kd != AddrKind::Legacy && !m.contains_key(&(k.pubkey.clone(), kd))).collect()
+    };
+    if !missing.is_empty() {
+        let mut ask = vec![AddrKind::Legacy];
+        ask.extend(&missing);
+        if let Ok(sks) = node.app.kind_keys(p, &ask, k.index) {
+            let pubs: Vec<PublicKey> = sks.iter().map(|sk| PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, sk)).collect();
+            // Only when the words in use are the ones this slot's Legacy key came from.
+            if pubs[0] == legacy {
+                let mut m = KIND_PUBKEYS.lock().unwrap();
+                if m.len() > 4096 {
+                    m.clear();
+                }
+                for (kd, pk) in missing.iter().zip(&pubs[1..]) {
+                    m.insert((k.pubkey.clone(), *kd), *pk);
+                }
+            }
+        }
+    }
+    let m = KIND_PUBKEYS.lock().unwrap();
+    kinds
+        .iter()
+        .filter_map(|&kd| if kd == AddrKind::Legacy { Some((kd, legacy)) } else { m.get(&(k.pubkey.clone(), kd)).map(|pk| (kd, *pk)) })
+        .collect()
+}
+
+/// A key's addresses of one kind, the receiving one first: Legacy is [`key_scripts`] (on
+/// DigiByte its dgb1... address, then D...); every other kind its one address.
+pub fn kind_scripts(p: &ChainParams, kind: AddrKind, pk: &PublicKey) -> Vec<(String, Vec<u8>)> {
+    if kind == AddrKind::Legacy {
+        // Where the chain also has address types (DigiByte), Legacy is the plain key-hash address first, as the
+        // original arcade showed it (D... on DigiByte), with the same key's SegWit form still counted after it.
+        let mut v = key_scripts(p, pk);
+        if kinds_for(p).len() > 1 && v.len() > 1 {
+            v.rotate_left(1);
+        }
+        return v;
+    }
+    match arcade_wallet::keys::kind_address(p, kind, pk) {
+        Some(a) => vec![(a, arcade_wallet::keys::kind_script(kind, pk))],
+        None => Vec::new(),
+    }
+}
+
+/// Every address of tag slot `k` on chain `p`, by kind (menu order).
+pub fn own_addresses(node: &Node, p: &ChainParams, k: &arcade_app::TagKey) -> Vec<(AddrKind, Vec<(String, Vec<u8>)>)> {
+    kind_pubkeys(node, p, k).into_iter().map(|(kd, pk)| (kd, kind_scripts(p, kd, &pk))).filter(|(_, v)| !v.is_empty()).collect()
+}
+
+fn pref_key(node: &Node, p: &ChainParams) -> Vec<u8> {
+    format!("wallet.addr_kind/{}/{}", node.app.active_account(), p.key).into_bytes()
+}
+
+/// The address kind the Wallet shows on a chain (remembered per chain, for the account in use);
+/// Legacy until another is picked.
+pub fn pref_kind(node: &Node, p: &ChainParams) -> AddrKind {
+    node.app
+        .store
+        .read(|r| r.get(arcade_app::META, &pref_key(node, p)))
+        .ok()
+        .flatten()
+        .and_then(|v| AddrKind::from_id(std::str::from_utf8(&v).ok()?))
+        .filter(|k| kinds_for(p).contains(k))
+        .unwrap_or(AddrKind::Legacy)
+}
+
+/// wallet.addr_kind: the kind the Wallet shows on chain `p`, and the kinds it offers; with
+/// `kind`, remember that one first.
+pub fn addr_kind(node: &Node, p: &ChainParams, kind: Option<&str>) -> R {
+    if let Some(id) = kind.filter(|k| !k.is_empty()) {
+        let kd = AddrKind::from_id(id).filter(|k| kinds_for(p).contains(k)).ok_or_else(|| format!("{} has no {id} addresses here", p.name))?;
+        node.app.store.write(|w| w.put(arcade_app::META, &pref_key(node, p), kd.id().as_bytes())).map_err(|e| e.to_string())?;
+    }
+    Ok(json!({"chain": p.key, "kind": pref_kind(node, p).id(), "kinds": kinds_json(p, 0)}))
+}
+
+/// The kinds a chain offers, for the menu: id, label, the path of tag slot `index`.
+pub fn kinds_json(p: &ChainParams, index: u32) -> Value {
+    json!(kinds_for(p).iter().map(|k| json!({"id": k.id(), "label": k.label(), "path": k.path(p.bip44_coin_type, index)})).collect::<Vec<_>>())
+}
+
+/// What one send from this wallet's own keys spends: the kind it is from (change
+/// goes back to that kind's receiving address), its coins and the keys that sign them.
+pub struct OwnSpend {
+    pub kind: AddrKind,
+    pub change: (String, Vec<u8>),
+    pub coins: Vec<Utxo>,
+    pub keys: Vec<arcade_wallet::SecretKey>,
+    /// The kind of each coin's script (for saying what was spent).
+    pub kinds: Vec<(Vec<u8>, AddrKind)>,
+}
+
+/// Plan a send from this wallet's own addresses on `p`. `from` (an address) picks the tag slot,
+/// and its kind unless `kind` says; without either the slot with the most to spend and the
+/// remembered kind. Only that kind's coins are spent, unless `all_kinds`: then every kind's of
+/// the slot. `coins_of` gives a script's spendable coins (with inscribed ones kept out by the
+/// caller). Ok(None) when `from` is not one of this wallet's own addresses.
+pub fn own_spend(
+    node: &Node,
+    p: &ChainParams,
+    from: Option<&str>,
+    kind: Option<&str>,
+    all_kinds: bool,
+    mut coins_of: impl FnMut(&[u8]) -> Result<Vec<Utxo>, String>,
+) -> Result<Option<OwnSpend>, String> {
+    let want = match kind.filter(|k| !k.is_empty()) {
+        Some(id) => Some(AddrKind::from_id(id).filter(|k| kinds_for(p).contains(k)).ok_or_else(|| format!("{} has no {id} addresses here", p.name))?),
+        None => None,
+    };
+    let mut keys = node.app.tag_keys(p.chain_no).map_err(|e| e.to_string())?;
+    if keys.is_empty() && node.app.has_wallet().map_err(|e| e.to_string())? {
+        keys.push(node.app.tag_key(p, 0).map_err(|e| e.to_string())?.0);
+    }
+    let pref = pref_kind(node, p);
+    let mut best: Option<(u32, AddrKind, (String, Vec<u8>), Vec<Utxo>, Vec<(Vec<u8>, AddrKind)>, u64)> = None;
+    for k in keys {
+        let addrs = own_addresses(node, p, &k);
+        let from_kind = from.and_then(|f| addrs.iter().find(|(_, v)| v.iter().any(|(a, _)| a == f)).map(|(kd, _)| *kd));
+        if from.is_some() && from_kind.is_none() {
+            continue;
+        }
+        let kd = want.or(from_kind).unwrap_or(pref);
+        let Some(change) = addrs.iter().find(|(x, _)| *x == kd).and_then(|(_, v)| v.first().cloned()) else { continue };
+        let (mut coins, mut kinds) = (Vec::new(), Vec::new());
+        for (x, v) in addrs.iter().filter(|(x, _)| all_kinds || *x == kd) {
+            for (_, sc) in v {
+                coins.extend(coins_of(sc)?);
+                kinds.push((sc.clone(), *x));
+            }
+        }
+        let total: u64 = coins.iter().map(|u| u.value).sum();
+        if from_kind.is_some() {
+            best = Some((k.index, kd, change, coins, kinds, u64::MAX));
+            break;
+        }
+        if best.as_ref().is_none_or(|b| total > b.5) {
+            best = Some((k.index, kd, change, coins, kinds, total));
+        }
+    }
+    let Some((index, kd, change, coins, kinds, _)) = best else {
+        return if from.is_some() { Ok(None) } else { Err("this wallet has no address on that chain".into()) };
+    };
+    // The keys of the kinds spent (Legacy's is the tag key).
+    let used: Vec<AddrKind> = kinds_for(p).iter().copied().filter(|x| kinds.iter().any(|(_, y)| y == x)).collect();
+    let keys = node.app.kind_keys(p, &used, index).map_err(|e| e.to_string())?;
+    Ok(Some(OwnSpend { kind: kd, change, coins, keys, kinds }))
+}
+
+/// The labels of the kinds a built tx spends, in menu order.
+pub fn kinds_spent(tx: &arcade_chain::Tx, coins: &[Utxo], kinds: &[(Vec<u8>, AddrKind)]) -> Vec<&'static str> {
+    let mut v: Vec<AddrKind> = tx
+        .inputs
+        .iter()
+        .filter_map(|i| coins.iter().find(|c| c.outpoint == i.prevout))
+        .filter_map(|c| kinds.iter().find(|(s, _)| *s == c.script).map(|(_, k)| *k))
+        .collect();
+    v.sort();
+    v.dedup();
+    v.into_iter().map(AddrKind::label).collect()
+}
+
 /// A word of caution about where a payment goes, when the address could be meant for another
 /// chain: a DigiByte "D..." address is also a Dogecoin address.
 pub fn warning(p: &ChainParams, to: &str) -> Option<String> {
@@ -72,8 +247,12 @@ pub fn warning(p: &ChainParams, to: &str) -> Option<String> {
 }
 
 /// wallet.send: pay `amount` (satoshis) to `to` on a chain from one of this wallet's keys,
-/// signed here. With broadcast false it is only built and shown (fee, size, warning).
-pub fn send(node: &Node, key: Option<&str>, to: &str, amount: u64, from: Option<&str>, broadcast: bool) -> R {
+/// signed here. With broadcast false it is only built and shown (fee, size, warning). `kind`
+/// (legacy, p2sh-p2wpkh, p2wpkh, p2tr) is the address type it is sent from, change back to it
+/// (default: the kind of `from`, else the one the Wallet shows); `all_kinds` spends the coins of
+/// every address type of that wallet.
+#[allow(clippy::too_many_arguments)]
+pub fn send(node: &Node, key: Option<&str>, to: &str, amount: u64, from: Option<&str>, kind: Option<&str>, all_kinds: bool, broadcast: bool) -> R {
     let from = from.map(str::trim).filter(|f| !f.is_empty());
     let p: &'static ChainParams = match key.filter(|k| !k.is_empty()) {
         Some(k) => crate::chains::find(k).ok_or_else(|| format!("unknown chain {k}"))?,
@@ -81,7 +260,7 @@ pub fn send(node: &Node, key: Option<&str>, to: &str, amount: u64, from: Option<
     };
     let warn = warning(p, to);
     if crate::borrow::is_borrowed(p.key) {
-        let mut v = crate::borrow::send(node, p.key, to, amount, from, broadcast)?;
+        let mut v = crate::borrow::send(node, p.key, to, amount, from, kind, all_kinds, broadcast)?;
         v["chain"] = json!(p.key);
         v["warning"] = json!(warn);
         return Ok(v);
@@ -105,81 +284,50 @@ pub fn send(node: &Node, key: Option<&str>, to: &str, amount: u64, from: Option<
     let to = named.as_deref().unwrap_or(to);
     let to_script = script_for_address(p, to).ok_or_else(|| format!("{to} is not a {} address", p.name))?;
     let tip = node.chain.tip(p.chain_no).map_err(|e| e.to_string())?.map(|t| t.height).unwrap_or(0);
-    // The key with the most to spend.
-    let mut keys = node.app.tag_keys(p.chain_no).map_err(|e| e.to_string())?;
-    if keys.is_empty() && node.app.has_wallet().map_err(|e| e.to_string())? {
-        keys.push(node.app.tag_key(p, 0).map_err(|e| e.to_string())?.0);
-    }
-    let mut best: Option<(u32, Vec<(String, Vec<u8>)>, Vec<Utxo>, u64)> = None;
-    for k in keys {
-        let Ok(pk) = hex::decode(&k.pubkey).map_err(|_| ()).and_then(|b| PublicKey::from_slice(&b).map_err(|_| ())) else { continue };
-        let scripts = key_scripts(p, &pk);
+    // A script's coins: not spent by a waiting transaction, and not an immature coinbase.
+    let coins_of = |sc: &[u8]| -> Result<Vec<Utxo>, String> {
         let mut coins = Vec::new();
-        for (_, sc) in &scripts {
-            for (op, value, _h) in node.chain.coins_for_script(p, sc).map_err(|e| e.to_string())? {
-                // Not spent by a waiting transaction, and not an immature coinbase.
-                if waiting_spend(&op)? {
+        for (op, value, _h) in node.chain.coins_for_script(p, sc).map_err(|e| e.to_string())? {
+            if waiting_spend(&op)? {
+                continue;
+            }
+            if let Some(c) = node.chain.coin(p, &op).map_err(|e| e.to_string())? {
+                if c.coinbase && c.height + p.coinbase_maturity > tip {
                     continue;
                 }
-                if let Some(c) = node.chain.coin(p, &op).map_err(|e| e.to_string())? {
-                    if c.coinbase && c.height + p.coinbase_maturity > tip {
-                        continue;
-                    }
-                }
-                coins.push(Utxo { outpoint: op, value, script: sc.clone() });
             }
+            coins.push(Utxo { outpoint: op, value, script: sc.to_vec() });
         }
-        let coins = crate::ordsafe::keep_free(node, p, coins);
-        let total: u64 = coins.iter().map(|u| u.value).sum();
-        let picked = from.is_some_and(|f| scripts.iter().any(|(a, _)| a == f));
-        if picked {
-            best = Some((k.index, scripts, coins, u64::MAX));
-            break;
-        }
-        if best.as_ref().is_none_or(|b| total > b.3) {
-            best = Some((k.index, scripts, coins, total));
-        }
-    }
-    // An imported wallet picked by its address spends its own coins, change back to it.
-    let imported = match from {
-        Some(f) if !best.as_ref().is_some_and(|b| b.1.iter().any(|(a, _)| a == f)) => {
-            let (_, sc, sk, kind) = crate::importsvc::wallets_on(node, p.key).into_iter().find(|w| w.0 == f).ok_or("that address is not one of this wallet's (own or imported) on this chain")?;
-            let keyhash = (sc.len() == 25 && sc[0] == 0x76 && sc[1] == 0xa9 && kind == "legacy") || (sc.len() == 22 && sc[0] == 0 && sc[1] == 20);
-            let pk = PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
-            if !keyhash || !key_scripts(p, &pk).iter().any(|(_, s)| *s == sc) {
-                return Err("this imported wallet's kind can't be spent here yet (only legacy compressed and p2wpkh)".into());
-            }
-            let mut coins = Vec::new();
-            for (op, value, _h) in node.chain.coins_for_script(p, &sc).map_err(|e| e.to_string())? {
-                if waiting_spend(&op)? {
-                    continue;
-                }
-                if let Some(c) = node.chain.coin(p, &op).map_err(|e| e.to_string())? {
-                    if c.coinbase && c.height + p.coinbase_maturity > tip {
-                        continue;
-                    }
-                }
-                coins.push(Utxo { outpoint: op, value, script: sc.clone() });
-            }
-            let coins = crate::ordsafe::keep_free(node, p, coins);
-            Some((sk, vec![(f.to_string(), sc)], coins))
-        }
-        _ => None,
+        Ok(coins)
     };
-    let (sk, scripts, coins) = match imported {
-        Some(x) => x,
+    // This wallet's own addresses (any kind), picked by `from` or the one with the most to spend.
+    let (keys, change, coins, kd, kinds) = match own_spend(node, p, from, kind, all_kinds, coins_of)? {
+        Some(o) => (o.keys, o.change, o.coins, Some(o.kind), o.kinds),
         None => {
-            let (index, scripts, coins, _) = best.ok_or("this wallet has no address on that chain")?;
-            (node.app.tag_key(p, index).map_err(|e| e.to_string())?.1, scripts, coins)
+            // An imported wallet picked by its address spends its own coins, change back to it.
+            let f = from.unwrap_or_default();
+            let (_, sc, sk, ikind) = crate::importsvc::wallets_on(node, p.key).into_iter().find(|w| w.0 == f).ok_or("that address is not one of this wallet's (own or imported) on this chain")?;
+            let pk = PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
+            // Compressed keys of the three import kinds (an uncompressed key's address isn't one this signs for).
+            if sc != crate::importsvc::script_for(&ikind, &pk) {
+                return Err("this imported wallet's kind can't be spent here yet (legacy, p2wpkh and p2sh-p2wpkh with a compressed key)".into());
+            }
+            (vec![sk], (f.to_string(), sc.clone()), coins_of(&sc)?, None, Vec::new())
         }
     };
+    // Coins carrying an inscription stay out (crate::ordsafe), whatever their address type.
+    let coins = crate::ordsafe::keep_free(node, p, coins);
     let fp = fee_policy(p);
-    let tx = arcade_wallet::tx::build_send_keyhash(p, &to_script, amount, &sk, &coins, &scripts[0].1, fp.fallback_per_kb.max(fp.floor_per_kb), fp.dust, arcade_app::now() as u32)?;
+    let tx = arcade_wallet::tx::build_send_keys(p, &to_script, amount, &keys, &coins, &change.1, fp.fallback_per_kb.max(fp.floor_per_kb), fp.dust, arcade_app::now() as u32)?;
     let ins: u64 = tx.inputs.iter().filter_map(|i| coins.iter().find(|c| c.outpoint == i.prevout).map(|c| c.value)).sum();
     let fee = ins.saturating_sub(tx.outputs.iter().map(|o| o.value).sum());
     let vsize = (tx.encode_legacy().len() * 3 + tx.raw.len()).div_ceil(4);
-    let mut out = json!({"chain": p.key, "txid": tx.txid.to_hex(), "from": scripts[0].0, "to": to, "amount": amount, "fee": fee,
-                         "size": tx.raw.len(), "vsize": vsize, "sent": false, "warning": warn});
+    let mut out = json!({"chain": p.key, "txid": tx.txid.to_hex(), "from": change.0, "to": to, "amount": amount, "fee": fee,
+                         "size": tx.raw.len(), "vsize": vsize, "sent": false, "warning": warn, "hex": hex::encode(&tx.raw),
+                         "kind": kd.map(AddrKind::id), "kind_label": kd.map(AddrKind::label), "kinds_spent": kinds_spent(&tx, &coins, &kinds)});
+    // How well the coins it spends are known to carry no inscription: shown before Send.
+    let spent: Vec<arcade_chain::OutPoint> = tx.inputs.iter().map(|i| i.prevout).collect();
+    out["caution"] = json!(crate::ordsafe::caution(node, p, &spent));
     if broadcast {
         let r = if arc {
             let (id, fee) = crate::ownwait::send_arc(node, &tx)?;
@@ -192,7 +340,6 @@ pub fn send(node: &Node, key: Option<&str>, to: &str, amount: u64, from: Option<
     }
     Ok(out)
 }
-
 
 /// `arc.blob_publish`: put `bytes` on the ARCADE chain as a blob (arcade-arc `blob.rs`). See [`publish_blobs`].
 pub fn publish_blob(node: &Node, bytes: &[u8], kind: &str, class: arcade_arc::blob::Class, encoding: arcade_arc::blob::Encoding, send: bool) -> Result<Value, String> {
@@ -314,6 +461,22 @@ pub fn publish_blobs(node: &Node, items: &[(Vec<u8>, String, arcade_arc::blob::C
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// On DigiByte (a chain with address types) Legacy is the D... key-hash address first, as the original arcade
+    /// showed it, with the same key's dgb1q... form still counted; a chain with no types keeps its single address.
+    #[test]
+    fn digibyte_legacy_shows_the_d_address_first() {
+        let words = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let seed = arcade_wallet::keys::seed_from_phrase(words).unwrap();
+        let dgb = arcade_chain::params::by_key("dgb").unwrap();
+        let x = arcade_wallet::keys::tag_key(&seed[..], dgb.bip44_coin_type, 0).unwrap();
+        let v = kind_scripts(dgb, AddrKind::Legacy, &x.public());
+        assert_eq!(v[0].0, "DBus3bamQjgJULBJtYXpEzDWQRwF5iwxgC", "the original arcade's D... address");
+        assert_eq!(v.len(), 2);
+        assert!(v[1].0.starts_with("dgb1q"), "its SegWit form still counted: {}", v[1].0);
+        let doge = arcade_chain::params::by_key("doge").unwrap();
+        assert_eq!(kind_scripts(doge, AddrKind::Legacy, &x.public()).len(), 1);
+    }
     use arcade_chain::params::{DIGIBYTE_MAIN, DOGECOIN_MAIN, PEPECOIN_TEST};
 
     #[test]
@@ -332,6 +495,92 @@ mod tests {
         assert!(warning(&DIGIBYTE_MAIN, &dgb[0].0).is_none());
         assert!(warning(&DOGECOIN_MAIN, &doge[0].0).is_none());
         assert_eq!(key_scripts(&PEPECOIN_TEST, &pk).len(), 1);
+    }
+
+    /// The account's own wallet on a chain with address types (a Litecoin-like test chain): each
+    /// kind's address from the words, coins of every kind counted, a send from one kind spends
+    /// only that kind's coins (change back to it), all_kinds mixes them in one SegWit tx, and
+    /// every input checks out with the checker for others' transactions.
+    #[test]
+    fn address_kinds_receive_count_and_send() {
+        use crate::sitesvc::tests::{block, setup_with, tx};
+        use arcade_wallet::keys::AddrKind;
+        let t = setup_with(|p| {
+            p.key = "ltcregtest";
+            p.format.segwit = true;
+            p.bech32_hrp = Some("rltc");
+            p.p2sh_version = 58;
+        });
+        let (node, p) = (&t.node, t.p);
+        node.app.create_wallet(Some("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")).unwrap();
+        let k0 = node.app.tag_key(p, 0).unwrap().0;
+        let addrs = own_addresses(node, p, &k0);
+        assert_eq!(addrs.iter().map(|(k, _)| k.id()).collect::<Vec<_>>(), ["legacy", "p2sh-p2wpkh", "p2wpkh", "p2tr"]);
+        let addr = |kd: AddrKind| addrs.iter().find(|(k, _)| *k == kd).unwrap().1[0].clone();
+        assert!(addr(AddrKind::NativeSegwit).0.starts_with("rltc1q") && addr(AddrKind::Taproot).0.starts_with("rltc1p"));
+        // The same keys as the words give at m/49' 84' 86' with the chain's coin type.
+        let seed = arcade_wallet::keys::seed_from_phrase("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about").unwrap();
+        for (kd, v) in &addrs {
+            let pk = arcade_wallet::keys::kind_key(&seed[..], *kd, p.bip44_coin_type, 0).unwrap().public();
+            assert_eq!(v[0].1, arcade_wallet::keys::kind_script(*kd, &pk), "{kd:?}");
+        }
+        // 1, 2, 3 and 4 coins to the four kinds.
+        let fund = tx(&[(t.spend.txid, 0)], &AddrKind::ALL.iter().enumerate().map(|(i, &kd)| ((i as u64 + 1) * 100_000_000, addr(kd).1)).collect::<Vec<_>>(), 0);
+        let tip = node.chain.tip(p.chain_no).unwrap().unwrap();
+        node.chain.connect_blocks(p, &[block(tip.hash, vec![tx(&[], &[(5000, crate::sitesvc::tests::p2pkh(3))], 4), fund.clone()], 4)]).unwrap();
+        // wallet.keys: each kind's balance, and all of them in the balance; Legacy shown until another is picked.
+        let keys = crate::api::dispatch(node, &json!({"cmd": "wallet.keys"})).unwrap();
+        assert_eq!(keys[0]["balance"], 1_000_000_000u64);
+        assert_eq!(keys[0]["kind"], "legacy");
+        assert_eq!(keys[0]["kinds"][2]["balance"], 300_000_000u64);
+        assert_eq!(keys[0]["kinds"][3]["path"], format!("m/86'/{}'/0'/0/0", p.bip44_coin_type));
+        // Remembered per chain.
+        assert_eq!(addr_kind(node, p, Some("p2wpkh")).unwrap()["kind"], "p2wpkh");
+        assert_eq!(pref_kind(node, p), AddrKind::NativeSegwit);
+        assert!(addr_kind(node, p, Some("p2pk")).is_err());
+        let to = arcade_ledger::address::p2pkh_script(&[7; 20]);
+        let to_a = base58check(p.p2pkh_version, &[7; 20]);
+        let check = |r: &Value, coins: &[Utxo]| {
+            let raw = hex::decode(r["hex"].as_str().unwrap()).unwrap();
+            let tx = arcade_chain::Tx::parse_with(&raw, &p.format).unwrap();
+            let spent: Vec<Utxo> = tx.inputs.iter().map(|i| coins.iter().find(|c| c.outpoint == i.prevout).unwrap().clone()).collect();
+            assert_eq!(arcade_wallet::verify::all(p, &tx, &spent), Ok(()));
+            (tx, spent)
+        };
+        let coins: Vec<Utxo> = AddrKind::ALL.iter().enumerate().map(|(i, &kd)| Utxo { outpoint: arcade_chain::OutPoint { txid: fund.txid, vout: i as u32 }, value: (i as u64 + 1) * 100_000_000, script: addr(kd).1 }).collect();
+        // Each kind alone (by `from`, by `kind`, and the remembered one): only its coin, change back to it.
+        for (i, &kd) in AddrKind::ALL.iter().enumerate() {
+            for r in [
+                send_hex(node, &to_a, 50_000_000, Some(&addr(kd).0), None, false),
+                send_hex(node, &to_a, 50_000_000, None, Some(kd.id()), false),
+            ] {
+                let r = r.unwrap();
+                assert_eq!((r["kind"].as_str(), r["from"].as_str()), (Some(kd.id()), Some(addr(kd).0.as_str())));
+                let (tx, spent) = check(&r, &coins);
+                assert_eq!(spent.len(), 1);
+                assert_eq!(spent[0].outpoint.vout, i as u32);
+                assert_eq!(tx.outputs[0].script_pubkey, to);
+                assert_eq!(tx.outputs[1].script_pubkey, addr(kd).1);
+                assert_eq!(tx.has_witness(), kd != AddrKind::Legacy);
+            }
+        }
+        let r = send_hex(node, &to_a, 50_000_000, None, None, false).unwrap();
+        assert_eq!(r["kind"], "p2wpkh");
+        // More than one kind holds: refused from one kind, sent with all_kinds (change to the kind picked).
+        assert!(send_hex(node, &to_a, 150_000_000, None, Some("legacy"), false).unwrap_err().contains("not enough"));
+        let r = send_hex(node, &to_a, 950_000_000, None, Some("p2tr"), true).unwrap();
+        let (tx, spent) = check(&r, &coins);
+        assert_eq!(spent.len(), 4);
+        assert_eq!(r["kinds_spent"], json!(["Legacy", "P2SH (Nested SegWit)", "Native SegWit", "Taproot"]));
+        assert_eq!(tx.outputs[1].script_pubkey, addr(AddrKind::Taproot).1);
+        assert_eq!(&tx.raw[4..6], &[0, 1]);
+        // Not one of ours: refused.
+        assert!(send_hex(node, &to_a, 1_000, Some(&to_a), None, false).is_err());
+    }
+
+    /// wallet.send built, not sent.
+    fn send_hex(node: &Node, to: &str, amount: u64, from: Option<&str>, kind: Option<&str>, all: bool) -> R {
+        send(node, None, to, amount, from, kind, all, false)
     }
 }
 

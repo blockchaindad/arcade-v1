@@ -781,7 +781,11 @@ pub fn status(node: &Node, key: &str) -> Result<Value, String> {
         let phase = j["phase"].as_str().unwrap_or("");
         let fetched = matches!(phase, "import" | "coins") || (bytes > 0 && done >= bytes);
         let pct_copy = if fetched { 100.0 } else if bytes == 0 { 0.0 } else { done as f64 * 100.0 / bytes as f64 };
-        let detail = if phase == "manifest" {
+        let local = j["from_dir"].as_str();
+        let pct_copy = if local.is_some() { 100.0 } else { pct_copy };
+        let detail = if let (Some(d), false) = (local, phase == "failed") {
+            format!("read in place from this computer's Core folder {d} (never written) · blocks too")
+        } else if phase == "manifest" {
             format!("asking for the copy's list of pieces · from arcade {}", crate::coreboot::short(j["maker"].as_str().unwrap_or("")))
         } else if phase == "failed" {
             format!("failed: {}", j["detail"].as_str().unwrap_or(""))
@@ -799,7 +803,7 @@ pub fn status(node: &Node, key: &str) -> Result<Value, String> {
     }
     if let Some(t) = copy.get("trusted").filter(|t| !t.is_null()) {
         let v = crate::cbimport::verify_note(key);
-        let d = format!("trusted coin set from arcade {} at block {}{}", crate::coreboot::short(t["maker"].as_str().unwrap_or("")), t["height"],
+        let d = format!("trusted coin set from {} at block {}{}", crate::coreboot::who(t["maker"].as_str().unwrap_or("")), t["height"],
             if v.is_empty() { " · not re-checked yet".to_string() } else { format!(" · {v}") });
         if let Some(st) = stages.iter_mut().find(|s| s["name"] == "Coins") {
             st["detail"] = json!(d);
@@ -1141,32 +1145,7 @@ fn mesh_first(node: &Arc<Node>, run: &ChainRun, syncer: &Syncer) {
             }
         }
         let _ = node.app.event("chains", &format!("{}: downloading from every source at once ({} arcade offer{} + P2P)", p.name, offers.len(), if offers.len() == 1 { "" } else { "s" }));
-        run.peer_tip.fetch_max(top as u32, Ordering::Relaxed);
-        let progress = |s: String| {
-            *run.source.lock().unwrap() = format!("parallel: {}", s.split(" · ").skip(1).collect::<Vec<_>>().join(" · "));
-            set(format!("downloading in parallel: {s}"));
-        };
-        // Retry the parallel download after a hiccup (a source vanishing, a slow stretch);
-        // only after three quick failures in a row fall back to one source at a time.
-        // (Rounds that connect nothing count too, however long they took: two in a row and the
-        // one-source-at-a-time path below takes over.)
-        let (mut quick_fails, mut idle) = (0, 0);
-        while !run.stop.load(Ordering::Relaxed) && !crate::coreboot::held(p.key) && ours() + 2000 < top && quick_fails < 3 && idle < 2 {
-            let t = std::time::Instant::now();
-            let before = ours();
-            match crate::psync::run(node, p, syncer, top as u32, &progress, &run.stop) {
-                Ok(n) => {
-                    let _ = node.app.event("chains", &format!("{}: parallel download connected {n} blocks", p.name));
-                    quick_fails = 0;
-                }
-                Err(e) => {
-                    let _ = node.app.event("chains", &format!("{}: parallel download stopped at {}: {e}", p.name, ours()));
-                    quick_fails = if t.elapsed() < Duration::from_secs(120) { quick_fails + 1 } else { 0 };
-                    std::thread::sleep(Duration::from_secs(5));
-                }
-            }
-            idle = if ours() > before { 0 } else { idle + 1 };
-        }
+        parallel_catch_up(node, run, syncer, top);
     }
     for (id, addr, kind, their) in offers {
         if run.stop.load(Ordering::Relaxed) || their <= ours() {
@@ -1415,6 +1394,50 @@ fn follow_headers(node: &Node, run: &ChainRun, syncer: &Syncer) {
     }
 }
 
+/// Far behind `top`: every source at once (crate::psync: the arcades offering the chain, if
+/// any, and up to 24 P2P peers), until within 2,000 blocks of it. A hiccup (a source vanishing,
+/// a slow stretch) is retried; after three quick failures in a row, or two rounds that connect
+/// nothing, the caller's one-source-at-a-time path takes over.
+fn parallel_catch_up(node: &Arc<Node>, run: &ChainRun, syncer: &Syncer, top: u64) {
+    let p = run.params;
+    let set = |s: String| *run.state.lock().unwrap() = s;
+    let ours = || node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height as u64).unwrap_or(0);
+    run.peer_tip.fetch_max(top as u32, Ordering::Relaxed);
+    let progress = |s: String| {
+        *run.source.lock().unwrap() = format!("parallel: {}", s.split(" · ").skip(1).collect::<Vec<_>>().join(" · "));
+        set(format!("downloading in parallel: {s}"));
+    };
+    // (Rounds that connect nothing count too, however long they took.)
+    let (mut quick_fails, mut idle) = (0, 0);
+    while !run.stop.load(Ordering::Relaxed) && !run.paused.load(Ordering::Relaxed) && !crate::coreboot::held(p.key)
+        && ours() + 2000 < top && quick_fails < 3 && idle < 2
+    {
+        let t = std::time::Instant::now();
+        let before = ours();
+        match crate::psync::run(node, p, syncer, top as u32, &progress, &run.stop) {
+            Ok(n) => {
+                let _ = node.app.event("chains", &format!("{}: parallel download connected {n} blocks", p.name));
+                quick_fails = 0;
+            }
+            Err(e) => {
+                let _ = node.app.event("chains", &format!("{}: parallel download stopped at {}: {e}", p.name, ours()));
+                quick_fails = if t.elapsed() < Duration::from_secs(120) { quick_fails + 1 } else { 0 };
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        }
+        idle = if ours() > before { 0 } else { idle + 1 };
+    }
+}
+
+/// Whether to download from many P2P peers at once: the peer's height is over 2,000 blocks
+/// ahead of ours, and the last try (if any) is at least P2P_PARALLEL_REST ago.
+fn p2p_parallel_due(their: u64, ours: u64, last_try: Option<Duration>) -> bool {
+    their > ours + 2000 && last_try.is_none_or(|t| t >= P2P_PARALLEL_REST)
+}
+
+/// How long the one-peer path runs before the many-peer download is tried again.
+const P2P_PARALLEL_REST: Duration = Duration::from_secs(600);
+
 fn follow(node: Arc<Node>, run: Arc<ChainRun>) {
     let p = run.params;
     let syncer = Syncer::new(&node.chain, p);
@@ -1427,6 +1450,7 @@ fn follow(node: Arc<Node>, run: Arc<ChainRun>) {
     }
     mesh_first(&node, &run, &syncer);
     let mut last_mesh = std::time::Instant::now();
+    let mut last_p2p_parallel: Option<std::time::Instant> = None;
     // The first balancing pass waits until the mesh has told us who holds what.
     let mut last_balance = std::time::Instant::now() - Duration::from_secs(crate::shares::every() * 4 / 5);
     'outer: while !run.stop.load(Ordering::Relaxed) {
@@ -1468,6 +1492,20 @@ fn follow(node: Arc<Node>, run: Arc<ChainRun>) {
             set(format!("genesis: {e}"));
             std::thread::sleep(Duration::from_secs(10));
             continue;
+        }
+        // Far behind the coin's network with no arcade far ahead to bootstrap from (Bitcoin for
+        // now, or any chain the mesh doesn't carry yet): many P2P peers at once, as from the mesh.
+        // One peer at a time ran Bitcoin's first sync at a few thousand blocks an hour.
+        {
+            let ours = node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height as u64).unwrap_or(0);
+            let their = peer.version.start_height.max(0) as u64;
+            if p2p_parallel_due(their, ours, last_p2p_parallel.map(|t| t.elapsed())) {
+                drop(peer);
+                let _ = node.app.event("chains", &format!("{}: downloading from many P2P peers at once ({} blocks behind)", p.name, their - ours));
+                parallel_catch_up(&node, &run, &syncer, their);
+                last_p2p_parallel = Some(std::time::Instant::now());
+                continue 'outer;
+            }
         }
         loop {
             if run.stop.load(Ordering::Relaxed) || run.paused.load(Ordering::Relaxed) || crate::coreboot::held(p.key) {
@@ -1787,5 +1825,21 @@ mod list_cache_tests {
         assert_eq!(cache.get(|| -> Value { panic!("boom") }, || json!("loading")), json!("loading"));
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(cache.get(|| json!("rows"), || json!("loading")), json!("rows"));
+    }
+}
+
+#[cfg(test)]
+mod p2p_parallel_tests {
+    use super::*;
+
+    #[test]
+    fn many_p2p_peers_only_far_behind_and_not_again_at_once() {
+        // Far behind, never tried: yes. Near the tip: no.
+        assert!(p2p_parallel_due(976_000, 589_000, None));
+        assert!(!p2p_parallel_due(591_000, 589_000, None));
+        assert!(!p2p_parallel_due(500_000, 589_000, None));
+        // Tried a minute ago: the one-peer path runs for a while first; after the rest, again.
+        assert!(!p2p_parallel_due(976_000, 589_000, Some(Duration::from_secs(60))));
+        assert!(p2p_parallel_due(976_000, 589_000, Some(P2P_PARALLEL_REST)));
     }
 }

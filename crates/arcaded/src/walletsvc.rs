@@ -390,11 +390,14 @@ pub(crate) fn tx_status(node: &Node, txid: &str) -> Option<Value> {
     let cc = c(node);
     let h = arcade_chain::Hash256::from_hex(txid).ok()?;
     if let Some((b, _)) = node.chain.tx_location(crate::pagechain::params(node), &h).ok().flatten() {
-        let tip = node.chain.tip(cc).ok().flatten().map(|t| t.height).unwrap_or(0);
         let height = node.chain.block_height_of(cc, b).ok().flatten();
         let hash = height.and_then(|ht| node.chain.hash_at(cc, ht).ok().flatten());
         let time = hash.and_then(|hh| node.chain.header(cc, &hh).ok().flatten()).map(|r| r.header.time);
-        return Some(json!({"txid": txid, "confirmed": true, "confirmations": height.map(|ht| tip.saturating_sub(ht) + 1), "conflicted": false,
+        // Confirmations as they count for money: on a chain where a block's height proves little (DigiByte, Kotia,
+        // Wojakcoin) only the checked work above it counts, and a payment under none is not confirmed yet.
+        let p = crate::pagechain::params(node);
+        let conf = height.map(|ht| node.chain.money_depth(p).map(|m| m.at(ht)).unwrap_or(0));
+        return Some(json!({"txid": txid, "confirmed": conf.is_none_or(|n| n > 0), "confirmations": conf, "conflicted": false,
                            "block": height, "blockhash": hash.map(|x| x.to_hex()), "time": time}));
     }
     let pooled = node.chain.mempool(cc).ok()?.iter().any(|(_, raw)| arcade_chain::Tx::parse_with(raw, &crate::pagechain::params(node).format).map(|t| t.txid == h).unwrap_or(false));
@@ -588,14 +591,21 @@ pub(crate) fn file_market(node: &Node, page: &str, what: &str, to: Option<String
 
 /// Build (and, when `send`, broadcast) a request's transaction: (txid, fee, outputs).
 fn build(node: &Node, r: &Value, send: bool) -> Result<(String, u64, Vec<Value>), String> {
+    build_with_caution(node, r, send).map(|(txid, fee, outs, _)| (txid, fee, outs))
+}
+
+/// [`build`], with the caution for its card: how well the coins it spends are known to carry
+/// no inscription (crate::ordsafe::caution).
+fn build_with_caution(node: &Node, r: &Value, send: bool) -> Result<(String, u64, Vec<Value>, Option<Value>), String> {
     let p = node.params;
     if r["kind"] == "market" {
         // An order, cancel or take (marketsvc.rs): (txid, fee, outputs) as the card shows them.
-        return crate::marketsvc::build_request(node, &r["market"], send);
+        return crate::marketsvc::build_request(node, &r["market"], send).map(|(t, f, o)| (t, f, o, None));
     }
     if r["kind"] == "repo" {
         // A repository write (reposvc.rs): on the ARCADE chain, signed by this wallet's @tag there.
-        return if send { crate::reposvc::start(node, r) } else { crate::reposvc::preview(node, r).map(|(fee, outs)| (String::new(), fee, outs)) };
+        let built = if send { crate::reposvc::start(node, r) } else { crate::reposvc::preview(node, r).map(|(fee, outs)| (String::new(), fee, outs)) };
+        return built.map(|(t, f, o)| (t, f, o, None));
     }
     let to = r["to"].as_str().unwrap_or("");
     let to_script = arcade_ledger::address::script_for_address(p, to).ok_or("bad address")?;
@@ -658,7 +668,9 @@ fn build(node: &Node, r: &Value, send: bool) -> Result<(String, u64, Vec<Value>)
         crate::claims::mark_spent(node, &tx);
         node.tx_outbox.lock().unwrap().push(tx.raw.clone());
     }
-    Ok((tx.txid.to_hex(), fee, outs))
+    let spent: Vec<arcade_chain::OutPoint> = tx.inputs.iter().map(|i| i.prevout).collect();
+    let caution = if send { None } else { crate::ordsafe::caution(node, node.ledger_home(), &spent) };
+    Ok((tx.txid.to_hex(), fee, outs, caution))
 }
 
 /// An arcade token send from this wallet itself (the Wallet's Send, not a page's request): built as a page's is,
@@ -670,17 +682,26 @@ pub fn token_send(node: &Node, pid: u32, units: u64, to: &str, send: bool) -> Re
 /// What a request would send, as built now (for the approval card).
 pub fn preview(node: &Node, id: &str) -> Result<Value, String> {
     let r = get_req(node, id).ok_or("no such request")?;
-    let (_, fee, outs) = build(node, &r, false)?;
+    let (_, fee, outs, caution) = build_with_caution(node, &r, false)?;
     let mut v = r.clone();
     v["fee"] = json!(fee);
     v["outputs"] = json!(outs);
+    v["caution"] = json!(caution);
     v["page_card"] = page_card(node, r["page"].as_str().unwrap_or(""));
     Ok(v)
 }
 
 /// The page's name as the chain says it: its app card's name and its creator's @tag.
 fn page_card(node: &Node, page: &str) -> Value {
-    let Some(i) = arcade_ledger::content::inscription(&node.chain, c(node), page) else { return json!({"page": page}) };
+    let Some(i) = arcade_ledger::content::inscription(&node.chain, c(node), page) else {
+        // An app on a chain whose ledger isn't here: its card as the App Store has it, with a caution when only
+        // one arcade on the mesh vouches for it (crate::appsvc trust).
+        return match crate::appsvc::of_page(node, page) {
+            Some(a) => json!({"page": page, "app": a["name"], "creator": a["creator"], "chain": a["chain"],
+                              "caution": (a["trust"]["level"] != "green").then(|| a["trust"]["note"].clone())}),
+            None => json!({"page": page}),
+        };
+    };
     let card = arcade_ledger::cards::parse(i["json"].as_str().unwrap_or("")).map(|c| c.name);
     json!({"page": page, "app": card, "creator": i["creator"], "creator_tag": i["creator"].as_str().and_then(|a| tag_of(node, a))})
 }
@@ -858,10 +879,27 @@ pub fn state_of(node: &Node, piece: &str, family: Option<&str>) -> Value {
 
 /// Token transfers waiting in the mempool to and from an address: (incoming, outgoing), each
 /// {kind: "token", property_id, units, txid, from, to} (simple sends and grants).
+/// The inscription an INSC transfer payload moves (its txid), if it is one.
+fn insc_transfer(payload: &[u8]) -> Option<[u8; 32]> {
+    (payload.len() >= 38 && &payload[..4] == b"INSC" && payload[4] == 1 && payload[5] == 2).then(|| payload[6..38].try_into().ok()).flatten()
+}
+
 pub fn pending_moves(node: &Node, address: &str) -> (Vec<Value>, Vec<Value>) {
     use arcade_ledger::payload::{decode, Msg};
     let (mut inc, mut out) = (Vec::new(), Vec::new());
     for (tx, atx) in crate::claims::pending_arcade(node) {
+        // An INSC transfer (kind 2: "INSC", version 1, kind 2, the inscription's txid): its inscription is on its
+        // way to the reference output.
+        if let Some(insc) = insc_transfer(&atx.payload) {
+            let m = json!({"kind": "inscription", "txid": hex::encode(insc), "move_txid": tx.txid.to_hex(), "from": atx.sender, "to": atx.reference});
+            if atx.reference.as_deref() == Some(address) {
+                inc.push(m.clone());
+            }
+            if atx.sender == address {
+                out.push(m);
+            }
+            continue;
+        }
         let Ok(d) = decode(&atx.payload) else { continue };
         let (pid, units, to) = match d.msg {
             Msg::SimpleSend { prop, amount } => (prop, amount, atx.reference.clone()),
@@ -918,6 +956,20 @@ fn ledger_tx(node: &Node, txid: &str) -> (u16, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An INSC transfer's payload names the inscription it moves; anything else isn't one.
+    #[test]
+    fn an_insc_transfer_is_a_pending_move() {
+        let mut d = b"INSC".to_vec();
+        d.extend_from_slice(&[1, 2]);
+        d.extend_from_slice(&[7u8; 32]);
+        assert_eq!(insc_transfer(&d), Some([7u8; 32]));
+        assert_eq!(insc_transfer(&d[..30]), None);
+        let mut other = d.clone();
+        other[5] = 1;
+        assert_eq!(insc_transfer(&other), None, "kind 1 is an inscription, not a transfer");
+        assert_eq!(insc_transfer(&[0, 0, 0, 0, 0, 0, 0, 1]), None);
+    }
 
     #[test]
     fn a_request_approved_twice_at_once_is_sent_once() {

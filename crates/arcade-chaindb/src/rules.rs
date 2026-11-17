@@ -164,93 +164,98 @@ pub fn check_info(params: &ChainParams, blk: &Block, height: u32, spent: &[Vec<S
     // Proof of stake (ValueRules::stake_reward): the coinstake's in and out.
     let pos = vr.is_some_and(|v| v.stake_reward.is_some()) && blk.txs.len() > 1 && blk.txs[1].is_coinstake();
     let (mut stake_in, mut stake_out) = (0u128, 0u128);
-    for (i, (tx, sp)) in blk.txs.iter().zip(spent).enumerate() {
-        let mut value_in = 0u128;
-        if let Some(vr) = &vr {
-            for s in sp {
-                value_in += s.value as u128;
-                if s.value > vr.max_money || value_in > vr.max_money as u128 {
-                    return Err(broke(&tx.txid, "input values out of range (bad-txns-inputvalues-outofrange)".into()));
-                }
-                let need = (vr.maturity)(s.height);
-                if s.coinbase && height.saturating_sub(s.height) < need {
-                    return Err(broke(&tx.txid, format!(
-                        "spends a coinbase from height {} before it matures ({need} blocks) (bad-txns-premature-spend-of-coinbase)", s.height)));
-                }
-                if s.pegout && height.saturating_sub(s.height) < vr.pegout_maturity {
-                    return Err(broke(&tx.txid, format!(
-                        "spends an MWEB peg-out from height {} before it matures ({} blocks) (bad-txns-premature-spend-of-pegout)", s.height, vr.pegout_maturity)));
-                }
-            }
-        }
-        if let (Some(br), false) = (&br, tx.is_coinbase()) {
-            // BIP68: relative lock times, against the median time past of the block before.
-            if let Some(prev_mtp) = prev_mtp {
-                let heights: Vec<u32> = sp.iter().map(|s| s.height).collect();
-                let Some((min_h, min_t)) = sigops::sequence_locks(tx, &heights, &mut |h| mtp(h).map(i64::from)) else {
-                    return Err(broke(&tx.txid, "a coin's median time past can't be read here".into()));
-                };
-                if min_h >= height as i64 || min_t >= prev_mtp as i64 {
-                    return Err(broke(&tx.txid, "relative lock time not reached (bad-txns-nonfinal, BIP68)".into()));
+    // Scripts are the slow part: they are queued as the transactions are read and run on all
+    // cores (run_scripts). A rule broken further on is only reported once the scripts queued
+    // before it have passed, so a block gets the same answer as checking one input at a time.
+    let mut jobs: Vec<ScriptJob> = Vec::new();
+    let mut each_tx = || -> Result<(), Broken> {
+        for (i, (tx, sp)) in blk.txs.iter().zip(spent).enumerate() {
+            let mut value_in = 0u128;
+            if let Some(vr) = &vr {
+                for s in sp {
+                    value_in += s.value as u128;
+                    if s.value > vr.max_money || value_in > vr.max_money as u128 {
+                        return Err(broke(&tx.txid, "input values out of range (bad-txns-inputvalues-outofrange)".into()));
+                    }
+                    let need = (vr.maturity)(s.height);
+                    if s.coinbase && height.saturating_sub(s.height) < need {
+                        return Err(broke(&tx.txid, format!(
+                            "spends a coinbase from height {} before it matures ({need} blocks) (bad-txns-premature-spend-of-coinbase)", s.height)));
+                    }
+                    if s.pegout && height.saturating_sub(s.height) < vr.pegout_maturity {
+                        return Err(broke(&tx.txid, format!(
+                            "spends an MWEB peg-out from height {} before it matures ({} blocks) (bad-txns-premature-spend-of-pegout)", s.height, vr.pegout_maturity)));
+                    }
                 }
             }
-            // Signature-operation cost: P2SH redeem scripts (GetP2SHSigOpCount) and witness scripts
-            // (CountWitnessSigOps), then the scripts.
-            let p2sh = on & SCRIPT_P2SH != 0;
-            for (inp, s) in tx.inputs.iter().zip(sp) {
-                if p2sh && sigops::is_p2sh(s.script) {
-                    cost += 4 * sigops::p2sh_sig_op_count(&inp.script_sig) as u64;
+            if let (Some(br), false) = (&br, tx.is_coinbase()) {
+                // BIP68: relative lock times, against the median time past of the block before.
+                if let Some(prev_mtp) = prev_mtp {
+                    let heights: Vec<u32> = sp.iter().map(|s| s.height).collect();
+                    let Some((min_h, min_t)) = sigops::sequence_locks(tx, &heights, &mut |h| mtp(h).map(i64::from)) else {
+                        return Err(broke(&tx.txid, "a coin's median time past can't be read here".into()));
+                    };
+                    if min_h >= height as i64 || min_t >= prev_mtp as i64 {
+                        return Err(broke(&tx.txid, "relative lock time not reached (bad-txns-nonfinal, BIP68)".into()));
+                    }
                 }
-                if witness_on {
-                    cost += sigops::witness_sig_op_count(&inp.script_sig, s.script, &inp.witness, p2sh) as u64;
+                // Signature-operation cost: P2SH redeem scripts (GetP2SHSigOpCount) and witness scripts
+                // (CountWitnessSigOps), then the scripts.
+                let p2sh = on & SCRIPT_P2SH != 0;
+                for (inp, s) in tx.inputs.iter().zip(sp) {
+                    if p2sh && sigops::is_p2sh(s.script) {
+                        cost += 4 * sigops::p2sh_sig_op_count(&inp.script_sig) as u64;
+                    }
+                    if witness_on {
+                        cost += sigops::witness_sig_op_count(&inp.script_sig, s.script, &inp.witness, p2sh) as u64;
+                    }
+                }
+                if cost > 4 * br.max_sigops as u64 {
+                    return Err(broke(&tx.txid, format!("signature-operation cost {cost}, over {} (bad-blk-sigops)", 4 * br.max_sigops as u64)));
+                }
+                if let Some(flags) = scripts {
+                    let prefix = (br.sighash_prefix)(height);
+                    let mut from = 0;
+                    while from < sp.len() {
+                        let to = (from + SCRIPT_CHUNK).min(sp.len());
+                        jobs.push(ScriptJob { tx: i, from, to, flags, prefix });
+                        from = to;
+                    }
                 }
             }
-            if cost > 4 * br.max_sigops as u64 {
-                return Err(broke(&tx.txid, format!("signature-operation cost {cost}, over {} (bad-blk-sigops)", 4 * br.max_sigops as u64)));
-            }
-            if let Some(flags) = scripts {
-                let prefix = (br.sighash_prefix)(height);
-                let bytes = script_bytes(tx);
-                // Taproot needs every coin the transaction spends.
-                let all: Vec<bitcoinconsensus::Utxo> = if flags & SCRIPT_TAPROOT != 0 {
-                    sp.iter().map(|s| bitcoinconsensus::Utxo { script_pubkey: s.script.as_ptr(), script_pubkey_len: s.script.len() as u32, value: s.value as i64 }).collect()
-                } else {
-                    Vec::new()
-                };
-                let outs = (flags & SCRIPT_TAPROOT != 0).then_some(&all[..]);
-                for (i, s) in sp.iter().enumerate() {
-                    if let Err(e) = bitcoinconsensus::verify_with_flags_and_sighash_prefix(s.script, s.value, &bytes, outs, i, flags, prefix) {
-                        return Err(broke(&tx.txid, format!("input {i}: script check failed ({e:?}) (mandatory-script-verify-flag-failed)")));
+            if let Some(vr) = &vr {
+                let mut out = 0u128;
+                for o in &tx.outputs {
+                    out += o.value as u128;
+                    if o.value > vr.max_money || out > vr.max_money as u128 {
+                        return Err(broke(&tx.txid, "output values out of range (bad-txns-vout-toolarge)".into()));
+                    }
+                }
+                if tx.is_coinbase() {
+                    coinbase_out = out;
+                } else if pos && i == 1 {
+                    (stake_in, stake_out) = (value_in, out);
+                } else if !tx.is_coinstake() {
+                    // Litecoin's HogEx too: MWEB fees leave the extension block through it (what
+                    // it spends, the pool and the peg-ins, less what it pays, the new pool and the
+                    // peg-outs), and the coinbase may claim them.
+                    if value_in < out {
+                        return Err(broke(&tx.txid, format!("pays out {out} but spends {value_in} (bad-txns-in-belowout)")));
+                    }
+                    fees += value_in - out;
+                    if fees > vr.max_money as u128 {
+                        return Err(broke(&tx.txid, "fees out of range (bad-txns-fee-outofrange)".into()));
                     }
                 }
             }
         }
-        if let Some(vr) = &vr {
-            let mut out = 0u128;
-            for o in &tx.outputs {
-                out += o.value as u128;
-                if o.value > vr.max_money || out > vr.max_money as u128 {
-                    return Err(broke(&tx.txid, "output values out of range (bad-txns-vout-toolarge)".into()));
-                }
-            }
-            if tx.is_coinbase() {
-                coinbase_out = out;
-            } else if pos && i == 1 {
-                (stake_in, stake_out) = (value_in, out);
-            } else if !tx.is_coinstake() {
-                // Litecoin's HogEx too: MWEB fees leave the extension block through it (what
-                // it spends, the pool and the peg-ins, less what it pays, the new pool and the
-                // peg-outs), and the coinbase may claim them.
-                if value_in < out {
-                    return Err(broke(&tx.txid, format!("pays out {out} but spends {value_in} (bad-txns-in-belowout)")));
-                }
-                fees += value_in - out;
-                if fees > vr.max_money as u128 {
-                    return Err(broke(&tx.txid, "fees out of range (bad-txns-fee-outofrange)".into()));
-                }
-            }
-        }
+        Ok(())
+    };
+    let read = each_tx();
+    if let Some(b) = run_scripts(blk, spent, &jobs) {
+        return Err(b);
     }
+    read?;
     let mut info = Info { coinbase_out, limit: None };
     if let Some(vr) = &vr {
         let subsidy = (vr.subsidy)(height, &blk.header.prev);
@@ -277,6 +282,102 @@ pub fn check_info(params: &ChainParams, blk: &Block, height: u32, spent: &[Vec<S
         }
     }
     Ok(info)
+}
+
+// ---------------- scripts on all cores ----------------
+
+/// Inputs per script job: small enough that one big transaction spreads over the cores, big
+/// enough that taking a job costs nothing next to checking it.
+const SCRIPT_CHUNK: usize = 16;
+
+/// Below this many inputs a block's scripts are checked on the calling thread.
+const SCRIPT_PARALLEL_MIN: usize = 32;
+
+/// Some of one transaction's inputs (`from..to`) to run the scripts of.
+#[derive(Debug, Clone, Copy)]
+struct ScriptJob {
+    tx: usize,
+    from: usize,
+    to: usize,
+    flags: u32,
+    prefix: Option<&'static [u8; 32]>,
+}
+
+/// Threads that check scripts: ARCADE_SCRIPT_THREADS, or every core but one (at least one).
+pub fn script_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("ARCADE_SCRIPT_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|n| *n > 0)
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1).max(1)))
+    })
+}
+
+/// One job's inputs, in order: the first that fails, as the block's reason.
+fn run_job(blk: &Block, spent: &[Vec<Spent>], j: &ScriptJob) -> Result<(), Broken> {
+    let (tx, sp) = (&blk.txs[j.tx], &spent[j.tx]);
+    let bytes = script_bytes(tx);
+    // Taproot needs every coin the transaction spends.
+    let all: Vec<bitcoinconsensus::Utxo> = if j.flags & SCRIPT_TAPROOT != 0 {
+        sp.iter().map(|s| bitcoinconsensus::Utxo { script_pubkey: s.script.as_ptr(), script_pubkey_len: s.script.len() as u32, value: s.value as i64 }).collect()
+    } else {
+        Vec::new()
+    };
+    let outs = (j.flags & SCRIPT_TAPROOT != 0).then_some(&all[..]);
+    for i in j.from..j.to {
+        let s = &sp[i];
+        // The signature-hash prefix is set per call on the thread that runs it.
+        if let Err(e) = bitcoinconsensus::verify_with_flags_and_sighash_prefix(s.script, s.value, &bytes, outs, i, j.flags, j.prefix) {
+            return Err(Broken { tx: tx.txid, why: format!("input {i}: script check failed ({e:?}) (mandatory-script-verify-flag-failed)") });
+        }
+    }
+    Ok(())
+}
+
+/// Run the queued scripts, on several threads when there are enough of them. The answer is the
+/// first failing input in block order, as checking them one at a time would give: jobs are
+/// taken in order, a failure keeps the earliest job that failed, and jobs after it are skipped.
+fn run_scripts(blk: &Block, spent: &[Vec<Spent>], jobs: &[ScriptJob]) -> Option<Broken> {
+    let threads = if BLOCKS_IN_PARALLEL.get() { 1 } else { script_threads() };
+    run_scripts_on(blk, spent, jobs, threads)
+}
+
+thread_local! {
+    /// Set on a thread that is one of several checking whole blocks at once (replay): its
+    /// blocks' scripts stay on it, as the cores are already in use.
+    static BLOCKS_IN_PARALLEL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn run_scripts_on(blk: &Block, spent: &[Vec<Spent>], jobs: &[ScriptJob], threads: usize) -> Option<Broken> {
+    let inputs: usize = jobs.iter().map(|j| j.to - j.from).sum();
+    let threads = threads.min(jobs.len());
+    if threads <= 1 || inputs < SCRIPT_PARALLEL_MIN {
+        return jobs.iter().find_map(|j| run_job(blk, spent, j).err());
+    }
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    // The index of the earliest job that failed so far (usize::MAX: none), and its reason.
+    let first_bad = AtomicUsize::new(usize::MAX);
+    let reason: std::sync::Mutex<Option<(usize, Broken)>> = std::sync::Mutex::new(None);
+    let work = || loop {
+        let k = next.fetch_add(1, Ordering::Relaxed);
+        if k >= jobs.len() || k > first_bad.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Err(b) = run_job(blk, spent, &jobs[k]) {
+            let mut r = reason.lock().unwrap_or_else(|e| e.into_inner());
+            if r.as_ref().is_none_or(|(at, _)| k < *at) {
+                *r = Some((k, b));
+                first_bad.fetch_min(k, Ordering::Relaxed);
+            }
+        }
+    };
+    std::thread::scope(|sc| {
+        for _ in 1..threads {
+            sc.spawn(work);
+        }
+        work();
+    });
+    reason.into_inner().unwrap_or_else(|e| e.into_inner()).map(|(_, b)| b)
 }
 
 // ---------------- watching rules not switched on ----------------
@@ -454,6 +555,7 @@ pub fn replay(db: &crate::ChainDb, params: &ChainParams, from: u32, to: u32, thr
     std::thread::scope(|sc| {
         for _ in 0..threads.max(1) {
             sc.spawn(|| {
+                BLOCKS_IN_PARALLEL.set(threads > 1);
                 // Blocks read for their transactions, by block number (cleared when big).
                 let mut blocks: HashMap<u32, Option<Arc<Block>>> = HashMap::new();
                 let mut by_number = |b: u32| -> Option<Arc<Block>> {
@@ -568,7 +670,9 @@ pub fn replay(db: &crate::ChainDb, params: &ChainParams, from: u32, to: u32, thr
 
 #[cfg(test)]
 mod tests {
-    use super::{Broken, Info, Watch};
+    use super::{run_scripts_on, Broken, Info, ScriptJob, Spent, Watch, SCRIPT_CHUNK};
+    use arcade_chain::params::SCRIPT_P2SH;
+    use arcade_chain::Block;
     use arcade_chain::luckycoin;
     use arcade_chain::Hash256;
 
@@ -587,6 +691,78 @@ mod tests {
         assert_eq!((w.checked, w.full_reward, w.broken), (20, 10, 1));
         assert_eq!(w.first[0].0, 20);
         assert_eq!(Watch::decode(&w.encode()), Some(w));
+    }
+
+    /// A block of a coinbase and `txs` transactions of `ins` inputs each, every input with an
+    /// empty scriptSig (the coin's script alone decides).
+    fn block_of(txs: usize, ins: usize) -> Block {
+        fn tx(b: &mut Vec<u8>, ins: &[([u8; 32], u32)]) {
+            b.extend(1u32.to_le_bytes());
+            b.push(ins.len() as u8);
+            for (h, n) in ins {
+                b.extend(h);
+                b.extend(n.to_le_bytes());
+                b.push(if *n == u32::MAX { 2 } else { 0 });
+                if *n == u32::MAX {
+                    b.extend([0x51, 0x51]);
+                }
+                b.extend(u32::MAX.to_le_bytes());
+            }
+            b.push(1);
+            b.extend(1u64.to_le_bytes());
+            b.extend([1, 0x51]);
+            b.extend(0u32.to_le_bytes());
+        }
+        let mut b = vec![0u8; 80];
+        b[0] = 1;
+        b.push((txs + 1) as u8);
+        tx(&mut b, &[([0; 32], u32::MAX)]);
+        for t in 0..txs {
+            let ins: Vec<([u8; 32], u32)> = (0..ins).map(|i| { let mut h = [7u8; 32]; h[0] = t as u8; h[1] = i as u8; (h, i as u32) }).collect();
+            tx(&mut b, &ins);
+        }
+        Block::parse(&b).unwrap()
+    }
+
+    fn jobs_for(spent: &[Vec<Spent>]) -> Vec<ScriptJob> {
+        let mut jobs = Vec::new();
+        for (t, sp) in spent.iter().enumerate() {
+            let mut from = 0;
+            while from < sp.len() {
+                let to = (from + SCRIPT_CHUNK).min(sp.len());
+                jobs.push(ScriptJob { tx: t, from, to, flags: SCRIPT_P2SH, prefix: None });
+                from = to;
+            }
+        }
+        jobs
+    }
+
+    /// Scripts on many threads give the answer checking one input at a time gives: nothing for
+    /// a good block, and for a bad one the first failing input in block order.
+    #[test]
+    fn scripts_on_all_cores_answer_as_one_at_a_time() {
+        let blk = block_of(12, 40);
+        let (yes, no): (&[u8], &[u8]) = (&[0x51], &[0x00]);
+        let spent_with = |bad: &[(usize, usize)]| -> Vec<Vec<Spent>> {
+            (0..blk.txs.len()).map(|t| if t == 0 { Vec::new() } else {
+                (0..40).map(|i| Spent { value: 1, script: if bad.contains(&(t, i)) { no } else { yes }, height: 1, coinbase: false, pegout: false }).collect()
+            }).collect()
+        };
+        let good = spent_with(&[]);
+        for threads in [1, 2, 8, 32] {
+            assert!(run_scripts_on(&blk, &good, &jobs_for(&good), threads).is_none(), "{threads} threads");
+        }
+        // Failures late in tx 9, early in tx 5 and in the middle of tx 5: the first in block order wins.
+        let bad = spent_with(&[(9, 1), (5, 37), (5, 20)]);
+        for threads in [1, 2, 8, 32] {
+            let b = run_scripts_on(&blk, &bad, &jobs_for(&bad), threads).expect("fails");
+            assert_eq!(b.tx, blk.txs[5].txid, "{threads} threads");
+            assert!(b.why.starts_with("input 20:"), "{threads} threads: {}", b.why);
+        }
+        // The last input of the block alone.
+        let last = spent_with(&[(12, 39)]);
+        let b = run_scripts_on(&blk, &last, &jobs_for(&last), 8).expect("fails");
+        assert_eq!((b.tx, b.why.starts_with("input 39:")), (blk.txs[12].txid, true));
     }
 
     fn hex(s: &str) -> Vec<u8> {

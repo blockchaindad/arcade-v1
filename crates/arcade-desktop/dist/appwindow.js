@@ -4,7 +4,9 @@
 // window opened, never what a message says.
 (() => {
   const q = new URLSearchParams(location.search);
-  const frame = q.get("frame") || "";
+  // The app's page and its key (apps.launch gives "<page>?pass=<key>"): asked for with the key, the arcade serves
+  // the page with its pass for the page API; a bare request for the page gets none.
+  const [frame, passKey] = (() => { const f = q.get("frame") || ""; const m = /^(.*)\?pass=([0-9a-f]{32})$/.exec(f); return m ? [m[1], m[2]] : [f, ""]; })();
   const id = q.get("id") || "";
   document.title = q.get("title") || "App";
   const el = document.getElementById("app");
@@ -87,7 +89,9 @@
     async llm(m) {
       if (m.op === "offers") {
         const list = await api("llm.offers");
-        return { offers: list.map((o) => ({
+        // Chat models only here: voices are for OpenAI programs and the Models tab.
+        const chat = list.map((o) => ({ ...o, models: o.models.filter((x) => x.kind !== "speech") })).filter((o) => o.models.length);
+        return { offers: chat.map((o) => ({
           seller: o.seller, here: o.here, name: o.name || "", tag: o.tag || "", max_out: o.max_out,
           free: o.models.every((x) => x.free), models: o.models.map((x) => ({ id: x.id })),
           prices: o.models.map((x) => ({ leg: "arctest", label: "ARCADE per million tokens", model: x.id, in: x.in, out: x.out })),
@@ -651,17 +655,25 @@
       const outs = document.createElement("ul"); outs.className = "outs";
       for (const o of pv.outputs) { const li = document.createElement("li"); li.textContent = o.data ? "data (the arcade record)" : `${pep(o.value)} → ${o.address}${o.mine ? " (back to you)" : ""}`; outs.append(li); }
       const lines = [`${from} asks to send ${pv.what} to ${pv.to_tag ? "@" + pv.to_tag + " " : ""}${pv.to}.`];
+      // The app's card is one arcade's word (a chain whose ledger isn't here): said above Approve, not hidden.
+      if (who.caution) { const c = document.createElement("span"); c.className = "caution"; c.textContent = "⚠ " + who.caution; lines.push(c); }
       if (pv.note) lines.push(`“${pv.note}”`);
       lines.push(outs, `Network fee: ${pep(pv.fee)}`);
+      // One arcade alone (or none) vouched that its coins carry no inscription: said above Approve.
+      if (pv.caution && pv.caution.note && pv.caution.level !== "green") {
+        const c = document.createElement("div"); c.className = "caution " + pv.caution.level; c.setAttribute("role", "alert"); c.textContent = pv.caution.note;
+        lines.push(c);
+      }
       const yes = await card("Approve this send?", lines, "Approve and send", "Refuse");
       await api(yes ? "wallet.approve" : "wallet.deny", { id: r.id });
     } catch (_) { /* answered elsewhere */ }
     finally { showing = null; }
   }, 1500);
 
-  // The page with its pass for the page API (a new address, so a copy cached before passes isn't used), and the place
+  // The page with its pass for the page API (asked for with its key; "?pass=" also makes a new address, so a copy
+  // cached before passes isn't used), and the place
   // to open it at when the window was asked for one (`at`: a plain #/ route, as Arcade Git's #/@owner/name).
   const at = q.get("at") || "";
-  el.src = frame + "?pass=1" + (/^#\/[A-Za-z0-9@._\/-]{0,200}$/.test(at) ? at : "");
+  el.src = frame + "?pass=" + (passKey || "1") + (/^#\/[A-Za-z0-9@._\/-]{0,200}$/.test(at) ? at : "");
   window.arcadeApp = { id, frame, el };
 })();
