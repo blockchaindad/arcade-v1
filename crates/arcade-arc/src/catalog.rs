@@ -16,6 +16,10 @@
 //!   is confirmed with **more than a tenth** of the draw weight, so a chain kept by few arcades is listed too. Such a
 //!   segment is in its **challenge window** for [`CHALLENGE_WINDOW`] blocks: listed, so fraud proofs and reveal demands
 //!   can reach it, but no replica of it registers (so it earns nothing) until the window is over.
+//! - From rules version 4 (ARCADE issue #14, testnet only: mainnet's schedule has no version 4, so it keeps the
+//!   numbers above), **every family** confirms with more than a tenth, the index families too, with the same challenge
+//!   window when it is less than half. On today's testnet (two genesis writers of 1 GiB each) one writer alone lists
+//!   an index segment; that is intended.
 //! - A removed entry is never taken again.
 //!
 //! What this can't check is whether the root is the right one: that is what the attesters
@@ -23,17 +27,18 @@
 
 use crate::block::{self, Attest, BlockError, CatalogEntry, Item, Key};
 use crate::merkle::Hash;
-use crate::params::Net;
+use crate::params::{self, Net};
 use crate::segment;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Blocks a segment confirmed by a tenth of the weight waits before replicas of it register (§15 step 11).
 pub const CHALLENGE_WINDOW: u64 = 100;
 
-/// Whether a family's segments confirm with a tenth of the draw weight at `height` (rules version 3 on): those a fraud
-/// proof can take out (blocks; coins).
+/// Whether a family's segments confirm with a tenth of the draw weight at `height`: from rules version 3 those a fraud
+/// proof can take out (blocks; coins), from version 4 (#14, testnet only; mainnet keeps half for the index families)
+/// every family, the index families too. Below a half such a segment has its challenge window ([`Listed::settled`]).
 pub fn light_family(net: &Net, family: u8, height: u64) -> bool {
-    net.rules_at(height) >= 3 && (family == segment::FAMILY_BLOCKS || family == segment::FAMILY_COINS)
+    params::rules_v4(net, height) || net.rules_at(height) >= 3 && (family == segment::FAMILY_BLOCKS || family == segment::FAMILY_COINS)
 }
 
 /// The draw weights the catalog counts with.
@@ -260,7 +265,7 @@ impl Catalog {
     }
 
     /// Confirm the waiting entry `id` if more than half of all draw weight is behind it (a tenth, for the families
-    /// fraud proofs reach from rules version 3).
+    /// fraud proofs reach from rules version 3, and for every family from version 4).
     fn settle(&mut self, id: &Hash, height: u64, weights: &impl Weights, undo: &mut Undo) {
         let c = &self.waiting[id];
         let behind: u128 = c.behind.iter().map(|key| weights.weight(key) as u128).sum();
@@ -521,6 +526,56 @@ pub(crate) mod tests {
         let mut c3 = Catalog::new(NET3, FULL);
         c3.apply(&[Item::CatalogEntry(e)], 6, &Held(vec![(key(1), 51), (key(2), 49)])).unwrap();
         assert!(c3.get(&id).is_some_and(|l| !l.light && l.settled(6)));
+    }
+
+    #[test]
+    fn from_rules_version_4_a_tenth_lists_index_segments_too() {
+        const NET4: Net = Net { rules: &[(3, 0), (4, 10)], ..TESTNET };
+        let index = |who: u8, root: u8| {
+            let mut e = entry_on(&NET4, &secret(who), "doge", 0, 0, just_full(1), root);
+            e.family = segment::FAMILY_ORD;
+            e.sig = block::sign(&secret(who), &e.message(&NET4));
+            e
+        };
+        let tenth = Held(vec![(key(1), 10), (key(2), 90)]);
+        let over = Held(vec![(key(1), 11), (key(2), 89)]);
+        let e = index(1, 1);
+        let id = e.segment(&NET4);
+        // From version 4 (height 10): a tenth isn't enough, just over a tenth lists it, in its challenge window.
+        let mut c = Catalog::new(NET4, FULL);
+        c.apply(&[Item::CatalogEntry(e.clone())], 10, &tenth).unwrap();
+        assert!(c.get(&id).is_none() && c.waiting(&id).is_some());
+        let mut c = Catalog::new(NET4, FULL);
+        c.apply(&[Item::CatalogEntry(e.clone())], 10, &over).unwrap();
+        let l = c.get(&id).unwrap();
+        assert!(l.light && !l.settled(10 + CHALLENGE_WINDOW - 1) && l.settled(10 + CHALLENGE_WINDOW));
+        // Before it (height 9) an index family still needs more than half: 49 of 100 waits, 51 lists it, no window.
+        let mut c = Catalog::new(NET4, FULL);
+        c.apply(&[Item::CatalogEntry(e.clone())], 9, &over).unwrap();
+        assert!(c.get(&id).is_none());
+        let mut c = Catalog::new(NET4, FULL);
+        c.apply(&[Item::CatalogEntry(e.clone())], 9, &Held(vec![(key(1), 49), (key(2), 51)])).unwrap();
+        assert!(c.get(&id).is_none());
+        c.apply(&[Item::CatalogEntry(index(2, 2))], 9, &Held(vec![(key(1), 49), (key(2), 51)])).unwrap();
+        assert!(c.get(&index(2, 2).segment(&NET4)).is_some_and(|l| !l.light));
+        // Blocks keep what version 3 gave them: more than a tenth, with the window; a tenth waits.
+        let b = entry_on(&NET4, &secret(1), "doge", 0, 0, just_full(1), 3);
+        let bid = b.segment(&NET4);
+        let mut c = Catalog::new(NET4, FULL);
+        c.apply(&[Item::CatalogEntry(b.clone())], 10, &tenth).unwrap();
+        assert!(c.get(&bid).is_none());
+        c.apply(&[Item::Attest(attest_on(&NET4, &secret(2), bid))], 11, &tenth).unwrap();
+        assert!(c.get(&bid).is_some_and(|l| !l.light), "everybody behind it: more than half");
+        let mut c = Catalog::new(NET4, FULL);
+        c.apply(&[Item::CatalogEntry(b)], 10, &over).unwrap();
+        assert!(c.get(&bid).is_some_and(|l| l.light));
+        // Which families a tenth lists, by version; mainnet has no version 4, so its index families need half.
+        for f in segment::FAMILIES.iter().copied() {
+            let raw = f == segment::FAMILY_BLOCKS || f == segment::FAMILY_COINS;
+            assert_eq!(light_family(&NET4, f, 9), raw);
+            assert!(light_family(&NET4, f, 10));
+            assert!((0..1_000_000).step_by(997).all(|h| !light_family(&MAINNET, f, h) || raw));
+        }
     }
 
     #[test]
