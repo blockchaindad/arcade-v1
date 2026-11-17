@@ -1745,7 +1745,8 @@ mod tests {
     use crate::sloth::{DATA_LEAF, SEALED_LEAF};
     use ed25519_dalek::SigningKey;
 
-    const NET: Net = TESTNET;
+    // The testnet's rules before version 4 (its schedule now has v4 from block 1,000): tests that want v4 make their own.
+    const NET: Net = Net { rules: &[(3, 0)], ..TESTNET };
 
     fn key(who: u8) -> (SigningKey, Key) {
         let s = SigningKey::from_bytes(&[who; 32]);
