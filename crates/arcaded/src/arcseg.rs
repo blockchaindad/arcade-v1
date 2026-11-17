@@ -322,11 +322,11 @@ pub fn root_of(node: &Node, p: &ChainParams, family: u8, first: u64, last: u64) 
     Some((bytes, root))
 }
 
-/// The listed chains of `net` this arcade keeps in full.
-pub fn kept(node: &Node, net: &Net) -> Vec<&'static ChainParams> {
-    net.listed
-        .iter()
-        .filter_map(|k| match crate::arcsvc::defined().filter(|d| d.key == *k) {
+/// The listed chains of `net` this arcade keeps in full, as listed for the block at `height` (the next block's: a
+/// chain listed from a rules version is offered, sealed and watched from its height on).
+pub fn kept(node: &Node, net: &Net, height: u64) -> Vec<&'static ChainParams> {
+    net.listed_at(height)
+        .filter_map(|k| match crate::arcsvc::defined().filter(|d| d.key == k) {
             // The ARCADE chain itself, while it runs here.
             Some(d) => crate::arcsvc::runs(d).then_some(d),
             None => node.chain_params(k).filter(|p| node.mode_of(p.key).as_deref() == Some("full") && crate::chains::kept(node, p)),
@@ -336,8 +336,8 @@ pub fn kept(node: &Node, net: &Net) -> Vec<&'static ChainParams> {
 
 /// One round: measure, then offer the next segment of each kept chain nobody offered, and
 /// attest every waiting entry this arcade made the same root for. `catalog` is the chain's
-/// now; `weight` this arcade's draw weight.
-pub fn round(node: &Node, net: &Net, catalog: &Catalog, weight: u64) {
+/// now; `weight` this arcade's draw weight; `height` the next block's.
+pub fn round(node: &Node, net: &Net, catalog: &Catalog, weight: u64, height: u64) {
     let me = node.identity.verifying_key().to_bytes();
     // Items the chain is past: an entry for heights already listed or no longer next, an
     // attestation of an entry that no longer waits (and isn't waiting here either).
@@ -351,7 +351,7 @@ pub fn round(node: &Node, net: &Net, catalog: &Catalog, weight: u64) {
         .collect();
     forget(&stale);
     let mut more = false;
-    for p in kept(node, net) {
+    for p in kept(node, net, height) {
         for family in families(node, p) {
             more |= measure(node, p, family, 50);
             if weight == 0 {
@@ -432,13 +432,13 @@ const FREE_FLOOR: u64 = 2_000_000_000;
 /// segment that is lost or set aside costs no data. When a range ends with a full segment's bytes in, the table goes on the end
 /// and the segment becomes a replica to register. Blocks first, then each index, per coin; one run at a time, in the
 /// background.
-pub fn auto_seal(node: &Node, net: &Net, catalog: &Catalog) {
+pub fn auto_seal(node: &Node, net: &Net, catalog: &Catalog, height: u64) {
     if crate::arcseal::sealing().is_some() {
         return;
     }
     // Every chain and family with work this round, each in turn: the ARCADE chain has newly settled blocks almost
     // every round, and taking only the first with work starved the families after it.
-    let work: Vec<(&'static ChainParams, u8)> = kept(node, net)
+    let work: Vec<(&'static ChainParams, u8)> = kept(node, net, height)
         .into_iter()
         .filter(|p| crate::arcsvc::runs(p) || earn_on(node, p.key))
         .flat_map(|p| families(node, p).into_iter().filter(|f| seal_work(node, net, p, *f).is_some_and(|(next, settled)| next <= settled)).map(move |f| (p, f)))
@@ -668,8 +668,8 @@ pub(crate) fn payout_of(node: &Node, net: &Net, p: &ChainParams) -> Option<block
 }
 
 /// What the Chains & Coins row and arc.status say about it.
-pub fn status(node: &Node, net: &Net, full: u64) -> serde_json::Value {
-    let chains: Vec<serde_json::Value> = kept(node, net)
+pub fn status(node: &Node, net: &Net, full: u64, height: u64) -> serde_json::Value {
+    let chains: Vec<serde_json::Value> = kept(node, net, height)
         .iter()
         .map(|p| {
             let fams: Vec<serde_json::Value> = families(node, p)

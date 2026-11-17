@@ -205,7 +205,7 @@ impl Catalog {
     }
 
     fn offer(&mut self, e: &CatalogEntry, height: u64, weights: &impl Weights, undo: &mut Undo) -> Result<(), BlockError> {
-        if !self.net.listed.contains(&e.chain.as_str()) {
+        if !self.net.is_listed_at(&e.chain, height) {
             return Err(no("catalog entry: not a listed chain"));
         }
         if !segment::FAMILIES.contains(&e.family) {
@@ -305,7 +305,7 @@ impl Catalog {
         let mut sorted: Vec<&CatalogEntry> = entries.iter().collect();
         sorted.sort_by(|a, b| line_of(a).cmp(&line_of(b)).then(a.first.cmp(&b.first)));
         for e in sorted {
-            if !self.net.listed.contains(&e.chain.as_str()) || !segment::FAMILIES.contains(&e.family) || !segment::whole_ranges(e.first, e.last) {
+            if !self.net.is_listed_at(&e.chain, 0) || !segment::FAMILIES.contains(&e.family) || !segment::whole_ranges(e.first, e.last) {
                 return Err(no("genesis catalog: not a listed chain, family or whole ranges"));
             }
             let least = (e.last - e.first + 1).checked_mul(segment::ROW).and_then(|table| table.checked_add(self.full));
@@ -717,5 +717,25 @@ pub(crate) mod tests {
         assert_eq!(c, holed);
         c.undo(u);
         assert_eq!(c, whole);
+    }
+
+    #[test]
+    fn a_shibacoin_segment_is_listed_from_rules_version_4_on_the_testnet() {
+        const NET4: Net = Net { rules: &[(1, 0), (2, 1), (3, 2), (4, 100)], ..TESTNET };
+        let e = entry_on(&NET4, &secret(1), "shic", 0, 0, just_full(1), 1);
+        let offer = |c: &mut Catalog, height: u64| c.apply(&[Item::CatalogEntry(e.clone())], height, &held()).map(|_| ());
+        // Below the version 4 height Shibacoin isn't listed: the entry is refused and changes nothing.
+        let mut c = Catalog::new(NET4, FULL);
+        assert_eq!(offer(&mut c, 99), Err(no("catalog entry: not a listed chain")));
+        assert_eq!(c, Catalog::new(NET4, FULL));
+        // From it, the same entry is taken.
+        offer(&mut c, 100).unwrap();
+        let id = e.segment(&NET4);
+        assert!(c.waiting(&id).is_some() || c.get(&id).is_some());
+        // Mainnet never lists it, whatever the height.
+        let main = Net { rules: &[(2, 0), (4, 100)], ..MAINNET };
+        let mut m = Catalog::new(main, FULL);
+        let e = entry_on(&main, &secret(1), "shic", 0, 0, just_full(1), 1);
+        assert_eq!(m.apply(&[Item::CatalogEntry(e)], 100, &held()).map(|_| ()), Err(no("catalog entry: not a listed chain")));
     }
 }

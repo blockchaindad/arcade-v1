@@ -366,6 +366,11 @@ impl Svc {
     pub fn registry(&self) -> Registry {
         self.st.lock().unwrap().chain.storage().clone()
     }
+
+    /// The next block's height (what views and offers judge the listed chains at, `Net::listed_at`).
+    pub fn next_height(&self) -> u64 {
+        self.st.lock().unwrap().chain.tip().height + 1
+    }
 }
 
 pub struct Svc {
@@ -1363,12 +1368,12 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
                 if s2.stop.load(Ordering::Relaxed) {
                     return;
                 }
-                let (reg, weight) = {
+                let (reg, weight, next) = {
                     let st = s2.st.lock().unwrap();
-                    (st.chain.storage().clone(), st.chain.storage().weight(&me))
+                    (st.chain.storage().clone(), st.chain.storage().weight(&me), st.chain.tip().height + 1)
                 };
-                crate::arcseg::round(&n, &s2.net, reg.catalog(), weight);
-                crate::arcseg::auto_seal(&n, &s2.net, reg.catalog());
+                crate::arcseg::round(&n, &s2.net, reg.catalog(), weight, next);
+                crate::arcseg::auto_seal(&n, &s2.net, reg.catalog(), next);
                 std::thread::sleep(Duration::from_secs(if crate::arcseg::busy() { 2 } else { 60 }));
             })
             .map_err(|e| e.to_string())?;
@@ -2544,8 +2549,9 @@ pub fn catalog(node: &Node) -> Result<Value, String> {
     let cat = st.chain.storage().catalog();
     let hex = |h: &[u8; 32]| hex::encode(h);
     let entry = |e: &arcade_arc::block::CatalogEntry| json!({"chain": e.chain, "family": e.family, "first": e.first, "last": e.last, "bytes": e.bytes, "root": hex(&e.root), "poster": hex(&e.poster)});
+    let next = st.chain.tip().height + 1;
     let mut listed = Vec::new();
-    for chain in svc.net.listed {
+    for chain in svc.net.listed_at(next) {
         for &family in arcade_arc::segment::FAMILIES {
             for (_, _, l) in cat.spans(chain, family) {
                 if let Some(l) = l {
@@ -2566,7 +2572,7 @@ pub fn catalog(node: &Node) -> Result<Value, String> {
             v
         })
         .collect();
-    Ok(json!({"segment_bytes": cat.segment_bytes(), "listed": listed, "waiting": waiting, "here": crate::arcseg::status(node, &svc.net, cat.segment_bytes())}))
+    Ok(json!({"segment_bytes": cat.segment_bytes(), "listed": listed, "waiting": waiting, "here": crate::arcseg::status(node, &svc.net, cat.segment_bytes(), next)}))
 }
 
 /// `arc.seal {segment?}`: seal a confirmed segment (its id; else the first listed one of a
@@ -2582,7 +2588,7 @@ pub fn seal(node: &Arc<Node>, req: &Value) -> Result<Value, String> {
                 let id: arcade_arc::merkle::Hash = hex::decode(h).ok().and_then(|b| b.try_into().ok()).ok_or("segment: 64 hex characters")?;
                 cat.get(&id).cloned().ok_or("no such segment is listed")?
             }
-            None => crate::arcseg::kept(node, &svc.net)
+            None => crate::arcseg::kept(node, &svc.net, st.chain.tip().height + 1)
                 .iter()
                 .find_map(|p| cat.spans(p.key, arcade_arc::segment::FAMILY_BLOCKS).find_map(|(_, _, l)| l.filter(|l| !have.contains(&l.id)).cloned()))
                 .ok_or("no listed segment of a chain kept here is left to seal")?,
@@ -2647,8 +2653,9 @@ pub fn sealing(node: &Node, req: &Value) -> Result<Value, String> {
     let st = svc.st.lock().unwrap();
     let reg = st.chain.storage();
     let cat = reg.catalog();
-    let listed = svc.net.listed.contains(&key);
-    let kept = crate::arcseg::kept(node, &svc.net).iter().any(|p| p.key == key);
+    let next = st.chain.tip().height + 1;
+    let listed = svc.net.is_listed_at(key, next);
+    let kept = crate::arcseg::kept(node, &svc.net, next).iter().any(|p| p.key == key);
     let mut rows = Vec::new();
     for (first, last, l) in cat.spans(key, arcade_arc::segment::FAMILY_BLOCKS) {
         let Some(l) = l else { continue };
@@ -2707,10 +2714,12 @@ pub fn earn(node: &Node, req: &Value) -> Result<Value, String> {
     earn_view(node, p)
 }
 
-/// Whether a coin's data can earn on the ARCADE network this arcade knows: one of its listed chains (params.rs
-/// `listed`; adding one is a rules version).
+/// Whether a coin's data can earn on the ARCADE network this arcade knows: one of its listed chains for the next block
+/// (params.rs `Net::listed_at`; adding one is a rules version, so it flips at that version's height). Before block 0
+/// (a defined network not running yet) block 0's list. Never call with the chain's state locked.
 fn paid_here(p: &ChainParams) -> bool {
-    svc().map(|s| s.net).or_else(|| defined_net().map(|d| d.0)).is_none_or(|n| n.listed.contains(&p.key))
+    let at = svc().map(|s| (s.net, s.next_height())).or_else(|| defined_net().map(|d| (d.0, 0)));
+    at.is_none_or(|(n, h)| n.is_listed_at(p.key, h))
 }
 
 /// `explorer.earn {chain?}` (/r/explorer/earn): what arc.earn shows, read only, for the Explorer and apps; without a
