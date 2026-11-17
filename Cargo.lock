@@ -156,6 +156,7 @@ dependencies = [
  "arcade-store",
  "bitcoinconsensus",
  "hex",
+ "libmdbx",
  "tempfile",
  "thiserror 1.0.69",
 ]
