@@ -1270,7 +1270,11 @@ pub fn define_text(node: &Arc<Node>, text: &str) -> Result<(), String> {
         let _changing = CHANGING.lock().unwrap();
         run(node, def)?;
     } else {
-        eprintln!("arc: the ARCADE test chain {} (block 0 {genesis}) can be installed in Chains & Coins", net.key);
+        // The home chain (HOMECHAIN.md phase 3, Martin 2026-11-17): installed by itself, on a new arcade and on one
+        // updating from a release before, and it stays.
+        install(node)?;
+        eprintln!("arc: the ARCADE test chain {} (block 0 {genesis}) installed: it is the home chain", net.key);
+        let _ = node.app.event("chains", &format!("installed {}: it is the home chain (@tags, profiles, posts and messages live there)", def.params.name));
     }
     Ok(())
 }
@@ -1285,7 +1289,7 @@ pub fn install(node: &Arc<Node>) -> Result<(), String> {
     let def = DEF.get().ok_or("this arcade knows no ARCADE chain")?;
     let _changing = CHANGING.lock().unwrap();
     if svc().is_some() {
-        return Err(format!("{} is already installed", def.params.name));
+        return Ok(()); // installed already (by itself, as the home chain)
     }
     if REMOVING.load(Ordering::Relaxed) {
         return Err(format!("{} is still being removed; try again in a moment", def.params.name));
@@ -1300,6 +1304,10 @@ pub fn install(node: &Arc<Node>) -> Result<(), String> {
 /// Coins on it are not lost: they are on the chain, and the wallet's keys stay.
 pub fn remove(node: &Arc<Node>) -> Result<(), String> {
     let def = DEF.get().ok_or("this arcade knows no ARCADE chain")?;
+    // The home chain stays (HOMECHAIN.md phase 3): @tags, profiles, posts and messages are read and written there.
+    if !LOCAL.load(Ordering::Relaxed) {
+        return Err(format!("{} is the home chain (your @tag, profile, posts and messages live there), so it can't be removed", def.params.name));
+    }
     let _changing = CHANGING.lock().unwrap();
     let svc = SVC.write().unwrap().take().ok_or_else(|| format!("{} is not installed", def.params.name))?;
     // Under the chain's lock: a block being taken in right now is in before, or never.

@@ -67,7 +67,8 @@ pub fn create_wallet(node: &Node, phrase: Option<&str>) -> Result<Value, String>
     let tag = if restored { crate::claims::find_own_tag(node, true) } else { None };
     // Test coins for the first handle come by themselves: asked for now, so they are
     // usually here by the time a handle is picked (a restored wallet may have some).
-    if tag.is_none() {
+    // On ARCADE as the home chain (crate::claims::claim_home) the node faucet's ARCADE pays the claim instead.
+    if tag.is_none() && !crate::arcsvc::runs(crate::claims::claim_home(node)) {
         if let Ok((k, _)) = node.app.tag_key(p, 0) {
             let script = arcade_wallet::keys::p2pkh_script_for(&arcade_wallet::secp256k1::PublicKey::from_slice(&hex::decode(&k.pubkey).unwrap()).unwrap());
             if crate::claims::coins(node, &script).is_empty() {
