@@ -304,8 +304,7 @@ fn advance_one(node: &Node, mut c: Claim) -> Result<Claim, String> {
                     }
                 }
                 Err(e) if !home => {
-                    // The ARCADE faucet tops the address up (once a day at most; #175).
-                    let _ = crate::arcfaucet::ask(node, &key.address);
+                    // Paid from the arcade's node-faucet ARCADE (crate::arcfaucet::node_gift_ask asks it on its own).
                     set(&mut c, ClaimStatus::Funding, &format!("waiting for ARCADE at {} ({e})", key.address));
                 }
                 Ok(tx) => {
