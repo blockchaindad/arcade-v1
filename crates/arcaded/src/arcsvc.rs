@@ -1052,7 +1052,7 @@ fn run_writer_on(node: Arc<Node>, svc: Arc<Svc>, wrote: &mut VecDeque<Hash256>, 
                 let parent = st.chain.entry(&t.prev);
                 let me = node.identity.verifying_key().to_bytes();
                 // The alone-streak guard as below, counted back from the parent our block goes on.
-                let alone = (t.weight as u128) < st.chain.storage().drawing_weight()
+                let alone = !alone_is_likely(t.weight, st.chain.storage().drawing_weight())
                     && parent.is_some_and(|p| alone_streak_from(&st.chain, &me, params::REORG_LIMIT / 2, p.height) >= params::REORG_LIMIT / 2);
                 if alone || !parent.is_some_and(|p| keeps_racing(p, t, st.chain.tip(), wrote.contains(&t.prev))) {
                     if t.prev != tip {
@@ -1088,8 +1088,9 @@ fn run_writer_on(node: Arc<Node>, svc: Arc<Svc>, wrote: &mut VecDeque<Hash256>, 
             // writes 50 in a row once in 3^50 tries): it waits until another's block comes.
             // Counted against the weight that can write now: a writer whose rivals are all silenced (an answered
             // challenge or demand, an audit period) is alone by the rules, not cut off, and must go on (ARCADE #11:
-            // testnet stopped at 675 while the JB20B was silenced).
-            if (t.weight as u128) < st.chain.storage().drawing_weight() {
+            // testnet stopped at 675 while the JB20B was silenced). And a writer holding nearly all of it writes long
+            // streaks by chance, so it goes on too (testnet stopped at 999 when v4 let a silent owner's 0.5% count).
+            if !alone_is_likely(t.weight, st.chain.storage().drawing_weight()) {
                 let me = node.identity.verifying_key().to_bytes();
                 if alone_streak(&st.chain, &me, params::REORG_LIMIT / 2) >= params::REORG_LIMIT / 2 {
                     if alone_said.is_none_or(|t: Instant| t.elapsed() > Duration::from_secs(60)) {
@@ -2361,6 +2362,13 @@ fn alone_streak<T: arcade_arc::time::TimeProofs, S: arcade_arc::chain::Storage>(
     alone_streak_from(chain, me, max, chain.tip().height)
 }
 
+/// Whether a writer with `weight` of the `drawing` weight writes the alone-streak guard's run of blocks in a row by
+/// chance often enough (at least 9 tenths of the weight: 0.9^50 is about 1 in 200) that such a run says nothing of
+/// being cut off. Below that a run that long means this arcade isn't hearing the network.
+fn alone_is_likely(weight: u64, drawing: u128) -> bool {
+    (weight as u128) * 10 >= drawing * 9
+}
+
 /// [`alone_streak`] counted back from the best chain's block at height `tip`.
 fn alone_streak_from<T: arcade_arc::time::TimeProofs, S: arcade_arc::chain::Storage>(chain: &Chain<T, S>, me: &[u8; 32], max: u64, tip: u64) -> u64 {
     let mut n = 0;
@@ -3006,6 +3014,17 @@ mod tests {
     use arcade_arc::vrf;
     use arcade_chain::hash::hash160;
     use arcade_chain::{OutPoint, TxIn, TxOut};
+
+    #[test]
+    fn a_writer_with_nearly_all_the_weight_goes_on_alone() {
+        // Testnet at 999: the GX10 held 1078812989 of 1083884154 (a silent owner's 0.47% counted from v4).
+        assert!(alone_is_likely(1_078_812_989, 1_083_884_154));
+        assert!(alone_is_likely(100, 100));
+        assert!(alone_is_likely(90, 100));
+        // A third, or even 89%: a run of 50 is no chance, so it waits for another's block.
+        assert!(!alone_is_likely(89, 100));
+        assert!(!alone_is_likely(1, 3));
+    }
     use arcade_ledger::address::base58check;
     use secp256k1::{PublicKey, Secp256k1, SecretKey};
 
