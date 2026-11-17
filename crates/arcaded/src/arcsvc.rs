@@ -721,29 +721,63 @@ fn warm_seed(chain: &LocalChain, home: &std::path::Path) {
 /// This arcade's block on the tip, as its ticket allows: the coinbase pays what is owed,
 /// then the fees of the waiting transactions the block takes to `pay`.
 fn write_block(chain: &LocalChain, pool: &Pool, secret: &[u8; 32], ticket: &Ticket, pot: TimeProof, seed: Option<TimeProof>, now: u64) -> Block {
+    seal_template(chain.net(), secret, ticket, template(chain, pool, secret, ticket), pot, seed, now)
+}
+
+/// What a block on the tip carries, made while its parent is the tip: the rules (§14.18) and the storage state it
+/// answers to are its parent's, so it can still be sealed on that parent after a rival block on it became the tip
+/// (§6.3: our block goes on when its score is lower).
+#[derive(Clone)]
+struct Template {
+    /// The parent's time: the block's is at least one more.
+    parent_time: u64,
+    /// The coinbase first, then the transactions picked from the pool.
+    txs: Vec<Tx>,
+    items: Vec<arcade_arc::block::Item>,
+    /// The bytes of the blobs those transactions bring that the chain hasn't got.
+    blobs: HashMap<arcade_arc::merkle::Hash, Vec<u8>>,
+}
+
+fn template(chain: &LocalChain, pool: &Pool, secret: &[u8; 32], ticket: &Ticket) -> Template {
     // The storage items waiting (crate::arcseg) that this block can carry, in group order, within each kind's limit
     // and the section's size (§9); registration commits with the most work first.
     let items = pack(chain.storage(), crate::arcseg::waiting(), ticket.height);
     let items = chain.storage().fitting(&items, ticket.height);
-    let time = now.max(chain.tip().time + 1);
     // The coinbase pays what is owed, then (rules 2) the writer's own share; fees join the pot (§14.18).
     let outputs = chain.payouts_for(&arcade_arc::vrf::public_key(secret));
     let coinbase_bytes = coins::coinbase(ticket.height, &ticket.prev, b"", &outputs).raw.len();
     let (mut txs, _fees) = pool.pick_with(params::MAX_TX_BYTES.saturating_sub(coinbase_bytes), arcade_arc::blob::MAX_BLOB_BYTES, &|id| !chain.holds_blob(id));
     // The bytes of the blobs those bring that the chain hasn't got (the pool took them only with their bytes here).
-    let mut new = HashMap::new();
+    let mut blobs = HashMap::new();
     for tx in &txs {
         for r in arcade_arc::blob::records(tx) {
             let id = r.id(chain.net());
-            if !chain.holds_blob(&id) && !new.contains_key(&id) {
+            if !chain.holds_blob(&id) && !blobs.contains_key(&id) {
                 if let Some(b) = crate::arcblob::get(&id) {
-                    new.insert(id, b);
+                    blobs.insert(id, b);
                 }
             }
         }
     }
     txs.insert(0, coins::coinbase(ticket.height, &ticket.prev, b"", &outputs));
-    ticket.seal_with_blobs(chain.net(), secret, time, txs, items, pot, seed, &new)
+    Template { parent_time: chain.tip().time, txs, items, blobs }
+}
+
+/// The block of `tpl`, sealed with its proof of time.
+fn seal_template(net: &Net, secret: &[u8; 32], ticket: &Ticket, tpl: Template, pot: TimeProof, seed: Option<TimeProof>, now: u64) -> Block {
+    ticket.seal_with_blobs(net, secret, now.max(tpl.parent_time + 1), tpl.txs, tpl.items, pot, seed, &tpl.blobs)
+}
+
+/// Whether our draw on `parent`, its proof of time not done yet, still races the tip: the tip is a rival block on that
+/// same parent, and ours would beat it as fork choice does (`Entry::beats`, §6.3: the same difficulty, then the lower
+/// total score; a tie goes by block id, which ours doesn't have yet, so it is given up). Never when we wrote on that
+/// parent already (§5.1), nor once the rival was built on (it has more difficulty than ours can).
+fn keeps_racing(parent: &Entry, ticket: &Ticket, tip: &Entry, wrote_on_parent: bool) -> bool {
+    if wrote_on_parent || ticket.prev != parent.id || tip.prev != parent.id {
+        return false;
+    }
+    let ours = (&parent.total_difficulty + ticket.difficulty, &parent.total_score + ticket.score);
+    (&tip.total_difficulty, &ours.1) < (&ours.0, &tip.total_score)
 }
 
 /// What a block carries of `waiting` (§9): in group order; registration commits by their stamp's work, most first
@@ -920,14 +954,28 @@ fn run_writer_on(node: Arc<Node>, svc: Arc<Svc>, wrote: &mut VecDeque<Hash256>, 
     let secret = node.identity.to_bytes();
     // The tip drawn on, and what came of it.
     let mut on: Option<Hash256> = None;
-    // The draw for the tip, its draw seed's proof, and whether it could be the height's best (crate::arckeep).
-    let mut ticket: Option<(Ticket, Option<TimeProof>, bool)> = None;
+    // The draw for the tip, its draw seed's proof, whether it could be the height's best (crate::arckeep), what its
+    // block carries (made while its parent is the tip) and when that parent became the tip.
+    let mut ticket: Option<(Ticket, Option<TimeProof>, bool, Template, Instant)> = None;
+    // Our draw on an older parent still racing the rival block on that parent that came first and is the tip now,
+    // because ours has the lower score (§6.3): its proof of time goes on, and the block is sealed from its template.
+    let mut race: Option<(Ticket, Option<TimeProof>, Template, Instant)> = None;
     let mut alone_said: Option<Instant> = None;
     let mut written: Option<Block> = None;
-    // The VDF's proof of time for this tip's ticket, made in the background: (tip, its proof when done).
-    let proving: Arc<Mutex<Option<(Hash256, Option<TimeProof>)>>> = Arc::new(Mutex::new(None));
-    // The threads still running a proof (a VDF can't be stopped midway), by thread id.
-    let running: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
+    // The VDF's proofs of time made in the background, by the parent they are for: None while running. Kept for the
+    // tip and the parent raced on (if any).
+    let proving: Arc<Mutex<HashMap<Hash256, Option<TimeProof>>>> = Arc::new(Mutex::new(HashMap::new()));
+    // The threads still running a proof (a VDF can't be stopped midway), by thread id, with the parent each is for.
+    let running: Arc<Mutex<Vec<(i64, Hash256)>>> = Arc::new(Mutex::new(Vec::new()));
+    // Proofs for parents given up only get spare CPU from now on (each takes a core, and several piled up starved
+    // chain sync on a 4-core machine).
+    let push_down = |keep: Option<Hash256>| {
+        for (tid, at) in running.lock().unwrap().iter() {
+            if Some(*at) != keep {
+                crate::rulecheck::lowest_priority_of(*tid);
+            }
+        }
+    };
     loop {
         std::thread::sleep(Duration::from_millis(100));
         if svc.stop.load(Ordering::Relaxed) {
@@ -941,6 +989,14 @@ fn run_writer_on(node: Arc<Node>, svc: Arc<Svc>, wrote: &mut VecDeque<Hash256>, 
             let first_of_epoch = (st.chain.tip().height + 1) % params::EPOCH_BLOCKS == 0;
             if on != Some(tip) || (ticket.is_none() && first_of_epoch && !wrote.contains(&tip)) {
                 on = Some(tip);
+                // A rival block on the parent we drew on came first: ours goes on when it would beat it (§6.3: the
+                // lower score wins, not the faster time calculator). We draw on the new tip as well.
+                if let Some((t, seed, _, tpl, since)) = ticket.take() {
+                    if st.chain.entry(&t.prev).is_some_and(|p| keeps_racing(p, &t, st.chain.tip(), wrote.contains(&t.prev))) {
+                        eprintln!("arc: a rival block came first at height {}, but our draw scores lower: our proof of time goes on", t.height);
+                        race = Some((t, seed, tpl, since));
+                    }
+                }
                 let seed = seed_proof(&st.chain);
                 // Written on before: never a second block on it.
                 // Written on before: our own block for it, offered again if the chain lacks it (lost before it went out).
@@ -959,10 +1015,43 @@ fn run_writer_on(node: Arc<Node>, svc: Arc<Svc>, wrote: &mut VecDeque<Hash256>, 
                         let f = frame(&svc, "cand", json!({"prev": tip.to_hex(), "w": t.weight, "writer": hex::encode(me), "vrf": hex::encode(t.vrf_proof)}));
                         crate::arckeep::announce(f, tip, me, t.weight, t.vrf_proof, t.steps);
                     }
-                    (t, seed, likely)
+                    let tpl = template(&st.chain, &st.pool, &secret, &t);
+                    (t, seed, likely, tpl, st.since)
                 });
             }
-            let Some((t, seed, likely)) = &ticket else { continue };
+            // The race: given up once the rival was built on or beaten (or the chain went back to our parent, where the
+            // draw above takes over, its proof shared); sealed and offered when its proof of time is done.
+            if let Some((t, seed, tpl, since)) = &race {
+                let parent = st.chain.entry(&t.prev);
+                let me = node.identity.verifying_key().to_bytes();
+                // The alone-streak guard as below, counted back from the parent our block goes on.
+                let alone = (t.weight as u128) < st.chain.storage().drawing_weight()
+                    && parent.is_some_and(|p| alone_streak_from(&st.chain, &me, params::REORG_LIMIT / 2, p.height) >= params::REORG_LIMIT / 2);
+                if alone || !parent.is_some_and(|p| keeps_racing(p, t, st.chain.tip(), wrote.contains(&t.prev))) {
+                    if t.prev != tip {
+                        eprintln!("arc: our block at height {} no longer races the tip: given up", t.height);
+                        proving.lock().unwrap().remove(&t.prev);
+                        push_down(Some(tip));
+                    }
+                    race = None;
+                } else {
+                    let pot = match *st.chain.proofs() {
+                        Clock::StandIn => (since.elapsed().as_secs_f64() >= t.steps as f64 / svc.steps_per_second as f64).then(|| StandIn.prove(&t.challenge, t.steps)),
+                        Clock::Vdf => proving.lock().unwrap().get(&t.prev).cloned().flatten(),
+                    };
+                    if let Some(pot) = pot.filter(|_| std::env::var("ARCADE_ARC_TEST_WITHHOLD").is_err()) {
+                        let b = seal_template(st.chain.net(), &secret, t, tpl.clone(), pot, seed.clone(), arcade_app::now());
+                        eprintln!("arc: our block at height {} scores lower than the rival that came first: offered", t.height);
+                        // The block first, then its parent (as below).
+                        save_written(&wrote_blocks_dir(&node, &svc), &t.prev, &b);
+                        remember(wrote, t.prev);
+                        written = Some(b);
+                        race = None;
+                        continue;
+                    }
+                }
+            }
+            let Some((t, seed, likely, _, _)) = &ticket else { continue };
             // Never far alone: while others hold weight, a branch only this arcade writes could outrun the reorg limit
             // and never join theirs (3-arcade test nets split so: first while their links came up under load, then
             // with links up but no blocks getting through). No block from anyone else in the last half of the limit
@@ -991,22 +1080,22 @@ fn run_writer_on(node: Arc<Node>, svc: Arc<Svc>, wrote: &mut VecDeque<Hash256>, 
                 }
                 // The VDF: run it once for this tip, in the background; written when it is done (if still the tip).
                 Clock::Vdf => {
+                    let racing = race.as_ref().map(|r| r.0.prev);
+                    let mut p = proving.lock().unwrap();
+                    // Proofs for an older tip are thrown away when done, but for the parent raced on.
+                    p.retain(|at, _| *at == tip || Some(*at) == racing);
                     // A keeper's proof for our count, if one came first (checked when it came).
                     if let Some(proof) = crate::arckeep::proof_for(&tip, t.steps) {
                         eprintln!("arc: writing with a time keeper's proof ({} steps)", t.steps);
-                        *proving.lock().unwrap() = Some((tip, Some(proof)));
+                        p.insert(tip, Some(proof));
                     }
-                    let mut p = proving.lock().unwrap();
-                    match p.as_ref() {
-                        Some((at, Some(proof))) if *at == tip => proof.clone(),
-                        Some((at, None)) if *at == tip => continue,
-                        _ => {
-                            *p = Some((tip, None));
-                            // Proofs for an older tip are thrown away when done: they only get spare CPU from now on
-                            // (each takes a core, and several piled up starved chain sync on a 4-core machine).
-                            for tid in running.lock().unwrap().iter() {
-                                crate::rulecheck::lowest_priority_of(*tid);
-                            }
+                    match p.get(&tip) {
+                        Some(Some(proof)) => proof.clone(),
+                        Some(None) => continue,
+                        None => {
+                            p.insert(tip, None);
+                            // Older tips' proofs only get spare CPU from now on, but the race's.
+                            push_down(racing);
                             // Tests only: an arcade too slow to make its own proof in time leans on the keepers for
                             // its likely draws (the rest still run at the lowest priority, so the chain can't stall).
                             if *likely && std::env::var("ARCADE_ARC_TEST_NO_OWN_PROOF").is_ok() {
@@ -1022,18 +1111,22 @@ fn run_writer_on(node: Arc<Node>, svc: Arc<Svc>, wrote: &mut VecDeque<Hash256>, 
                                 // machine nobody's proof finished (testnet stall at block 1,061, 2026-11-14). Only runs for
                                 // tips that moved on are pushed down (above), as before.
                                 let _ = likely;
-                                running.lock().unwrap().push(me);
+                                running.lock().unwrap().push((me, tip));
                                 let proof = prove_in_pieces(&pot_dir, &challenge, steps, most);
-                                running.lock().unwrap().retain(|t| *t != me);
+                                running.lock().unwrap().retain(|t| t.0 != me);
                                 {
                                     let mut own = OWN_PROOF.lock().unwrap();
                                     if *own == Some(tip) {
                                         *own = None;
                                     }
                                 }
+                                // Kept only while its parent is still wanted (the tip, or raced on); none made: run again.
                                 let mut j = job.lock().unwrap();
-                                if j.as_ref().is_some_and(|x| x.0 == tip) {
-                                    *j = proof.map(|pr| (tip, Some(pr)));
+                                if j.get(&tip).is_some_and(|x| x.is_none()) {
+                                    match proof {
+                                        Some(pr) => j.insert(tip, Some(pr)),
+                                        None => j.remove(&tip),
+                                    };
                                 }
                             });
                             continue;
@@ -2227,7 +2320,11 @@ pub fn unspent(op: &OutPoint) -> bool {
 
 /// How many blocks in a row up to the tip `me` wrote (at most `max`).
 fn alone_streak<T: arcade_arc::time::TimeProofs, S: arcade_arc::chain::Storage>(chain: &Chain<T, S>, me: &[u8; 32], max: u64) -> u64 {
-    let tip = chain.tip().height;
+    alone_streak_from(chain, me, max, chain.tip().height)
+}
+
+/// [`alone_streak`] counted back from the best chain's block at height `tip`.
+fn alone_streak_from<T: arcade_arc::time::TimeProofs, S: arcade_arc::chain::Storage>(chain: &Chain<T, S>, me: &[u8; 32], max: u64, tip: u64) -> u64 {
     let mut n = 0;
     while n < max && n < tip {
         match chain.id_at(tip - n).and_then(|id| chain.block(&id)) {
@@ -3039,6 +3136,52 @@ mod tests {
         let mut heavy = heavy;
         let _ = fetch(&mut heavy, &light, true, 3);
         assert_eq!(heavy.tip().id, before);
+    }
+
+    /// ARCADE #11 (§6.3): two writers draw on one parent; the one whose proof of time is done first (the higher score
+    /// here) gets its block in. The other's block, made from what it drew on that parent and sealed only now, still
+    /// goes in and wins: the lower score, not the faster time calculator. It races only while it would win.
+    #[test]
+    fn a_lower_score_finished_after_its_rival_still_wins() {
+        let mut c = chain();
+        grow(&mut c, 1, 3);
+        let parent = c.tip().clone();
+        let pool = Pool::default();
+        let seed = seed_proof(&c);
+        let (t1, t2) = (c.ticket(&secret(1), seed.as_ref()).unwrap(), c.ticket(&secret(2), seed.as_ref()).unwrap());
+        assert_ne!(t1.score, t2.score);
+        let ((fast, tf), (slow, ts)) = if t1.score > t2.score { ((1, t1), (2, t2)) } else { ((2, t2), (1, t1)) };
+        // Both made while the parent is the tip; the worse one sealed and in first.
+        let (tpl_fast, tpl_slow) = (template(&c, &pool, &secret(fast), &tf), template(&c, &pool, &secret(slow), &ts));
+        let now = parent.time + params::BLOCK_SECONDS;
+        let first = seal_template(c.net(), &secret(fast), &tf, tpl_fast, StandIn.prove(&tf.challenge, tf.steps), seed.clone(), now);
+        assert!(matches!(c.accept(first, LATE), Ok(Accepted::Tip { .. })));
+        let rival = c.tip().clone();
+        assert_eq!(rival.prev, parent.id);
+
+        // The better draw keeps racing; the worse one, our parent already written on, or the tip elsewhere: not.
+        assert!(keeps_racing(&parent, &ts, &rival, false));
+        assert!(!keeps_racing(&parent, &tf, &rival, false), "the same score as the tip: a tie, given up");
+        assert!(!keeps_racing(&parent, &ts, &rival, true), "never two blocks on one parent");
+        assert!(!keeps_racing(&parent, &ts, &parent, false), "the tip back on our parent: the ordinary draw takes over");
+        let worse = Ticket { score: rival.score + 1, ..ts.clone() };
+        assert!(!keeps_racing(&parent, &worse, &rival, false));
+
+        // Sealed now, after the rival became the tip: built on the parent's state, taken, and the tip.
+        let ours = seal_template(c.net(), &secret(slow), &ts, tpl_slow.clone(), StandIn.prove(&ts.challenge, ts.steps), seed.clone(), now + 30);
+        let id = ours.id();
+        assert!(matches!(c.accept(ours, LATE), Ok(Accepted::Tip { .. })), "the lower score takes the height");
+        assert_eq!(c.tip().id, id);
+
+        // Once the rival is built on (more difficulty than ours on the parent can have), the race is given up.
+        let mut d = chain();
+        for h in 1..=rival.height {
+            let b = if h == rival.height { c.block(&rival.id).unwrap().clone() } else { c.block(&c.id_at(h).unwrap()).unwrap().clone() };
+            d.accept(b, LATE).unwrap();
+        }
+        assert_eq!(d.tip().id, rival.id);
+        grow(&mut d, fast, 1);
+        assert!(!keeps_racing(&parent, &ts, d.tip(), false));
     }
 
     fn stored_matches(db: &ChainDb, p: &ChainParams, c: &LocalChain) {
