@@ -216,7 +216,7 @@ mod tests {
             assert!(window_may("app-00ff", cmd), "{cmd}");
         }
         // The rest is the main window's.
-        for cmd in ["wallet.phrase", "wallet.send", "wallet.create", "wallet.import", "options.set", "apps.launch", "status", ""] {
+        for cmd in ["wallet.phrase", "wallet.send", "wallet.create", "wallet.import", "options.set", "apps.launch", "status", "node.stop", "node.terminal", ""] {
             assert!(!window_may("app-00ff", cmd), "{cmd}");
             assert!(window_may("main", cmd), "{cmd}");
         }
@@ -260,6 +260,32 @@ mod tests {
         // Hung or a helper process: nothing (WebView2 recovers; the X still closes the window).
         assert_eq!(after_process_failed("app-00ff", Gone::Other), Healing::Nothing);
         assert_eq!(after_process_failed("main", Gone::Other), Healing::Nothing);
+    }
+
+    #[test]
+    fn only_the_main_window_starts_the_node_or_opens_a_terminal() {
+        assert!(owner_window("main"));
+        for label in ["app-00ff", "content-00ff", "other", "Main"] {
+            assert!(!owner_window(label), "{label}");
+        }
+    }
+
+    #[test]
+    fn start_uses_the_installed_service_and_does_not_enable_it() {
+        assert_eq!(plan_start(std::path::Path::new("/var/lib/arcade")), StartHow::Systemctl { user: false });
+        let dir = std::env::temp_dir().join(format!("arcade-desktop-start-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(plan_start(&dir), StartHow::Systemctl { user: true });
+        let script = dir.join("start-arcaded.sh");
+        std::fs::write(&script, "").unwrap();
+        assert_eq!(plan_start(&dir), StartHow::Script(script));
+        std::fs::remove_dir_all(&dir).unwrap();
+        // A missing unit is the only reason to start the binary beside the app. A failed start is not.
+        assert!(unit_missing("Unit arcaded.service not found."));
+        assert!(unit_missing("Failed to start arcaded.service: Unit arcaded.service not found."));
+        assert!(!unit_missing("arcaded.service: start operation timed out"));
+        assert!(!unit_missing(""));
     }
 
     #[test]
@@ -434,6 +460,164 @@ fn allow_media(w: &tauri::WebviewWindow) {
     });
 }
 
+/// The main window is the owner's. App windows hold someone else's page; content windows hold an inscription.
+fn owner_window(label: &str) -> bool {
+    label == "main"
+}
+
+/// How Start brings arcaded back: the unit or script the installer wrote, not a fresh enable.
+#[derive(Debug, PartialEq, Eq)]
+enum StartHow {
+    /// `systemctl start` (system) or `systemctl --user start`. Start, not enable: a node turned
+    /// off at boot stays that way.
+    Systemctl { user: bool },
+    /// install-linux.sh's script, when there is no systemd user session.
+    Script(std::path::PathBuf),
+}
+
+fn plan_start(home: &std::path::Path) -> StartHow {
+    if home.starts_with("/var/lib/arcade") {
+        StartHow::Systemctl { user: false }
+    } else if home.join("start-arcaded.sh").is_file() {
+        StartHow::Script(home.join("start-arcaded.sh"))
+    } else {
+        StartHow::Systemctl { user: true }
+    }
+}
+
+fn unit_missing(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("not found") || e.contains("does not exist") || e.contains("no such file")
+}
+
+fn command_output(cmd: &mut std::process::Command) -> Result<(), String> {
+    match cmd.output() {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let msg = err.trim();
+            Err(if msg.is_empty() { format!("exit {}", out.status) } else { msg.to_string() })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err("not found".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// The arcade CLI beside this app, else on PATH. One path, never a command line.
+fn cli_path() -> Result<std::path::PathBuf, String> {
+    let name = if cfg!(windows) { "arcade.exe" } else { "arcade" };
+    if let Ok(exe) = std::env::current_exe() {
+        let beside = exe.with_file_name(name);
+        if beside.is_file() {
+            return Ok(beside);
+        }
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        if let Some(p) = std::env::split_paths(&path).map(|d| d.join(name)).find(|p| p.is_file()) {
+            return Ok(p);
+        }
+    }
+    Err("the arcade CLI isn't installed next to the app, or on PATH".into())
+}
+
+fn path_ok(p: &std::path::Path) -> bool {
+    let s = p.as_os_str().to_string_lossy();
+    !s.is_empty() && !s.chars().any(|c| c.is_control() || matches!(c, '&' | '|' | ';' | '<' | '>' | '^' | '$' | '`'))
+}
+
+/// Start arcaded the way the installer did: its user service, its system service, or its start script.
+/// The binary beside the app is only a fallback when that unit isn't installed.
+#[tauri::command]
+fn node_start(window: tauri::WebviewWindow) -> Result<String, String> {
+    if !owner_window(window.label()) {
+        return Err("only this arcade's own window can start the node".into());
+    }
+    let home = home();
+    if UnixStream::connect(home.join("arcaded.sock")).is_ok() {
+        return Ok("The node is already running.".into());
+    }
+    match plan_start(&home) {
+        StartHow::Script(p) => {
+            let mut c = std::process::Command::new("sh");
+            c.arg(&p);
+            command_output(&mut c)?;
+        }
+        StartHow::Systemctl { user } => {
+            let mut c = std::process::Command::new("systemctl");
+            if user {
+                c.arg("--user");
+            }
+            c.args(["start", "arcaded"]);
+            if let Err(e) = command_output(&mut c) {
+                if !unit_missing(&e) && e != "not found" {
+                    return Err(e);
+                }
+                let name = if cfg!(windows) { "arcaded.exe" } else { "arcaded" };
+                let bin = std::env::current_exe().map_err(|err| err.to_string())?.with_file_name(name);
+                if !bin.is_file() {
+                    return Err(e);
+                }
+                std::process::Command::new(&bin).arg("--home").arg(&home).spawn().map_err(|err| err.to_string())?;
+            }
+        }
+    }
+    Ok("Started. It comes back the same way the installer starts it.".into())
+}
+
+/// A terminal running the arcade CLI, in the owner's session (this window has the display).
+/// The program is the CLI. Nothing the page sends is run.
+#[tauri::command]
+fn open_cli(window: tauri::WebviewWindow) -> Result<(), String> {
+    if !owner_window(window.label()) {
+        return Err("only this arcade's own window can open a terminal".into());
+    }
+    let cli = cli_path()?;
+    if !path_ok(&cli) {
+        return Err("the arcade CLI's path can't be opened in a terminal".into());
+    }
+    let c = cli.as_os_str();
+    let mut tried = Vec::new();
+    #[cfg(unix)]
+    let launches: Vec<(&str, Vec<std::ffi::OsString>)> = {
+        let one = |flag: &str| vec![std::ffi::OsString::from(flag), c.to_os_string()];
+        let dash = || vec![std::ffi::OsString::from("--"), c.to_os_string()];
+        vec![
+            ("x-terminal-emulator", one("-e")),
+            ("gnome-terminal", dash()),
+            ("konsole", one("-e")),
+            ("xfce4-terminal", one("-e")),
+            ("mate-terminal", dash()),
+            ("kgx", dash()),
+            ("alacritty", one("-e")),
+            ("kitty", one("-e")),
+            ("wezterm", vec![std::ffi::OsString::from("start"), std::ffi::OsString::from("--"), c.to_os_string()]),
+            ("xterm", one("-e")),
+        ]
+    };
+    #[cfg(windows)]
+    let launches: Vec<(&str, Vec<std::ffi::OsString>)> = vec![
+        ("wt", vec![std::ffi::OsString::from("--"), c.to_os_string()]),
+        (
+            "cmd",
+            vec![
+                std::ffi::OsString::from("/c"),
+                std::ffi::OsString::from("start"),
+                std::ffi::OsString::from("Arcade CLI"),
+                std::ffi::OsString::from("cmd"),
+                std::ffi::OsString::from("/k"),
+                c.to_os_string(),
+            ],
+        ),
+    ];
+    for (bin, args) in launches {
+        match std::process::Command::new(bin).args(&args).spawn() {
+            Ok(_) => return Ok(()),
+            Err(_) => tried.push(bin),
+        }
+    }
+    Err(format!("no terminal program found ({}); open a terminal and run arcade", tried.join(", ")))
+}
+
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
@@ -464,7 +648,7 @@ fn main() {
                 make_sure_it_closes(w);
             }
         })
-        .invoke_handler(tauri::generate_handler![api, open_app, open_content, save_file])
+        .invoke_handler(tauri::generate_handler![api, open_app, open_content, save_file, node_start, open_cli])
         .run(tauri::generate_context!())
         .expect("error while running the Arcade app");
 }

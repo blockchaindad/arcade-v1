@@ -8,6 +8,7 @@ const HELP: &str = "arcade — Arcade V1.0
 
   arcade setup                   first-run setup (mesh, chain, wallet, handle)
   arcade status                  sync, tag index, mesh links
+  arcade stop                    write the coin caches, then stop the service
   arcade web                     the link that opens the app's window in a browser (here, or through an SSH tunnel)
   arcade peers                   mesh links
   arcade peers dials             the last mesh dials, and whether this network refuses bare IPs
@@ -159,6 +160,11 @@ fn index_line(s: &Value) -> String {
 /// Whether the arcade runs as the .deb's system service (data in /var/lib/arcade) or as this user's.
 fn system_service(sock: &std::path::Path) -> bool {
     sock.starts_with("/var/lib/arcade")
+}
+
+/// `arcade stop`: the clean stop (caches written, then the service exits). Not a restart.
+fn stop_request() -> Value {
+    json!({"cmd": "node.stop"})
 }
 
 /// How to start the service again: the system one, the user one, or (installed without a systemd user
@@ -367,6 +373,7 @@ fn main() {
     }
     let req = match a.as_slice() {
         ["status"] => json!({"cmd": "status"}),
+        ["stop"] => stop_request(),
         ["web"] => json!({"cmd": "ui.link"}),
         ["peers"] => json!({"cmd": "peers"}),
         ["peers", "dials"] => json!({"cmd": "mesh.dials"}),
@@ -493,6 +500,10 @@ fn main() {
     BufReader::new(s).read_line(&mut line).unwrap();
     let v: Value = serde_json::from_str(&line).unwrap_or(json!({"ok": false, "error": "bad reply"}));
     if v["ok"] == true {
+        if a.as_slice() == ["stop"] {
+            println!("Stopping: writing the coin caches, then the service exits.");
+            return;
+        }
         if a.as_slice() == ["web"] {
             if let Some(u) = v["result"]["url"].as_str() {
                 println!("Open in a browser on this computer:\n\n  {u}\n");
@@ -603,6 +614,14 @@ mod tests {
         assert!(index_line(&s).starts_with("not started yet"));
         let s = json!({"tip": {"height": 200}, "tags": {"indexed_to": 50, "count": 3}});
         assert_eq!(index_line(&s), "indexed to 50 of 200 (25.0%), 3 tags");
+    }
+
+    #[test]
+    fn stop_asks_for_the_clean_stop_and_nothing_else() {
+        assert!(HELP.contains("arcade stop"));
+        let r = stop_request();
+        assert_eq!(r["cmd"], "node.stop");
+        assert_eq!(r.as_object().unwrap().len(), 1, "no program, no path, no extra flag");
     }
 
     #[test]

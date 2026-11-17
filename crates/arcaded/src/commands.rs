@@ -247,6 +247,8 @@ cmds! {
     "chains.unqueue" Admin "key" "Take a chain out of the install queue.";
     "chains.pause" Admin "key" "Pause a chain.";
     "ui.link" Local "" "The link that opens the app's window in a browser (/ui/, with this start's key) and the SSH tunnel command for another computer (docs/WEBUI.md).";
+    "node.stop" Local "" "Stop this arcade the way SIGTERM and `arcade stop` do: write every chain's coin cache, then exit. This computer only (the socket or the cookie). Never an API key, and never another arcade.";
+    "node.terminal" Local "" "Open a terminal on this computer running the arcade CLI (no other program, and no command is taken from the caller). This computer only (the socket or the cookie). Never an API key, and never another arcade.";
     "chains.drives" Read "" "Drives a chain's file can go on: this arcade's own, and other mounted disks (free space, whether the arcade can write there).";
     "chains.move" Admin "key, drive" "Move an installed chain's file to another drive (drive from chains.drives; home = this arcade's own). Runs in the background; chains.status shows its progress.";
     "chains.resume" Admin "key" "Resume a chain.";
@@ -364,4 +366,18 @@ pub fn find(name: &str) -> Option<&'static Cmd> {
 
 pub fn help() -> serde_json::Value {
     serde_json::json!(COMMANDS.iter().map(|c| serde_json::json!({"method": c.name, "needs": c.perm.name(), "params": c.params, "summary": c.summary})).collect::<Vec<_>>())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stopping_and_a_terminal_stay_on_this_computer() {
+        for name in ["node.stop", "node.terminal"] {
+            let c = find(name).unwrap_or_else(|| panic!("{name} missing"));
+            assert_eq!(c.perm, Perm::Local, "{name}");
+            assert!(c.params.is_empty(), "{name} takes nothing from the caller");
+        }
+    }
 }

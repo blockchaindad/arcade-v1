@@ -104,6 +104,15 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
     match req["cmd"].as_str().unwrap_or("") {
         // The link that opens the desktop app's window in a browser (crate::webui; `arcade web`).
         "ui.link" => crate::webui::link(node, node.http_port.get().copied().unwrap_or(8420)),
+        // The desktop window's Stop. Same path as SIGTERM: caches, then exit. Local, so a mesh
+        // peer or an API key cannot ask it (commands::Perm::Local).
+        "node.stop" => {
+            crate::request_stop();
+            Ok(json!({"stopping": true, "note": "Writing the coin caches, then the service exits."}))
+        }
+        // A terminal for the owner, on this computer. The program is the arcade CLI; the request
+        // names nothing to run.
+        "node.terminal" => crate::localterm::open(),
         "status" => {
             let tip = node.chain.tip(c).map_err(|e| e.to_string())?;
             use arcade_ledger::index;
@@ -744,6 +753,13 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
             if let Some(p) = crate::chains::find(&key).filter(|_| st["installed"] != false && st.is_object()) {
                 st["place"] = crate::chaindrive::place(node, p.chain_no);
                 st["move"] = crate::chaindrive::status(p.key);
+            }
+            // Queued installs have no stages yet. The explorer's bar still needs the place in line.
+            if st.is_object() {
+                let canon = st["key"].as_str().unwrap_or(key.as_str());
+                let pos = crate::chains::queued_at(node, canon);
+                let behind = pos.and_then(|_| crate::chains::installing_now(node)).map(|p| p.key);
+                crate::chains::attach_queue(&mut st, pos, behind);
             }
             Ok(st)
         }

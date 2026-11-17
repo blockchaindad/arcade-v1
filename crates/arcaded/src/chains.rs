@@ -299,6 +299,15 @@ fn home_busy(tip: u32, lag: u32, addresses_ready: bool) -> bool {
     tip == 0 || lag > 10 || !addresses_ready
 }
 
+/// Stamp a chain status with its install-queue place (1 = next), when it is waiting.
+/// `behind` is the chain being installed now, the one this place waits on.
+pub fn attach_queue(st: &mut Value, pos: Option<usize>, behind: Option<&str>) {
+    let Some(obj) = st.as_object_mut() else { return };
+    let Some(pos) = pos else { return };
+    obj.insert("queued".into(), json!(pos));
+    obj.insert("behind".into(), json!(behind));
+}
+
 /// Position (1 = next) of a chain waiting to be installed.
 pub fn queued_at(node: &Node, key: &str) -> Option<usize> {
     queue(node).iter().position(|e| e["key"] == key).map(|i| i + 1)
@@ -1644,6 +1653,17 @@ mod one_follower_tests {
 #[cfg(test)]
 mod home_queue_tests {
     use super::home_busy;
+
+    #[test]
+    fn a_status_gains_its_queue_place_only_when_it_is_waiting() {
+        let mut st = serde_json::json!({"key": "doge", "installed": false});
+        super::attach_queue(&mut st, None, None);
+        assert!(st.get("queued").is_none(), "not waiting: the bar has nothing to say about a queue");
+        super::attach_queue(&mut st, Some(1), Some("peptest"));
+        assert_eq!(st["queued"], 1);
+        assert_eq!(st["behind"], "peptest");
+        super::attach_queue(&mut serde_json::Value::Null, Some(1), None);
+    }
 
     #[test]
     fn installs_wait_while_the_home_chain_syncs() {

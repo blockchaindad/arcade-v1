@@ -6,6 +6,7 @@
 //!           [--http-port N|0] [--http-bind ADDR] [--site DIR] [--stun-port N|0]
 
 mod accountsvc;
+mod localterm;
 mod webui;
 mod rulecheck;
 mod updater;
@@ -179,6 +180,12 @@ static RESTART_ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// Stop cleanly (as on SIGTERM), then start the arcaded now installed, with the same options.
 pub fn request_restart() {
     RESTART_ASKED.store(true, std::sync::atomic::Ordering::SeqCst);
+    STOP_ASKED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The same clean stop as SIGTERM and `arcade stop`: the stop thread writes every chain's coin
+/// cache, then exits. It does not restart. An update sets the restart flag separately.
+pub fn request_stop() {
     STOP_ASKED.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 

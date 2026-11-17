@@ -209,4 +209,17 @@ mod tests {
         assert!(r(json!({"cmd": "arc.blob_publish_many", "files": [{"path": "/etc/passwd"}]})).is_err());
         assert!(r(json!({"cmd": "arc.blob_publish", "hex": "6869", "type": "text/plain"})).is_ok());
     }
+
+    /// Stop and a terminal are the owner's, on this computer. An API key cannot have them, admin included.
+    #[test]
+    fn a_key_cannot_stop_the_node_or_open_a_terminal() {
+        let (_one, t) = crate::http::tests::node();
+        let k = create(&t.node, "admin", &["admin".into(), "wallet".into(), "read".into()], 0).unwrap();
+        let k = k["key"].as_str().unwrap();
+        for cmd in ["node.stop", "node.terminal", "wallet.phrase"] {
+            let err = allow(&t.node, Some(k), &json!({"cmd": cmd})).unwrap_err();
+            assert_eq!(err.0, 403, "{cmd}");
+            assert!(err.1.contains("this computer"), "{cmd}: {}", err.1);
+        }
+    }
 }
