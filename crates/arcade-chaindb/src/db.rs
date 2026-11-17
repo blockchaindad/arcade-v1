@@ -515,8 +515,10 @@ pub struct ChainDb {
     batches: std::sync::Mutex<std::collections::HashMap<usize, Arc<std::sync::Mutex<()>>>>,
     /// Indexers and the chains they run on.
     indexers: std::sync::RwLock<Vec<(u16, Arc<dyn Indexer>)>>,
-    /// Coin caches of chains catching up (see CoinCache).
-    caches: std::sync::Mutex<std::collections::HashMap<u16, CoinCache>>,
+    /// Coin caches of chains catching up (see CoinCache), each behind its own lock: the map's lock is held only to find
+    /// one. (One lock for every chain's cache, held through a whole batch, let one slow chain stop all the others: the
+    /// JB20B's Litecoin batches of minutes froze every chain, 2026-11-17.)
+    caches: std::sync::Mutex<std::collections::HashMap<u16, Arc<std::sync::Mutex<CoinCache>>>>,
     /// Coin cache budget in bytes (0 = no cache): ARCADE_COIN_CACHE_MB, or set_coin_cache_mb.
     cache_bytes: std::sync::atomic::AtomicUsize,
     /// Address builds running now: per chain, each step's progress (addrbuild).
@@ -1018,7 +1020,19 @@ impl ChainDb {
 
     /// Whether a chain's coin cache is empty (everything is in the database).
     pub fn coins_settled(&self, c: u16) -> bool {
-        self.caches.lock().unwrap().get(&c).is_none_or(|cc| cc.is_empty())
+        // A cache busy right now (its chain connecting a batch) counts as not settled, without waiting for it.
+        let Some(cc) = self.caches.lock().unwrap().get(&c).cloned() else { return true };
+        let settled = match cc.try_lock() {
+            Ok(cc) => cc.is_empty(),
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner().is_empty(),
+            Err(std::sync::TryLockError::WouldBlock) => false,
+        };
+        settled
+    }
+
+    /// Chain `c`'s coin cache (made empty when it has none yet).
+    pub(crate) fn cache_of(&self, c: u16) -> Arc<std::sync::Mutex<CoinCache>> {
+        self.caches.lock().unwrap().entry(c).or_default().clone()
     }
 
     /// Stopping: wait for a batch being connected to commit (or roll back), then write every
@@ -1070,11 +1084,12 @@ impl ChainDb {
 
     /// Write a chain's coin cache to the database now (it matches the current tip).
     pub fn flush_coins(&self, c: u16) -> Result<()> {
+        let Some(cache) = self.caches.lock().unwrap().get(&c).cloned() else { return Ok(()) };
         self.store(c).write(|w| {
-            let mut caches = self.caches.lock().unwrap();
-            if let Some(cc) = caches.get_mut(&c).filter(|cc| !cc.is_empty()) {
+            let mut cc = cache.lock().unwrap_or_else(|e| e.into_inner());
+            if !cc.is_empty() {
                 if let Some(tip) = w.get(STATE, &k_state(c, "tip"))?.map(|v| decode_tip(&v)) {
-                    flush_cache(w, c, cc, &tip)?;
+                    flush_cache(w, c, &mut cc, &tip)?;
                 }
             }
             Ok(())
@@ -2142,8 +2157,9 @@ impl ChainDb {
             } else {
                 None
             };
-            let mut caches = self.caches.lock().unwrap();
-            let cc = caches.entry(c).or_default();
+            let cache = self.cache_of(c);
+            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+            let cc = &mut *guard;
             if defer {
                 cc.log_txs = addr == Addr::Log;
             }
