@@ -28,7 +28,30 @@ pub fn serve(node: Arc<Node>, path: std::path::PathBuf) {
 
 fn handle(node: Arc<Node>, s: UnixStream) {
     let mut w = s.try_clone().unwrap();
-    for line in BufReader::new(s).lines().map_while(Result::ok) {
+    let mut lines = BufReader::new(s).lines();
+    while let Some(Ok(line)) = lines.next() {
+        // Services over the mesh (crate::svcmesh): a helper keeps this connection; an ask with "stream" answers in
+        // several lines, the last the usual {ok, result}.
+        if let Ok(req) = serde_json::from_str::<Value>(&line) {
+            if req["cmd"] == "svc.attach" {
+                return crate::svcmesh::attach(node, &mut lines, w, &req);
+            }
+            if req["cmd"] == "svc.ask" && req["stream"] == true {
+                let mut ww = match w.try_clone() {
+                    Ok(x) => x,
+                    Err(_) => return,
+                };
+                let r = crate::svcmesh::ask_cmd(&node, &req, Some(&mut |v: Value| writeln!(ww, "{v}").map_err(|e| e.to_string())));
+                let reply = match r {
+                    Ok(v) => json!({"ok": true, "result": v}),
+                    Err(e) => json!({"ok": false, "error": e}),
+                };
+                if writeln!(w, "{reply}").is_err() {
+                    break;
+                }
+                continue;
+            }
+        }
         let reply = match serde_json::from_str::<Value>(&line) {
             // Stop cleanly (write the coin caches, then exit), as SIGTERM does. Socket only,
             // never over HTTP: `arcade stop`, the way to stop a background arcaded on Windows.
@@ -121,20 +144,12 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         }
         "mesh.udp" => Ok(crate::udpsvc::status(node)),
         "mesh.relay" => Ok(crate::relaysvc::status(node)),
-        "llm.status" => Ok(crate::llmsvc::status(node)),
-        "llm.set" => crate::llmsvc::set(node, &req),
-        "llm.scan" => crate::llmsvc::scan(node, &req),
-        "llm.offers" => Ok(crate::llmsvc::list_offers(node)),
-        "llm.balance" => crate::llmsvc::balance(node, &req),
-        "llm.topup" => crate::llmsvc::topup(node, &req),
-        "llm.refund" => crate::llmsvc::ask_refund(node, &req),
-        "llm.chat" => crate::llmsvc::chat_cmd(node, &req),
-        "llm.speak" => crate::llmsvc::speak_cmd(node, &req),
-        "llm.auto" => crate::llmsvc::auto_set(node, &req),
-        "llm.keys" => crate::llmsvc::keys(node),
-        "llm.key_new" => crate::llmsvc::key_new(node, &req),
-        "llm.key_drop" => crate::llmsvc::key_drop(node, &req),
-        "llm.usage" => Ok(crate::llmsvc::usage(node, &req)),
+        "svc.offers" => crate::svcmesh::list_offers(node, req),
+        "svc.services" => Ok(crate::svcmesh::services()),
+        "svc.ask" => crate::svcmesh::ask_cmd(node, req, None),
+        "svc.pay" => crate::svcmesh::pay(node, req),
+        "svc.paid" => crate::svcmesh::paid(node, req),
+        "svc.attach" => Err("svc.attach is for the API socket only (it keeps the connection)".into()),
         "mesh.dials" => Ok(crate::meshsvc::dials_status()),
         "mesh.name" => Ok(json!({"name": crate::meshsvc::public_name(node)})),
         "mesh.name_set" => crate::meshsvc::set_public_name(node, req["name"].as_str().ok_or("name required (\"\" clears it)")?),
@@ -454,7 +469,7 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         // The ledger on the ARCADE chain (§15 step 7).
         "ledger.announce" => crate::arcledger::announce(node),
         "ledger.profile" => crate::arcledger::profile(node, &req),
-        "ledger.repo_push" => crate::arcledger::repo_push(node, &s("name").ok_or("name required")?, &s("manifest").ok_or("manifest required")?),
+        "ledger.repo_push" => crate::arcledger::repo_push(node, &s("name").ok_or("name required")?, &s("manifest").ok_or("manifest required")?, s("base").as_deref(), req["force"] == true),
         "ledger.repo_maintainer" => crate::arcledger::repo_maintainer(node, &s("name").ok_or("name required")?, &s("tag").ok_or("tag required")?, req["add"] != false),
         "ledger.repo_fork" => crate::arcledger::repo_fork(node, &s("from").ok_or("from required")?, &s("name").ok_or("name required")?),
         "ledger.item_open" => crate::arcledger::item_open(node, &req),

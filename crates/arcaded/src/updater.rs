@@ -38,6 +38,9 @@ const PROGRAMS: &[&str] = &["arcaded", "arcade", "arcade-desktop"];
 /// This build's release version (None for a local build).
 /// The longest an installed update waits for the next ARCADE block before it restarts.
 const RESTART_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+/// The longest an installed update waits for the draw seed's proof (crate::arcsvc::seed_running): seed proofs took
+/// 15 to 56 minutes on the testnet's writers (2026-11-15/16).
+const SEED_WAIT: std::time::Duration = std::time::Duration::from_secs(70 * 60);
 
 pub fn version() -> Option<&'static str> {
     option_env!("ARCADE_VERSION")
@@ -275,6 +278,16 @@ fn install(node: &Node, tag: &str, archive: &str, want: &str) -> Result<(), Stri
                 let _ = node.app.event("update", &format!("{tag} is in place: restarting after the next ARCADE block (this arcade's proof is running)"));
                 while crate::arcsvc::proving_for_tip() && crate::arcsvc::tip_id() == at && since.elapsed() < RESTART_WAIT {
                     std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+            }
+            // Nor in the middle of the draw seed's proof the next epoch's first block needs (one VDF run that a restart
+            // starts over, often longer than the epoch has left): wait for it, at most SEED_WAIT.
+            if crate::arcsvc::seed_running() {
+                let since = std::time::Instant::now();
+                st().lock().unwrap().doing = "waiting for the draw seed's proof";
+                let _ = node.app.event("update", &format!("{tag} is in place: restarting once the ARCADE draw seed's proof is made"));
+                while crate::arcsvc::seed_running() && since.elapsed() < SEED_WAIT {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
                 }
             }
             let mut s = st().lock().unwrap();

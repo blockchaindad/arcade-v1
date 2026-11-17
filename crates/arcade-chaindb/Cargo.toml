@@ -9,6 +9,7 @@ arcade-chain = { version = "0.1.0", path = "../arcade-chain" }
 arcade-store = { version = "0.1.0", path = "../arcade-store" }
 bitcoinconsensus = "0.106.0"
 hex = "0.4.3"
+libmdbx = "0.9.0"
 thiserror = "1"
 
 [dev-dependencies]
