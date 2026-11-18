@@ -396,6 +396,11 @@ fn read_hidden(prompt: &str) -> std::io::Result<String> {
     got.map(|_| line.trim().to_string())
 }
 
+/// `arcade stop`: the clean stop on the service socket. Not a restart, and not a command the cookie can call.
+fn stop_request() -> Value {
+    json!({"cmd": "service.stop"})
+}
+
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let sock = arcade_local::socket_path(&home(&args));
@@ -417,7 +422,7 @@ fn main() {
         ["web"] => json!({"cmd": "ui.link"}),
         ["peers"] => json!({"cmd": "peers"}),
         ["peers", "dials"] => json!({"cmd": "mesh.dials"}),
-        ["stop"] => json!({"cmd": "service.stop"}),
+        ["stop"] => stop_request(),
         ["wallet", "create"] => json!({"cmd": "wallet.create"}),
         ["wallet", "restore", words @ ..] => match restore_phrase(words, || read_hidden("Your recovery phrase (not shown as you type): ")) {
             Ok(phrase) => json!({"cmd": "wallet.create", "phrase": phrase}),
@@ -541,6 +546,10 @@ fn main() {
     BufReader::new(s).read_line(&mut line).unwrap();
     let v: Value = serde_json::from_str(&line).unwrap_or(json!({"ok": false, "error": "bad reply"}));
     if v["ok"] == true {
+        if a.as_slice() == ["stop"] {
+            println!("Stopping: writing the coin caches, then the service exits.");
+            return;
+        }
         if a.as_slice() == ["web"] {
             if let Some(u) = v["result"]["url"].as_str() {
                 println!("Open in a browser on this computer:\n\n  {u}\n");
@@ -605,6 +614,14 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_asks_for_the_clean_stop_and_nothing_else() {
+        assert!(HELP.contains("arcade stop"));
+        let r = stop_request();
+        assert_eq!(r["cmd"], "service.stop");
+        assert_eq!(r.as_object().unwrap().len(), 1, "no program, no path, no extra flag");
+    }
 
     #[test]
     fn restore_asks_for_the_words_when_none_are_given() {

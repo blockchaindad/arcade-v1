@@ -299,9 +299,30 @@ fn home_busy(tip: u32, lag: u32, addresses_ready: bool) -> bool {
     tip == 0 || lag > 10 || !addresses_ready
 }
 
+/// Stamp a chain status with its install-queue place (1 = next), when it is waiting.
+/// `behind` is the chain being installed now, the one this place waits on.
+pub fn attach_queue(st: &mut Value, pos: Option<usize>, behind: Option<&str>) {
+    let Some(obj) = st.as_object_mut() else { return };
+    let Some(pos) = pos else { return };
+    obj.insert("queued".into(), json!(pos));
+    obj.insert("behind".into(), json!(behind));
+}
+
 /// Position (1 = next) of a chain waiting to be installed.
 pub fn queued_at(node: &Node, key: &str) -> Option<usize> {
     queue(node).iter().position(|e| e["key"] == key).map(|i| i + 1)
+}
+
+/// Put a chain in the install queue without installing it. Tests only.
+#[cfg(test)]
+pub fn enqueue_for_test(node: &Node, key: &str) {
+    let key = by_key(key).map(|p| p.key).unwrap_or(key);
+    let mut q = queue(node);
+    if q.iter().any(|e| e["key"] == key) {
+        return;
+    }
+    q.push(json!({"key": key, "mode": "full", "with": [], "at": 0}));
+    save_queue(node, &q);
 }
 
 /// chains.unqueue: take a chain out of the install queue.
@@ -367,7 +388,8 @@ pub fn run_queue(node: Arc<Node>) {
 }
 
 /// chains.add: install a chain now, or, while another chain is still being installed, put it
-/// in the queue (one install at a time: each gets the disk and network to itself).
+/// in the queue (one install at a time: each gets the disk and network to itself). A chain
+/// already in the queue returns its place in line; its drive is not touched (chains.move).
 pub fn add(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>) -> Result<Value, String> {
     // The ARCADE chain: its blocks come over the mesh, so no queue and nothing to choose.
     if crate::arcsvc::defines(key) {
@@ -378,6 +400,12 @@ pub fn add(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>) -> Res
     }
     let key = by_key(key).map(|p| p.key).unwrap_or(key);
     let p = by_key(key).ok_or_else(|| format!("unknown chain {key}; see  arcade chain list"))?;
+    // Already waiting: say where it is in line and change nothing. A second add (the Options form
+    // defaults the drive to home) must not rewrite the queue entry or the drive chosen for it.
+    if let Some(pos) = queued_at(node, p.key) {
+        let behind = installing_now(node).map(|b| b.key);
+        return Ok(json!({"queued": true, "key": p.key, "position": pos, "behind": behind}));
+    }
     // Headers only is small and quick (§15 step 15): it never waits behind another chain's install.
     if let Some(busy) = installing_now(node).filter(|b| b.key != p.key && mode != "light") {
         if node.extra.lock().unwrap().contains_key(p.key) {
@@ -1644,6 +1672,17 @@ mod one_follower_tests {
 #[cfg(test)]
 mod home_queue_tests {
     use super::home_busy;
+
+    #[test]
+    fn a_status_gains_its_queue_place_only_when_it_is_waiting() {
+        let mut st = serde_json::json!({"key": "doge", "installed": false});
+        super::attach_queue(&mut st, None, None);
+        assert!(st.get("queued").is_none(), "not waiting: the bar has nothing to say about a queue");
+        super::attach_queue(&mut st, Some(1), Some("peptest"));
+        assert_eq!(st["queued"], 1);
+        assert_eq!(st["behind"], "peptest");
+        super::attach_queue(&mut serde_json::Value::Null, Some(1), None);
+    }
 
     #[test]
     fn installs_wait_while_the_home_chain_syncs() {

@@ -16,7 +16,7 @@
 #   a Task Scheduler entry "Arcade V1.0" that starts arcaded at login
 #   a Start menu shortcut
 #
-# Options: --no-desktop  --build  --prebuilt DIR  --home DIR
+# Options: --no-desktop  --build  --prebuilt DIR  --home DIR  --log PATH
 #          --http-port N  --mesh-port N  --stun-port N
 # Environment: ARCADE_BUILD=1, ARCADE_HOME, ARCADE_GITHUB, ARCADE_BRANCH, ARCADE_NO_OPEN=1
 
@@ -36,6 +36,7 @@ $DataDir = $null
 $HttpPort = $null
 $MeshPort = $null
 $StunPort = $null
+$LogPath = $null
 
 $argv = @($args)
 for ($i = 0; $i -lt $argv.Count; $i++) {
@@ -63,6 +64,10 @@ for ($i = 0; $i -lt $argv.Count; $i++) {
             if ($i + 1 -ge $argv.Count) { throw 'missing value for --stun-port' }
             $i++; $StunPort = [int]$argv[$i]
         }
+        '--log' {
+            if ($i + 1 -ge $argv.Count) { throw 'missing value for --log' }
+            $i++; $LogPath = $argv[$i]
+        }
         '--help' {
             Get-Content -LiteralPath $PSCommandPath -TotalCount 28
             exit 0
@@ -76,6 +81,78 @@ for ($i = 0; $i -lt $argv.Count; $i++) {
 }
 
 function Say([string]$Msg) { Write-Host $Msg -ForegroundColor Cyan }
+
+function Step([string]$Msg) {
+    $line = '{0:yyyy-MM-dd HH:mm:ss} {1}' -f (Get-Date), $Msg
+    Write-Host $line
+    if ($script:LogPath -and -not $script:TranscriptOn) {
+        Add-Content -LiteralPath $script:LogPath -Value $line -Encoding Unicode -ErrorAction SilentlyContinue
+    }
+}
+
+function Stop-InstallLog {
+    if ($script:TranscriptOn) {
+        try { Stop-Transcript | Out-Null } catch {}
+        $script:TranscriptOn = $false
+    }
+}
+
+# A failed install must not leave the previous node off. The task is the one already
+# registered; enabling it is a no-op when this run never got as far as disabling it.
+function Resume-OldNode {
+    Step "Starting the previous '$TaskName' task so this failure does not leave the node off."
+    $already = @(Get-Process -Name 'arcaded' -ErrorAction SilentlyContinue)
+    try {
+        Enable-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Out-Null
+        Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+        Step "Login task '$TaskName' is enabled and was started."
+        return
+    } catch {
+        Step "Task Scheduler did not start '$TaskName' ($($_.Exception.Message))."
+    }
+    if ($already.Count -gt 0) {
+        Step 'arcaded.exe is already running, so it was not started a second time.'
+        return
+    }
+    $vbs = Join-Path (Join-Path (LocalAppData) 'Programs\Arcade') 'arcaded-hidden.vbs'
+    $wscript = Join-Path $env:SystemRoot 'System32\wscript.exe'
+    if ((Test-Path -LiteralPath $vbs) -and (Test-Path -LiteralPath $wscript)) {
+        Step "Starting $vbs directly."
+        Start-Process -FilePath $wscript -ArgumentList "//B `"$vbs`"" -WindowStyle Hidden
+    } else {
+        Step "No previous login task or arcaded-hidden.vbs was found to start."
+    }
+}
+
+function Copy-WithRetry([string]$Src, [string]$Dst) {
+    for ($n = 1; $n -le 10; $n++) {
+        try {
+            Copy-Item -LiteralPath $Src -Destination $Dst -Force -ErrorAction Stop
+            return
+        } catch {
+            if ($n -ge 10) { throw }
+            Step "Copy of $(Split-Path -Leaf $Src) is in use; retry $n of 10."
+            Start-Sleep -Seconds 2
+        }
+    }
+}
+
+if (-not $LogPath -and $Prebuilt) {
+    $temp = if ($env:TEMP) { $env:TEMP } else { [IO.Path]::GetTempPath() }
+    $LogPath = Join-Path $temp 'arcade-v1-install.log'
+}
+$script:LogPath = $LogPath
+$script:TranscriptOn = $false
+if ($LogPath) {
+    try {
+        Start-Transcript -LiteralPath $LogPath -Append -Force -ErrorAction Stop | Out-Null
+        $script:TranscriptOn = $true
+    } catch {
+        $script:TranscriptOn = $false
+        Add-Content -LiteralPath $LogPath -Value ("{0:yyyy-MM-dd HH:mm:ss} Start-Transcript failed: {1}" -f (Get-Date), $_.Exception.Message) -Encoding Unicode -ErrorAction SilentlyContinue
+    }
+    Step 'install.ps1 started.'
+}
 
 function LocalAppData {
     if ($env:LOCALAPPDATA) { return $env:LOCALAPPDATA }
@@ -155,11 +232,39 @@ function Test-WebView2 {
 }
 
 function Stop-Arcade([string]$Dir) {
+    # The open 0.1.101 window starts arcaded again through arcaded-hidden.vbs even after the
+    # login task is disabled. Close that window first. Nothing in the data folder is deleted.
+    Step 'Closing arcade-desktop.exe before the service, so it cannot start arcaded again.'
+    $desk = @(Get-Process -Name 'arcade-desktop' -ErrorAction SilentlyContinue)
+    if ($desk.Count -gt 0) {
+        foreach ($proc in $desk) { [void]$proc.CloseMainWindow() }
+        $deadline = (Get-Date).AddSeconds(10)
+        while ((Get-Process -Name 'arcade-desktop' -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 1
+        }
+        $left = @(Get-Process -Name 'arcade-desktop' -ErrorAction SilentlyContinue)
+        if ($left.Count -gt 0) {
+            Step 'arcade-desktop.exe was still open after 10 seconds; stopping it.'
+            $left | Stop-Process -Force -ErrorAction SilentlyContinue
+        } else {
+            Step 'arcade-desktop.exe closed.'
+        }
+    } else {
+        Step 'arcade-desktop.exe was not running.'
+    }
     Disable-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Out-Null
-    $running = Get-Process -Name 'arcaded' -ErrorAction SilentlyContinue
-    if ($running -and $Dir) {
-        Say "Stopping Arcade so it can finish writing (up to 5 minutes)..."
-        New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if (-not $task) {
+        Step "No login task named '$TaskName' to disable."
+    } elseif ($task.State -ne 'Disabled') {
+        Step "The login task '$TaskName' is still $($task.State) after Disable-ScheduledTask."
+    } else {
+        Step "Login task '$TaskName' is Disabled."
+    }
+    $running = @(Get-Process -Name 'arcaded' -ErrorAction SilentlyContinue)
+    if ($running.Count -gt 0 -and $Dir) {
+        Step 'Stopping Arcade so it can finish writing (up to 5 minutes)...'
+        if (-not (Test-Path -LiteralPath $Dir)) { New-Item -ItemType Directory -Force -Path $Dir | Out-Null }
         $stop = Join-Path $Dir 'arcaded.stop'
         Set-Content -LiteralPath $stop -Value 'stop' -Encoding ascii
         $deadline = (Get-Date).AddSeconds(300)
@@ -169,7 +274,13 @@ function Stop-Arcade([string]$Dir) {
         Remove-Item -LiteralPath $stop -Force -ErrorAction SilentlyContinue
     }
     Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    Get-Process -Name 'arcaded' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    $still = @(Get-Process -Name 'arcaded' -ErrorAction SilentlyContinue)
+    if ($still.Count -gt 0) {
+        Step 'arcaded.exe was still running after the clean stop; it was force-killed.'
+        $still | Stop-Process -Force -ErrorAction SilentlyContinue
+    } else {
+        Step 'arcaded.exe had already exited; it was not force-killed.'
+    }
     Start-Sleep -Milliseconds 400
 }
 
@@ -358,31 +469,40 @@ function Try-Download {
 }
 
 function Install-Programs([string]$FromDir, [string]$IconPng, [string]$IconIco) {
+  try {
     $local = LocalAppData
     if (-not $DataDir) {
         if ($env:ARCADE_HOME) { $script:DataDir = $env:ARCADE_HOME } else { $script:DataDir = (Join-Path $local 'arcade') }
     }
     if ($DataDir -match '"') { throw 'The data folder path cannot contain quotes.' }
     $bin = Join-Path $local 'Programs\Arcade'
+    $srcExe = Join-Path $FromDir 'arcaded.exe'
+    if (-not (Test-Path -LiteralPath $srcExe)) {
+        throw "arcaded.exe is not in the installer payload ($srcExe). Windows Defender may have quarantined it."
+    }
+    Step "Chain data in $DataDir is not moved or deleted."
     $first = -not (Test-Path (Join-Path $bin 'arcade-desktop.exe'))
     Stop-Arcade $DataDir
-    New-Item -ItemType Directory -Force -Path $bin, $DataDir | Out-Null
-    Copy-Item -LiteralPath (Join-Path $FromDir 'arcaded.exe') -Destination (Join-Path $bin 'arcaded.exe') -Force
-    Copy-Item -LiteralPath (Join-Path $FromDir 'arcade.exe') -Destination (Join-Path $bin 'arcade.exe') -Force
+    New-Item -ItemType Directory -Force -Path $bin | Out-Null
+    if (-not (Test-Path -LiteralPath $DataDir)) { New-Item -ItemType Directory -Force -Path $DataDir | Out-Null }
+    Copy-WithRetry $srcExe (Join-Path $bin 'arcaded.exe')
+    Copy-WithRetry (Join-Path $FromDir 'arcade.exe') (Join-Path $bin 'arcade.exe')
     # MPIR's DLLs (chiavdf links them) and its license go beside the programs.
-    Get-ChildItem -LiteralPath $FromDir -Filter 'mpir*.dll' -ErrorAction SilentlyContinue | Copy-Item -Destination $bin -Force
+    Get-ChildItem -LiteralPath $FromDir -Filter 'mpir*.dll' -ErrorAction SilentlyContinue | ForEach-Object {
+        Copy-WithRetry $_.FullName (Join-Path $bin $_.Name)
+    }
     $mpirLicense = Join-Path $FromDir 'MPIR-LICENSE.txt'
-    if (Test-Path -LiteralPath $mpirLicense) { Copy-Item -LiteralPath $mpirLicense -Destination $bin -Force }
+    if (Test-Path -LiteralPath $mpirLicense) { Copy-WithRetry $mpirLicense (Join-Path $bin 'MPIR-LICENSE.txt') }
     $haveDesktop = $false
     $deskSrc = Join-Path $FromDir 'arcade-desktop.exe'
     if (-not $NoDesktop -and (Test-Path -LiteralPath $deskSrc)) {
-        Copy-Item -LiteralPath $deskSrc -Destination (Join-Path $bin 'arcade-desktop.exe') -Force
+        Copy-WithRetry $deskSrc (Join-Path $bin 'arcade-desktop.exe')
         $haveDesktop = $true
         if ($IconIco -and (Test-Path -LiteralPath $IconIco)) {
-            Copy-Item -LiteralPath $IconIco -Destination (Join-Path $bin 'arcade-v1.ico') -Force
+            Copy-WithRetry $IconIco (Join-Path $bin 'arcade-v1.ico')
         }
         if ($IconPng -and (Test-Path -LiteralPath $IconPng)) {
-            Copy-Item -LiteralPath $IconPng -Destination (Join-Path $bin 'arcade-v1.png') -Force
+            Copy-WithRetry $IconPng (Join-Path $bin 'arcade-v1.png')
         }
     } elseif (-not $NoDesktop) {
         Say "The desktop app is not in this build; the service and the command line still install."
@@ -401,7 +521,11 @@ function Install-Programs([string]$FromDir, [string]$IconPng, [string]$IconIco) 
     $run = "`"$exe`" --home `"$DataDir`" --http-port $HttpPort --mesh-port $MeshPort --stun-port $StunPort"
     $runVbs = $run.Replace('"', '""')
     $vbs = Join-Path $bin 'arcaded-hidden.vbs'
+    # Login (and a Startup-folder fallback) clear the owner's stop marker, then start. The
+    # window's refresh does not: while arcaded.stopped exists it will not run this task.
     @"
+Set fso = CreateObject("Scripting.FileSystemObject")
+If fso.FileExists("$DataDir\arcaded.stopped") Then fso.DeleteFile "$DataDir\arcaded.stopped", True
 Set sh = CreateObject("WScript.Shell")
 sh.Environment("Process")("ARCADE_HOME") = "$DataDir"
 sh.CurrentDirectory = "$DataDir"
@@ -493,6 +617,14 @@ sh.Run "$deskRun", 1, False
     Write-Host "  logs:     run arcaded.exe in a terminal to see them. A hidden login start does not keep a console."
     Write-Host ""
     Write-Host "Open a new terminal if `"arcade`" is not found yet (PATH was updated for this user)."
+    Step 'Install finished.'
+    Stop-InstallLog
+  } catch {
+    Step "Install failed: $($_.Exception.Message)"
+    Resume-OldNode
+    Stop-InstallLog
+    exit 1
+  }
 }
 
 $ScriptDir = $PSScriptRoot
